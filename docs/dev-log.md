@@ -1974,6 +1974,26 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | 重试状态机 RED | `0/1/5`、持续失败、并发 claim、running 恢复 | FAIL：缺少带原子 claim 的有界重试与启动重放。 |
 | 生命周期 RED | 慢 provider readiness、shutdown cancel/await、prepare 失败重试、legacy raw | FAIL（4 failed）：recovery 阻塞 lifespan，flag 过早置位，legacy 分析收到空输入。 |
 | 审查 GREEN | 跨 event 重投、UserPrompt crash-window、意外 recovery 异常、Store event_id 防线 | PASS：冲突返回 409；缺失 prompt 幂等补齐；异常不吞且锁释放；Pydantic 1/2 与 Store 共用规则。 |
-| Task 2 聚焦 GREEN | `pytest tests/test_analysis_service.py tests/test_service_routing.py tests/test_store_phase1.py tests/test_student_agent.py tests/test_student_coordinator.py tests/test_student_spool.py tests/test_student_transport.py -q` | PASS（147 passed，1 个既有 Starlette 弃用 warning）。 |
-| 尽可能全量（3.14 诊断） | loopback `NO_PROXY` + 真 Chromium 下 `pytest -q` | 580 passed / 2 failed / 1 warning；两失败仍仅为 Task 1 已登记的 Python 3.14 `fcntl` 合同差异与多 worker 短暂 `/health` 竞态。 |
+| Task 2 聚焦 GREEN | `pytest tests/test_analysis_service.py tests/test_service_routing.py tests/test_store_phase1.py tests/test_student_agent.py tests/test_student_coordinator.py tests/test_student_spool.py tests/test_student_transport.py -q` | PASS（153 passed，1 个既有 Starlette 弃用 warning）。 |
+| 尽可能全量（3.14 诊断） | loopback `NO_PROXY` + 真 Chromium 下 `pytest -q` | 586 passed / 2 failed / 1 warning；两失败仍仅为 Task 1 已登记的 Python 3.14 `fcntl` 合同差异与多 worker 短暂 `/health` 竞态。 |
 | Python 合同 | `python scripts/python_preflight.py` | 按预期 exit 1：本机 Python 3.14.4 不满足 `>=3.13,<3.14`；本地 3.13 门 **BLOCKED**。 |
+
+### Task 2 独立 Review 修复：同进程 Stop crash-window — 2026-07-14
+
+- 复现 report 已持久为 pending，但首次 HTTP 请求在 Starlette BackgroundTask 启动前中断的
+  窗口。同一 `event_id` 在同进程重投时，只有持久状态为 pending 或 attempts < 3 的
+  failed 才再排队；running、done 和已耗尽 failed 不进 wrapper。
+- 两个 duplicate 请求在 claim 前同时进入 wrapper 的真 ASGI 用例中，SQLite CAS 保证仅
+  1 次 provider 调用和 1 条 analysis；完成后第三次 duplicate 不再进 wrapper。
+- `handle_stop_with_retry` 在 claim 后收到 `CancelledError` 时，CAS 将 running 转回 failed，
+  保留 input/attempts，写入 `analysis_cancelled`，然后原样重抛取消。同进程重投或下次
+  启动可继续恢复，不需要先重启才释放 running。
+
+| 阶段 | 结果 |
+|---|---|
+| RED：pending 重投 + 近同时 duplicate | 2 failed：重投不调 provider，并发用例等不到 wrapper。 |
+| RED：状态门 | 4 failed / 1 passed：running、done、failed attempts=3 仍被无谓调度。 |
+| RED：claim 后取消 | 1 failed：shutdown 后 report 仍为 running。 |
+| GREEN：crash-window 聚焦 | 7 passed；pending/failed 可恢复，running/done/exhausted 不调度，取消后可恢复。 |
+| Task 2 七文件 | 153 passed / 1 个既有 warning。 |
+| 最终全量 | 586 passed / 2 个已登记基线 failed / 1 warning。 |

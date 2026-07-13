@@ -789,7 +789,10 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                 data.prompt,
                 report_id=report_id,
             )
-        elif data.event == "Stop" and not duplicate:
+        elif data.event == "Stop" and (
+            not duplicate
+            or analysis_svc.is_report_analysis_recoverable(report_id)
+        ):
             background_tasks.add_task(
                 _handle_stop_background,
                 analysis_svc,

@@ -398,6 +398,222 @@ def test_duplicate_event_id_rejects_conflicting_event_without_side_effects(tmp_p
         assert [row["content"] for row in prompts] == ["original stop"]
 
 
+def test_duplicate_stop_reschedules_persisted_pending_report_without_restart(tmp_path):
+    async def scenario():
+        report_app, store, llm_calls = _build_real_report_app(tmp_path)
+        analysis_svc = report_app.state.context.analysis_svc
+        accepted = analysis_svc.accept_report(
+            student_id="stu-stop-gap",
+            session_id="sess-stop-gap",
+            event="Stop",
+            event_id="stop-gap-event",
+            prompt_text="repair the background gap",
+            transcript_content=_line({
+                "type": "message",
+                "role": "user",
+                "content": "PERSISTED-BEFORE-BACKGROUND",
+                "sessionId": "sess-stop-gap",
+            }),
+        )
+        assert store.get_report(accepted.report_id)["analysis_status"] == "pending"
+
+        transport = httpx.ASGITransport(app=report_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post("/report", json={
+                "student_id": "stu-stop-gap",
+                "session_id": "sess-stop-gap",
+                "event": "Stop",
+                "event_id": "stop-gap-event",
+                "prompt": "conflicting retry payload",
+                "transcript_tail": "must not replace persisted input",
+            })
+
+        assert response.status_code == 202
+        assert response.json()["duplicate"] is True
+        assert response.json()["report_id"] == accepted.report_id
+        assert len(llm_calls) == 1
+        assert llm_calls[0]["messages"] == [
+            ("user", "PERSISTED-BEFORE-BACKGROUND"),
+        ]
+        assert store.get_report(accepted.report_id)["analysis_status"] == "done"
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_duplicate_stop_reschedules_once(tmp_path, monkeypatch):
+    async def scenario():
+        store = Store(tmp_path / "copilot.db")
+        bus = EventBus()
+        registry = WSRegistry(send_timeout=0.05)
+        provider_started = asyncio.Event()
+        provider_release = asyncio.Event()
+        first_wrapper_started = asyncio.Event()
+        second_wrapper_started = asyncio.Event()
+        wrappers_release = asyncio.Event()
+        provider_calls = 0
+        wrapper_calls = 0
+
+        async def blocking_llm(config, snap, event, latest_prompt):
+            nonlocal provider_calls
+            provider_calls += 1
+            provider_started.set()
+            await provider_release.wait()
+            return {"topic": "one live repair", "diagnosis": "claimed once"}
+
+        config = {
+            "student_id": "server",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": str(tmp_path / "copilot.db")},
+            "llm": {},
+        }
+        analysis_svc = AnalysisService(store, blocking_llm, config, bus)
+        context = AppContext(
+            config=config,
+            store=store,
+            analysis_svc=analysis_svc,
+            session_svc=SessionQueryService(store, config),
+            message_svc=MessageService(store, bus),
+            bus=bus,
+            ws_registry=registry,
+        )
+        report_app = create_app(context)
+        accepted = analysis_svc.accept_report(
+            student_id="stu-concurrent-stop-gap",
+            session_id="sess-concurrent-stop-gap",
+            event="Stop",
+            event_id="concurrent-stop-gap-event",
+            prompt_text="authoritative prompt",
+            transcript_content=_line({
+                "type": "message", "role": "user",
+                "content": "AUTHORITATIVE-TAIL",
+                "sessionId": "sess-concurrent-stop-gap",
+            }),
+        )
+        original_wrapper = analysis_svc.handle_stop_with_retry
+
+        async def observed_wrapper(*args, **kwargs):
+            nonlocal wrapper_calls
+            wrapper_calls += 1
+            if wrapper_calls == 1:
+                first_wrapper_started.set()
+            if wrapper_calls == 2:
+                second_wrapper_started.set()
+            await wrappers_release.wait()
+            return await original_wrapper(*args, **kwargs)
+
+        monkeypatch.setattr(
+            analysis_svc,
+            "handle_stop_with_retry",
+            observed_wrapper,
+        )
+        payload = {
+            "student_id": "stu-concurrent-stop-gap",
+            "session_id": "sess-concurrent-stop-gap",
+            "event": "Stop",
+            "event_id": "concurrent-stop-gap-event",
+            "prompt": "retry payload",
+            "transcript_tail": "retry tail",
+        }
+        transport = httpx.ASGITransport(app=report_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            first = asyncio.create_task(client.post("/report", json=payload))
+            await asyncio.wait_for(first_wrapper_started.wait(), timeout=1)
+            second = asyncio.create_task(client.post("/report", json=payload))
+            await asyncio.wait_for(second_wrapper_started.wait(), timeout=1)
+            wrappers_release.set()
+            await asyncio.wait_for(provider_started.wait(), timeout=1)
+            provider_release.set()
+            responses = await asyncio.gather(first, second)
+            done_response = await client.post("/report", json=payload)
+
+        assert [response.status_code for response in responses] == [202, 202]
+        assert [response.json()["duplicate"] for response in responses] == [True, True]
+        assert done_response.status_code == 202
+        assert done_response.json()["duplicate"] is True
+        assert wrapper_calls == 2
+        assert provider_calls == 1
+        with store._conn() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM analyses WHERE report_id = ?",
+                (accepted.report_id,),
+            ).fetchone()[0] == 1
+        assert store.get_report(accepted.report_id)["analysis_status"] == "done"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("analysis_status", "analysis_attempts", "expected_wrapper_calls"),
+    [
+        ("failed", 1, 1),
+        ("running", 1, 0),
+        ("done", 1, 0),
+        ("failed", 3, 0),
+    ],
+)
+def test_duplicate_stop_schedules_only_recoverable_states(
+    tmp_path,
+    monkeypatch,
+    analysis_status,
+    analysis_attempts,
+    expected_wrapper_calls,
+):
+    async def scenario():
+        report_app, store, _ = _build_real_report_app(tmp_path)
+        analysis_svc = report_app.state.context.analysis_svc
+        accepted = analysis_svc.accept_report(
+            student_id="stu-stop-state",
+            session_id="sess-stop-state",
+            event="Stop",
+            event_id="stop-state-event",
+            prompt_text="state gate",
+            transcript_content="durable state input",
+        )
+        with store._conn() as conn:
+            conn.execute(
+                """UPDATE reports
+                   SET analysis_status = ?, analysis_attempts = ?
+                   WHERE id = ?""",
+                (analysis_status, analysis_attempts, accepted.report_id),
+            )
+        wrapper_calls = 0
+
+        async def observed_wrapper(*args, **kwargs):
+            nonlocal wrapper_calls
+            wrapper_calls += 1
+            return None
+
+        monkeypatch.setattr(
+            analysis_svc,
+            "handle_stop_with_retry",
+            observed_wrapper,
+        )
+        transport = httpx.ASGITransport(app=report_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post("/report", json={
+                "student_id": "stu-stop-state",
+                "session_id": "sess-stop-state",
+                "event": "Stop",
+                "event_id": "stop-state-event",
+                "prompt": "retry state",
+            })
+
+        assert response.status_code == 202
+        assert response.json()["duplicate"] is True
+        assert wrapper_calls == expected_wrapper_calls
+
+    asyncio.run(scenario())
+
+
 def test_session_owner_conflict_rolls_back_report_acceptance(tmp_path):
     report_app, store, llm_calls = _build_real_report_app(tmp_path)
     store.upsert_student("student-owner")
@@ -1094,7 +1310,11 @@ def test_lifespan_shutdown_cancels_recovery_then_restart_analyzes_once(tmp_path)
         assert context.report_recovery_task is None
         assert context.worker_lock_file is None
         assert first_calls == 1
-        assert store.get_report(report_id)["analysis_status"] == "running"
+        cancelled_report = store.get_report(report_id)
+        assert cancelled_report["analysis_status"] == "failed"
+        assert cancelled_report["analysis_attempts"] == 1
+        assert cancelled_report["analysis_error"] == "analysis_cancelled"
+        assert cancelled_report["analysis_input"] is not None
 
         restarted_calls = 0
 

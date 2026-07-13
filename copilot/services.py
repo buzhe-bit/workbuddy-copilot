@@ -381,6 +381,14 @@ class AnalysisService:
                     transcript_content=str(claimed.get("analysis_input") or ""),
                     report_id=report_id,
                 )
+            except asyncio.CancelledError:
+                self.copilot.mark_report_analysis_failed(
+                    report_id,
+                    attempt=attempt,
+                    error_code="analysis_cancelled",
+                    next_retry_at=(0 if attempt < max_attempts else None),
+                )
+                raise
             except Exception as exc:
                 error_code = stable_analysis_error_code(exc)
                 next_delay = (
@@ -400,6 +408,21 @@ class AnalysisService:
                 )
                 if attempt >= max_attempts:
                     raise AnalysisRetriesExhausted(error_code) from None
+
+    def is_report_analysis_recoverable(
+        self,
+        report_id: int,
+        *,
+        max_attempts: int = 3,
+    ) -> bool:
+        """Return whether a durable Stop report can still be claimed."""
+        report = self.copilot.get_report(report_id)
+        if not report or report.get("event") != "Stop":
+            return False
+        return (
+            str(report.get("analysis_status") or "") in {"pending", "failed"}
+            and int(report.get("analysis_attempts") or 0) < max_attempts
+        )
 
 
 class SessionQueryService:

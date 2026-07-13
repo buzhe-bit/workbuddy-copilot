@@ -44,8 +44,8 @@
 
 | 命令 | 结果 |
 |---|---|
-| Task 2 七个相关测试文件 | 147 passed / 1 个既有 Starlette warning |
-| loopback `NO_PROXY` + 真 Chromium 下全量 `pytest -q` | 580 passed / 2 failed / 1 warning |
+| Task 2 七个相关测试文件 | 153 passed / 1 个既有 Starlette warning |
+| loopback `NO_PROXY` + 真 Chromium 下全量 `pytest -q` | 586 passed / 2 failed / 1 warning |
 | `python scripts/python_preflight.py` | 预期 exit 1：Python 3.14.4 不满足 `>=3.13,<3.14` |
 
 全量两项失败与 Task 1 已登记基线完全一致：
@@ -57,3 +57,18 @@
 
 本机无 Python 3.13，因此本地 3.13 门仍为 **BLOCKED: interpreter unavailable**；上述
 3.14 结果只是诊断，不冒充发布合同全绿。
+
+## 独立 Review 追加修复
+
+- 基础交付提交：`741bc820116bf38fbcd6957a77edb8a831436930`。
+- 追加提交信息：`fix: reschedule recoverable duplicate stop reports`。
+- RED 1：report 已落 pending，但首次 BackgroundTask 未启动时，duplicate 重投不调用
+  provider；近同时用例等不到 wrapper。
+- RED 2：一律调度 duplicate 后，running/done/failed attempts=3 也会进 wrapper；状态门
+  4 failed / 1 passed。
+- RED 3：lifespan 取消已 claim 的 recovery 后，report 停在 running，同进程无法重投。
+- GREEN：只有 pending 或 attempts < 3 的 failed duplicate 再排队；两请求在 claim 前同时
+  入 wrapper 仍仅 1 provider / 1 analysis；done 重投不再入 wrapper。claim 后取消会 CAS
+  回 failed，保留 input/attempts，写 `analysis_cancelled` 并原样重抛。
+- 追加聚焦：7 passed；Task 2 七文件：153 passed；最终全量：586 passed / 2 个已登记
+  baseline failed / 1 warning。
