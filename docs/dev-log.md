@@ -1906,3 +1906,26 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | P0-1~P0-3、P0-5~P0-8 | 测试方案 v2 对应命令 | PASS：导入、FastAPI app、组合根正常；多 worker 按预期拒绝；server redlines 6 passed、public auth 4 passed、部署/URL 配置 18 passed。 |
 | 当前树隐私门 | `<项目虚拟环境>/bin/python -m pytest tests/test_repository_privacy.py tests/test_wb_upload.py -q` | PASS（15 passed）：两张敏感导师截图不在 Git 索引，受跟踪内容不含个人主目录路径。 |
 | 文本与差异检查 | `git grep` 个人路径扫描；`git diff --check` | PASS：无命中、无格式错误。 |
+
+### Task 1 Plan A：可复现质量基线 — 2026-07-14
+
+- 上传用例改用显式合成 `WorkBuddyDataAdapter`，不再隐式依赖开发机 WorkBuddy HOME；
+  `data_adapter=None` 仍保留生产构建与既有 `read_sessions` monkeypatch 兼容。
+- pytest 在 collection 前将 `HOME`/`USERPROFILE`/`APPDATA` 切到临时 sandbox；CI 固定
+  Python 3.13，分 Linux server/core、macOS 真 Chromium、Windows contract 三 lane。Windows W0/W1
+  发布仍为 **BLOCKED**。
+- 本机只有 Python 3.14.4，没有 `python3.13`；因此本地 Python 3.13 门明确为
+  **BLOCKED: interpreter unavailable**，下列 3.14 结果只是补充诊断，不冒充 3.13 结果。
+
+| 阶段 | 命令 | 结果与判定 |
+|---|---|---|
+| 既有隔离 HOME RED | `env HOME=/tmp/workbuddy-task1-home USERPROFILE=... APPDATA=... <venv>/python -m pytest tests/test_wb_upload.py -q` | FAIL（6 failed, 7 passed）：6 个上传用例因真 adapter 访问隔离 HOME 而返回 `not_installed`。 |
+| adapter 注入 RED | 只跑 `test_upload_conversations_uses_injected_adapter_without_accessing_home` | FAIL（1 failed）：`upload_conversations()` 不接受 `data_adapter`。 |
+| adapter 注入 GREEN | 隔离 HOME 跑 `tests/test_wb_upload.py -q` | PASS（14 passed）：合成 adapter 只读 fixture，forbidden HOME/DB 访问未触发。 |
+| 摘要脚本 RED/GREEN | `<venv>/python -m pytest tests/test_quality_summary.py -q` | 先因脚本缺失 FAIL，实现后 PASS（1 passed）。 |
+| collection 隔离 | 全新外部 HOME 下 `pytest --collect-only tests/test_platform_imports.py -q`，随后检查外部 HOME | PASS（13 collected）；未创建 `.workbuddy-copilot`。 |
+| server/core 精确门 | `<venv>/python -m pytest tests/test_analysis_service.py tests/test_store.py tests/test_store_mentor.py tests/test_connections.py tests/test_message_service.py -q` | PASS（61 passed）。 |
+| macOS 真浏览器 | 安装 Chromium 1228 到 `/tmp`，先启动探针，再用 loopback `NO_PROXY` 跑两个 E2E 文件 | PASS：`CHROMIUM_OK`，29 passed。首轮 28 passed/1 failed 由本机 SOCKS proxy 促使 websockets 要求未安装的 `python-socks`；单一变量绕过 loopback proxy 后转绿。 |
+| 平台合同（3.14 诊断） | `<venv>/python -m pytest tests/test_platform_imports.py -q` | FAIL（1 failed, 12 passed）：Student Core 运行时导入树含 `fcntl`。在同一 3.14 下对比 websockets 12.0/14.2/16.1 均为 `fcntl=True`，无证据添加版本上界；等待 CI 3.13 门。 |
+| 尽可能全量（3.14 诊断） | loopback `NO_PROXY` + 真 Chromium 下 `<venv>/python -m pytest -q` | 542 passed, 2 failed, 1 warning；除上述平台合同外，既有多 worker 真进程用例稳定观察到一个 worker 短暂提供 `/health` 后 supervisor 才终止；不在 Task 1 改动 Task 2+ 业务实现。 |
+| 语法与差异 | Ruby YAML 解析、`py_compile`、`git diff --check` | PASS。 |

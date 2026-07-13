@@ -1,0 +1,136 @@
+name: Quality baseline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-server-core:
+    name: Linux server/core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install lane dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-server.txt -r requirements-core.txt -r requirements-dev.txt
+      - name: Run server/core quality gate
+        shell: bash
+        run: |
+          set +e
+          python -m pytest \
+            tests/test_platform_imports.py \
+            tests/test_analysis_service.py \
+            tests/test_store.py \
+            tests/test_store_mentor.py \
+            tests/test_connections.py \
+            tests/test_message_service.py \
+            -q > pytest-output.txt 2>&1
+          status=$?
+          set -e
+          cat pytest-output.txt
+          python scripts/quality_summary.py \
+            --pytest-output pytest-output.txt \
+            --output quality-summary.json
+          exit "$status"
+      - name: Upload machine-readable summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-linux-server-core
+          path: |
+            pytest-output.txt
+            quality-summary.json
+
+  macos-client-browser:
+    name: macOS client/browser (real Chromium)
+    runs-on: macos-latest
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+      NO_PROXY: 127.0.0.1,localhost
+      no_proxy: 127.0.0.1,localhost
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install lane dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-server.txt -r requirements-macos.txt -r requirements-dev.txt
+          python -m playwright install chromium
+      - name: Prove Chromium launches
+        run: |
+          python -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); page = b.new_page(); assert page.evaluate("1 + 1") == 2; b.close(); p.stop()'
+      - name: Run client/browser quality gate
+        shell: bash
+        run: |
+          set +e
+          python -m pytest \
+            tests/test_platform_imports.py \
+            tests/e2e/test_mentor_ui.py \
+            tests/e2e/test_student_agent_system.py \
+            -q > pytest-output.txt 2>&1
+          status=$?
+          set -e
+          cat pytest-output.txt
+          python scripts/quality_summary.py \
+            --pytest-output pytest-output.txt \
+            --output quality-summary.json
+          exit "$status"
+      - name: Upload machine-readable summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-macos-client-browser
+          path: |
+            pytest-output.txt
+            quality-summary.json
+
+  windows-contract:
+    name: Windows contract (real-machine release BLOCKED)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install contract dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-core.txt -r requirements-windows.txt -r requirements-dev.txt
+      - name: Run Windows contract gate
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          python -m pytest tests/test_platform_imports.py -q *> pytest-output.txt
+          $status = $LASTEXITCODE
+          Get-Content pytest-output.txt
+          python scripts/quality_summary.py `
+            --pytest-output pytest-output.txt `
+            --output quality-summary.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          exit $status
+      - name: Keep Windows real-machine release blocked
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "::warning::BLOCKED: Windows W0/W1 real-machine evidence is still missing. Contract green is not a release claim."
+      - name: Upload machine-readable summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-windows-contract-release-blocked
+          path: |
+            pytest-output.txt
+            quality-summary.json

@@ -198,6 +198,7 @@ def upload_conversations(
     timeout: float = 60.0,
     request_id: str | None = None,
     session_id: str | None = None,
+    data_adapter: WorkBuddyDataAdapter | None = None,
 ) -> dict[str, int]:
     """Upload filtered transcripts one session at a time.
 
@@ -213,12 +214,15 @@ def upload_conversations(
 
     resolved_server_url = _server_url(cfg, server_url)
     resolved_token = token if token is not None else _config_token(cfg)
-    data_adapter = WorkBuddyDataAdapter(
-        Path(db_path).expanduser().parent,
-        database_path=db_path,
-        projects_dir=projects_dir,
-    )
-    sessions = read_sessions(db_path)
+    if data_adapter is None:
+        data_adapter = WorkBuddyDataAdapter(
+            Path(db_path).expanduser().parent,
+            database_path=db_path,
+            projects_dir=projects_dir,
+        )
+        sessions = read_sessions(db_path)
+    else:
+        sessions = [session.to_dict() for session in data_adapter.list_sessions()]
     if session_id:
         sessions = [
             session for session in sessions

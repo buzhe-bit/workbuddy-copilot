@@ -5,10 +5,38 @@ import json
 import sqlite3
 
 from copilot import wb_upload
+from copilot.student_platform.workbuddy import TranscriptReadResult, WorkBuddySession
 
 
 def _line(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+def _session(session_id: str, work_dir: str) -> WorkBuddySession:
+    return WorkBuddySession(
+        session_id=session_id,
+        title=session_id,
+        work_dir=work_dir,
+        created_at=1.0,
+        last_activity_at=2.0,
+        deleted=False,
+        group_type="",
+        space_name="",
+    )
+
+
+class _SyntheticAdapter:
+    def __init__(self, sessions, transcripts):
+        self._sessions = sessions
+        self._transcripts = transcripts
+        self.read_session_ids = []
+
+    def list_sessions(self):
+        return list(self._sessions)
+
+    def read_transcript(self, session_id):
+        self.read_session_ids.append(session_id)
+        return TranscriptReadResult(content=self._transcripts[session_id])
 
 
 def test_encode_cwd_matches_workbuddy_project_path_for_chinese_directory():
@@ -145,18 +173,12 @@ def test_should_upload_retries_failed_same_sha_and_skips_other_same_sha_states()
     assert wb_upload.should_upload(sha, None) is True
 
 
-def test_upload_conversations_probes_legacy_same_sha_without_resending_content(
-    monkeypatch, tmp_path
-):
-    projects = tmp_path / "projects"
-    session_dir = projects / wb_upload.encode_cwd("/work/legacy")
-    session_dir.mkdir(parents=True)
+def test_upload_conversations_probes_legacy_same_sha_without_resending_content(monkeypatch):
     content = _line({"type": "message", "session_id": "sess-legacy", "role": "user", "content": "legacy"})
-    (session_dir / "sess-legacy.jsonl").write_text(content, encoding="utf-8")
     sha = wb_upload.content_sha256(content)
-    monkeypatch.setattr(wb_upload, "read_sessions", lambda db_path=wb_upload.DEFAULT_DB_PATH: [{
-        "session_id": "sess-legacy", "work_dir": "/work/legacy",
-    }])
+    adapter = _SyntheticAdapter(
+        [_session("sess-legacy", "/work/legacy")], {"sess-legacy": content},
+    )
     monkeypatch.setattr(wb_upload, "get_known_shas", lambda *args, **kwargs: {
         "sess-legacy": {"sha": sha, "analysis_status": "unknown"},
     })
@@ -170,7 +192,7 @@ def test_upload_conversations_probes_legacy_same_sha_without_resending_content(
     result = wb_upload.upload_conversations(
         {"service": {"host": "127.0.0.1", "port": 8765}},
         "student-a",
-        projects_dir=projects,
+        data_adapter=adapter,
     )
 
     assert result == {"total": 1, "synced": 1, "skipped": 0, "failed": 0}
@@ -181,18 +203,12 @@ def test_upload_conversations_probes_legacy_same_sha_without_resending_content(
     }]
 
 
-def test_upload_conversations_skips_session_when_known_sha_matches(monkeypatch, tmp_path):
-    projects = tmp_path / "projects"
-    session_dir = projects / wb_upload.encode_cwd("/Users/student/项目")
-    session_dir.mkdir(parents=True)
+def test_upload_conversations_skips_session_when_known_sha_matches(monkeypatch):
     content = _line({"type": "message", "session_id": "sess-1", "role": "user", "content": "hi"})
-    (session_dir / "sess-1.jsonl").write_text(content, encoding="utf-8")
     sha = wb_upload.content_sha256(content)
-
-    monkeypatch.setattr(wb_upload, "read_sessions", lambda db_path=wb_upload.DEFAULT_DB_PATH: [{
-        "session_id": "sess-1",
-        "work_dir": "/Users/student/项目",
-    }])
+    adapter = _SyntheticAdapter(
+        [_session("sess-1", "/Users/student/项目")], {"sess-1": content},
+    )
     monkeypatch.setattr(wb_upload, "get_known_shas", lambda server_url, student_id, token="", timeout=10.0: {
         "sess-1": {"sha": sha, "analysis_status": "done"},
     })
@@ -203,7 +219,7 @@ def test_upload_conversations_skips_session_when_known_sha_matches(monkeypatch, 
     result = wb_upload.upload_conversations(
         {"service": {"host": "127.0.0.1", "port": 8765}},
         "student-a",
-        projects_dir=projects,
+        data_adapter=adapter,
     )
 
     assert result == {"total": 1, "synced": 0, "skipped": 1, "failed": 0}
@@ -211,17 +227,13 @@ def test_upload_conversations_skips_session_when_known_sha_matches(monkeypatch, 
 
 
 def test_requested_upload_probes_same_sha_without_resending_and_counts_skipped(
-    monkeypatch, tmp_path
+    monkeypatch,
 ):
-    projects = tmp_path / "projects"
-    session_dir = projects / wb_upload.encode_cwd("/work/same")
-    session_dir.mkdir(parents=True)
     content = _line({"type": "message", "session_id": "sess-same", "role": "user", "content": "same"})
-    (session_dir / "sess-same.jsonl").write_text(content, encoding="utf-8")
     sha = wb_upload.content_sha256(content)
-    monkeypatch.setattr(wb_upload, "read_sessions", lambda *args, **kwargs: [{
-        "session_id": "sess-same", "work_dir": "/work/same",
-    }])
+    adapter = _SyntheticAdapter(
+        [_session("sess-same", "/work/same")], {"sess-same": content},
+    )
     monkeypatch.setattr(wb_upload, "get_known_shas", lambda *args, **kwargs: {
         "sess-same": {"sha": sha, "analysis_status": "done"},
     })
@@ -237,8 +249,8 @@ def test_requested_upload_probes_same_sha_without_resending_and_counts_skipped(
     result = wb_upload.upload_conversations(
         {"service": {"host": "127.0.0.1", "port": 8765}},
         "student-a",
-        projects_dir=projects,
         request_id="req-1",
+        data_adapter=adapter,
     )
 
     assert result == {"total": 1, "synced": 0, "skipped": 1, "failed": 0}
@@ -250,17 +262,13 @@ def test_requested_upload_probes_same_sha_without_resending_and_counts_skipped(
     }]
 
 
-def test_specific_requested_upload_filters_other_local_sessions(monkeypatch, tmp_path):
-    monkeypatch.setattr(wb_upload, "read_sessions", lambda *args, **kwargs: [
-        {"session_id": "wanted", "work_dir": "/work/wanted"},
-        {"session_id": "other", "work_dir": "/work/other"},
-    ])
-    projects = tmp_path / "projects"
-    wanted_dir = projects / wb_upload.encode_cwd("/work/wanted")
-    wanted_dir.mkdir(parents=True)
-    (wanted_dir / "wanted.jsonl").write_text(
-        _line({"type": "message", "session_id": "wanted", "role": "user", "content": "wanted"}),
-        encoding="utf-8",
+def test_specific_requested_upload_filters_other_local_sessions(monkeypatch):
+    wanted_content = _line({
+        "type": "message", "session_id": "wanted", "role": "user", "content": "wanted",
+    })
+    adapter = _SyntheticAdapter(
+        [_session("wanted", "/work/wanted"), _session("other", "/work/other")],
+        {"wanted": wanted_content},
     )
     monkeypatch.setattr(wb_upload, "get_known_shas", lambda *args, **kwargs: {})
     posted = []
@@ -270,24 +278,21 @@ def test_specific_requested_upload_filters_other_local_sessions(monkeypatch, tmp
     )
 
     result = wb_upload.upload_conversations(
-        {}, "student-a", projects_dir=projects,
+        {}, "student-a",
         request_id="req-specific", session_id="wanted",
+        data_adapter=adapter,
     )
 
     assert result == {"total": 1, "synced": 1, "skipped": 0, "failed": 0}
     assert posted == ["wanted"]
 
 
-def test_upload_conversations_posts_same_sha_when_remote_analysis_failed(monkeypatch, tmp_path):
-    projects = tmp_path / "projects"
-    session_dir = projects / wb_upload.encode_cwd("/work/retry")
-    session_dir.mkdir(parents=True)
+def test_upload_conversations_posts_same_sha_when_remote_analysis_failed(monkeypatch):
     content = _line({"type": "message", "session_id": "sess-retry", "role": "user", "content": "retry"})
-    (session_dir / "sess-retry.jsonl").write_text(content, encoding="utf-8")
     sha = wb_upload.content_sha256(content)
-    monkeypatch.setattr(wb_upload, "read_sessions", lambda db_path=wb_upload.DEFAULT_DB_PATH: [{
-        "session_id": "sess-retry", "work_dir": "/work/retry",
-    }])
+    adapter = _SyntheticAdapter(
+        [_session("sess-retry", "/work/retry")], {"sess-retry": content},
+    )
     monkeypatch.setattr(wb_upload, "get_known_shas", lambda *args, **kwargs: {
         "sess-retry": {"sha": sha, "analysis_status": "failed"},
     })
@@ -301,31 +306,25 @@ def test_upload_conversations_posts_same_sha_when_remote_analysis_failed(monkeyp
     result = wb_upload.upload_conversations(
         {"service": {"host": "127.0.0.1", "port": 8765}},
         "student-a",
-        projects_dir=projects,
+        data_adapter=adapter,
     )
 
     assert result == {"total": 1, "synced": 1, "skipped": 0, "failed": 0}
     assert posted == [{"student_id": "student-a", "filtered_content": content, "sha": sha}]
 
 
-def test_upload_conversations_posts_filtered_content_and_continues_after_failure(monkeypatch, tmp_path):
-    projects = tmp_path / "projects"
-    ok_dir = projects / wb_upload.encode_cwd("/work/ok")
-    fail_dir = projects / wb_upload.encode_cwd("/work/fail")
-    ok_dir.mkdir(parents=True)
-    fail_dir.mkdir(parents=True)
+def test_upload_conversations_posts_filtered_content_and_continues_after_failure(monkeypatch):
     ok_content = _line({"type": "message", "session_id": "sess-ok", "role": "user", "content": "ok"})
     fail_content = _line({"type": "message", "session_id": "sess-fail", "role": "user", "content": "fail"})
-    (ok_dir / "sess-ok.jsonl").write_text(
-        ok_content + _line({"type": "function_call_result", "content": "must not upload"}),
-        encoding="utf-8",
+    adapter = _SyntheticAdapter(
+        [_session("sess-ok", "/work/ok"), _session("sess-fail", "/work/fail")],
+        {
+            "sess-ok": ok_content + _line({
+                "type": "function_call_result", "content": "must not upload",
+            }),
+            "sess-fail": fail_content,
+        },
     )
-    (fail_dir / "sess-fail.jsonl").write_text(fail_content, encoding="utf-8")
-
-    monkeypatch.setattr(wb_upload, "read_sessions", lambda db_path=wb_upload.DEFAULT_DB_PATH: [
-        {"session_id": "sess-ok", "work_dir": "/work/ok"},
-        {"session_id": "sess-fail", "work_dir": "/work/fail"},
-    ])
     monkeypatch.setattr(wb_upload, "get_known_shas", lambda *args, **kwargs: {})
 
     posts: list[dict] = []
@@ -341,7 +340,7 @@ def test_upload_conversations_posts_filtered_content_and_continues_after_failure
     result = wb_upload.upload_conversations(
         {"service": {"host": "127.0.0.1", "port": 8765}},
         "student-a",
-        projects_dir=projects,
+        data_adapter=adapter,
     )
 
     assert result == {"total": 2, "synced": 1, "skipped": 0, "failed": 1}
@@ -353,3 +352,49 @@ def test_upload_conversations_posts_filtered_content_and_continues_after_failure
     assert "must not upload" not in posts[0]["payload"]["filtered_content"]
     assert posts[0]["timeout"] == 60.0
     assert posts[1]["session_id"] == "sess-fail"
+
+
+def test_upload_conversations_uses_injected_adapter_without_accessing_home(monkeypatch):
+    fixture_content = (
+        _line({"type": "message", "session_id": "fixture-session", "content": "fixture"})
+        + _line({"type": "reasoning", "text": "must not upload"})
+    )
+    adapter = _SyntheticAdapter(
+        [_session("fixture-session", "/fixture")],
+        {"fixture-session": fixture_content},
+    )
+    monkeypatch.setattr(
+        wb_upload.Path,
+        "home",
+        classmethod(lambda cls: (_ for _ in ()).throw(AssertionError("forbidden HOME access"))),
+    )
+    monkeypatch.setattr(
+        wb_upload,
+        "read_sessions",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("forbidden HOME DB access")),
+    )
+    monkeypatch.setattr(wb_upload, "get_known_shas", lambda *args, **kwargs: {})
+    posted = []
+    monkeypatch.setattr(
+        wb_upload,
+        "post_transcript",
+        lambda server_url, session_id, payload, **kwargs: posted.append(payload) or {"ok": True},
+    )
+
+    result = wb_upload.upload_conversations(
+        {"service": {"host": "127.0.0.1", "port": 8765}},
+        "student-a",
+        data_adapter=adapter,
+    )
+
+    assert result == {"total": 1, "synced": 1, "skipped": 0, "failed": 0}
+    assert adapter.read_session_ids == ["fixture-session"]
+    assert posted == [{
+        "student_id": "student-a",
+        "filtered_content": _line({
+            "type": "message", "session_id": "fixture-session", "content": "fixture",
+        }),
+        "sha": wb_upload.content_sha256(_line({
+            "type": "message", "session_id": "fixture-session", "content": "fixture",
+        })),
+    }]

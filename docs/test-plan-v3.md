@@ -21,6 +21,10 @@ Windows 实机证据、隔离和防假绿门。v2 保留为历史来源；v3 只
 PY=venv/bin/python
 ```
 
+Python 基线由仓库根目录 `.python-version` 固定为 3.13。本地开发环境在安装对应
+runtime requirements 后，必须再安装 `requirements-dev.txt`；未使用 3.13 的结果可作
+开发诊断，不能代替 3.13 发布门。
+
 默认开发机总门：
 
 ```bash
@@ -45,25 +49,46 @@ marker 已严格注册，但 `unit/integration/component/server/macos/windows` �
 迁移测试；在相应 marker 至少有一个已收集测试且 CI 证明返回 0 前，它们只是未来选择器，
 不是当前 gate。
 
+### 1.1 可复现 CI 三 lane
+
+`.github/workflows/quality.yml` 在 Python 3.13 上运行三个独立 lane：
+
+| lane | 依赖与自动门 | 发布含义 |
+|---|---|---|
+| Linux server/core | server + core + dev；平台合同与当前 server/core 精确门 | 自动门 |
+| macOS client/browser | server + macOS + dev；先安装并启动真 Chromium，再跑客户端/浏览器用例 | 自动门，不替代原生 UI 实机冒烟 |
+| Windows contract | core + Windows + dev；仅跑跨平台合同 | 自动合同可绿，但 W0/W1 真机发布仍 **BLOCKED** |
+
+每个 lane 保存 pytest 终端输出，然后调用：
+
+```bash
+$PY scripts/quality_summary.py \
+  --pytest-output pytest-output.txt \
+  --output quality-summary.json
+```
+
+结果以 CI 上传的 `quality-*` artifact 为准；README 不手工维护 passed 数。
+
 三系统当前平台合同命令如下：
 
 ```bash
 # Linux server/core
-python3 -m venv .venv-linux
-.venv-linux/bin/python -m pip install pytest -r requirements-server.txt -r requirements-core.txt
+python3.13 -m venv .venv-linux
+.venv-linux/bin/python -m pip install -r requirements-server.txt -r requirements-core.txt -r requirements-dev.txt
 .venv-linux/bin/python -m pytest tests/test_platform_imports.py -q
 
 # macOS client/core
-python3 -m venv .venv-macos
-.venv-macos/bin/python -m pip install pytest -r requirements-macos.txt
+python3.13 -m venv .venv-macos
+.venv-macos/bin/python -m pip install -r requirements-server.txt -r requirements-macos.txt -r requirements-dev.txt
+.venv-macos/bin/python -m playwright install chromium
 .venv-macos/bin/python -m pytest tests/test_platform_imports.py -q
 ```
 
 Windows 原生 PowerShell：
 
 ```powershell
-py -3 -m venv .venv-win
-.\.venv-win\Scripts\python.exe -m pip install pytest -r requirements-windows.txt
+py -3.13 -m venv .venv-win
+.\.venv-win\Scripts\python.exe -m pip install -r requirements-windows.txt -r requirements-dev.txt
 .\.venv-win\Scripts\python.exe -m pytest tests/test_platform_imports.py -q
 ```
 
@@ -93,8 +118,10 @@ Student Core 的完整导入树不得加载 `AppKit`、`Foundation`、`objc` 或
 
 ## 3. 隔离与确定性规则
 
-1. 每个测试使用独立临时 `HOME`、`USERPROFILE`、`APPDATA`、SQLite、spool 和配置；
-   服务端测试把真实用户目录设为 forbidden sentinel，访问即失败。
+1. pytest 在 collection 导入任何应用模块前，先把 `HOME`、`USERPROFILE` 和 `APPDATA`
+   指向临时 collection sandbox，使全局 app 与 SQLite 不会创建在真实
+   `~/.workbuddy-copilot`。具体用例仍使用独立临时 SQLite、spool 和配置；服务端本地
+   WorkBuddy 目录设为 forbidden sentinel，访问即失败。
 2. 组件测试使用预绑定端口 `0` 并把实际地址注入客户端，禁止固定占用 8765/18765。
 3. 自动化默认禁止外网，只允许 in-process 或 loopback；真 DeepSeek 和公网域名只在发布
    冒烟使用。

@@ -52,10 +52,15 @@ Windows: headless adapter skeleton (W0/W1 blocked)
 ### 本地开发
 
 ```bash
+python3.13 -m venv venv
+venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 ./install.sh
 ./start_service.sh
 ./start_menubar.sh  # 仅 macOS 原生浮标
 ```
+
+项目 Python 版本由 [`.python-version`](.python-version) 固定为 3.13；测试与浏览器工具统一由
+[`requirements-dev.txt`](requirements-dev.txt) 安装。
 
 本地导师台地址为 `http://127.0.0.1:8765/mentor/`。`install.sh` 在 macOS 上安装 hook 并把 Hook spool 放在学员本机；它不把 WorkBuddy 数据位置配置给服务端。
 
@@ -84,13 +89,17 @@ Windows 不应执行 macOS 安装或浮标命令。待真实 Windows WorkBuddy �
 
 ```bash
 PY=venv/bin/python
+$PY -m pytest tests/test_wb_upload.py tests/test_quality_summary.py -q
 $PY -m pytest tests/test_platform_imports.py -q
 $PY -m pytest tests/test_student_spool.py tests/test_student_transport.py tests/test_student_coordinator.py tests/test_student_agent.py tests/test_floating_native_phase3.py tests/test_e2e_reverse_message.py tests/test_message_service.py tests/test_mentor_api.py tests/e2e/test_student_agent_system.py -q
 $PY -m pytest -q
 git diff --check
 ```
 
-最近的全量回归为 **495 passed**（14 条既有/上游弃用 warning）。自动测试不替代 P3 真实环境验证：macOS 原生 UI 仍需实机冒烟；Windows W0/W1 未完成前，Windows 发布门始终为 blocked。
+当前通过数不在 README 手工维护；以 [Quality baseline 每次运行产生的
+`quality-*` 机器可读摘要](https://github.com/SuperOPC-AI-Incubator/workbuddy-copilot/actions/workflows/quality.yml)
+为准。自动测试不替代 P3 真实环境验证：macOS 原生 UI 仍需实机冒烟；Windows W0/W1
+未完成前，Windows 发布门始终为 **BLOCKED**。
 
 ## 文档
 

@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import atexit
 import ast
 from fnmatch import fnmatchcase
+import os
 from pathlib import Path
+import shutil
+import tempfile
 
 import pytest
+
+
+# Test modules import ``copilot.service`` during collection, so HOME isolation
+# must exist before those modules (and their global app) are imported.
+_COLLECTION_SANDBOX = Path(tempfile.mkdtemp(prefix="workbuddy-pytest-"))
+_COLLECTION_HOME = _COLLECTION_SANDBOX / "home"
+_COLLECTION_HOME.mkdir()
+(_COLLECTION_HOME / "AppData").mkdir()
+os.environ["HOME"] = str(_COLLECTION_HOME)
+os.environ["USERPROFILE"] = str(_COLLECTION_HOME)
+os.environ["APPDATA"] = str(_COLLECTION_HOME / "AppData")
+atexit.register(shutil.rmtree, _COLLECTION_SANDBOX, ignore_errors=True)
 
 
 def _collection_tree(nodeid: str) -> ast.AST | None:
