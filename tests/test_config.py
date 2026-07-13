@@ -100,6 +100,7 @@ class TestLoadConfig:
     def test_default_config_falls_back_to_example_when_config_json_missing(
         self, tmp_path, monkeypatch, caplog,
     ):
+        monkeypatch.delenv("COPILOT_CONFIG", raising=False)
         missing_default = tmp_path / "config.json"
         example = tmp_path / "config.example.json"
         example.write_text(json.dumps({

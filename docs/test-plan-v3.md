@@ -21,9 +21,10 @@ Windows 实机证据、隔离和防假绿门。v2 保留为历史来源；v3 只
 PY=venv/bin/python
 ```
 
-Python 基线由仓库根目录 `.python-version` 固定为 3.13。本地开发环境在安装对应
-runtime requirements 后，必须再安装 `requirements-dev.txt`；未使用 3.13 的结果可作
-开发诊断，不能代替 3.13 发布门。
+Python release 合同由 `pyproject.toml` 声明为 `>=3.13,<3.14`，`.python-version`
+提供 3.13 工具选择提示。每个 release/CI lane 先执行 `$PY scripts/python_preflight.py`；
+版本不匹配时必须非零退出。开发者可在 3.14 下做诊断，但结果不能代替
+3.13 release 门。安装对应 runtime requirements 后，再安装 `requirements-dev.txt`。
 
 默认开发机总门：
 
@@ -64,21 +65,26 @@ marker 已严格注册，但 `unit/integration/component/server/macos/windows` �
 ```bash
 $PY scripts/quality_summary.py \
   --pytest-output pytest-output.txt \
-  --output quality-summary.json
+  --output quality-summary.json \
+  --pytest-exit-code "$PYTEST_EXIT_CODE"
 ```
 
-结果以 CI 上传的 `quality-*` artifact 为准；README 不手工维护 passed 数。
+`PYTEST_EXIT_CODE` 必须是紧邻 pytest 运行保存的原始退出码。只有 exit 0 且可解析
+终态才可记为 `passed`；非零为 `failed`，无法解析为 `unknown`。结果以 CI
+上传的 `quality-*` artifact 为准；README 不手工维护 passed 数。
 
 三系统当前平台合同命令如下：
 
 ```bash
 # Linux server/core
 python3.13 -m venv .venv-linux
+.venv-linux/bin/python scripts/python_preflight.py
 .venv-linux/bin/python -m pip install -r requirements-server.txt -r requirements-core.txt -r requirements-dev.txt
 .venv-linux/bin/python -m pytest tests/test_platform_imports.py -q
 
 # macOS client/core
 python3.13 -m venv .venv-macos
+.venv-macos/bin/python scripts/python_preflight.py
 .venv-macos/bin/python -m pip install -r requirements-server.txt -r requirements-macos.txt -r requirements-dev.txt
 .venv-macos/bin/python -m playwright install chromium
 .venv-macos/bin/python -m pytest tests/test_platform_imports.py -q
@@ -88,6 +94,7 @@ Windows 原生 PowerShell：
 
 ```powershell
 py -3.13 -m venv .venv-win
+.\.venv-win\Scripts\python.exe scripts\python_preflight.py
 .\.venv-win\Scripts\python.exe -m pip install -r requirements-windows.txt -r requirements-dev.txt
 .\.venv-win\Scripts\python.exe -m pytest tests/test_platform_imports.py -q
 ```
@@ -119,9 +126,10 @@ Student Core 的完整导入树不得加载 `AppKit`、`Foundation`、`objc` 或
 ## 3. 隔离与确定性规则
 
 1. pytest 在 collection 导入任何应用模块前，先把 `HOME`、`USERPROFILE` 和 `APPDATA`
-   指向临时 collection sandbox，使全局 app 与 SQLite 不会创建在真实
-   `~/.workbuddy-copilot`。具体用例仍使用独立临时 SQLite、spool 和配置；服务端本地
-   WorkBuddy 目录设为 forbidden sentinel，访问即失败。
+   指向临时 collection sandbox，并生成 sandbox config、通过 `COPILOT_CONFIG`
+   强制 server 使用其中的临时 SQLite。即使仓库根存在被忽略、指向绝对路径的
+   `config.json`，collection 也不得读取或迁移其 DB。具体用例仍使用独立临时
+   SQLite、spool 和配置；服务端本地 WorkBuddy 目录设为 forbidden sentinel，访问即失败。
 2. 组件测试使用预绑定端口 `0` 并把实际地址注入客户端，禁止固定占用 8765/18765。
 3. 自动化默认禁止外网，只允许 in-process 或 loopback；真 DeepSeek 和公网域名只在发布
    冒烟使用。

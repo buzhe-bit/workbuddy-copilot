@@ -44,8 +44,9 @@ def _resolve_env(value: Any) -> Any:
 
 
 def load_config(path: Path | str | None = None) -> dict:
-    explicit_path = path is not None
-    cfg_path = Path(path) if explicit_path else DEFAULT_CONFIG_PATH
+    environment_path = os.environ.get("COPILOT_CONFIG")
+    explicit_path = path is not None or bool(environment_path)
+    cfg_path = Path(path or environment_path) if explicit_path else DEFAULT_CONFIG_PATH
     if not cfg_path.exists():
         if not explicit_path and EXAMPLE_CONFIG_PATH.exists():
             log.warning(

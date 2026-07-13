@@ -53,13 +53,15 @@ Windows: headless adapter skeleton (W0/W1 blocked)
 
 ```bash
 python3.13 -m venv venv
+venv/bin/python scripts/python_preflight.py
 venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 ./install.sh
 ./start_service.sh
 ./start_menubar.sh  # 仅 macOS 原生浮标
 ```
 
-项目 Python 版本由 [`.python-version`](.python-version) 固定为 3.13；测试与浏览器工具统一由
+release Python 合同由 [`pyproject.toml`](pyproject.toml) 固定为 `>=3.13,<3.14`，
+[`.python-version`](.python-version) 提供 3.13 选择提示；测试与浏览器工具统一由
 [`requirements-dev.txt`](requirements-dev.txt) 安装。
 
 本地导师台地址为 `http://127.0.0.1:8765/mentor/`。`install.sh` 在 macOS 上安装 hook 并把 Hook spool 放在学员本机；它不把 WorkBuddy 数据位置配置给服务端。
@@ -89,6 +91,7 @@ Windows 不应执行 macOS 安装或浮标命令。待真实 Windows WorkBuddy �
 
 ```bash
 PY=venv/bin/python
+$PY scripts/python_preflight.py
 $PY -m pytest tests/test_wb_upload.py tests/test_quality_summary.py -q
 $PY -m pytest tests/test_platform_imports.py -q
 $PY -m pytest tests/test_student_spool.py tests/test_student_transport.py tests/test_student_coordinator.py tests/test_student_agent.py tests/test_floating_native_phase3.py tests/test_e2e_reverse_message.py tests/test_message_service.py tests/test_mentor_api.py tests/e2e/test_student_agent_system.py -q

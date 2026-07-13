@@ -398,3 +398,73 @@ def test_upload_conversations_uses_injected_adapter_without_accessing_home(monke
             "type": "message", "session_id": "fixture-session", "content": "fixture",
         })),
     }]
+
+
+def test_upload_conversations_none_adapter_uses_real_db_and_transcript(
+    monkeypatch, tmp_path,
+):
+    forbidden_home = tmp_path / "forbidden-home"
+    forbidden_home.mkdir()
+    monkeypatch.setenv("HOME", str(forbidden_home))
+
+    config_dir = tmp_path / "workbuddy-fixture"
+    projects_dir = config_dir / "projects"
+    projects_dir.mkdir(parents=True)
+    db_path = config_dir / "workbuddy.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, cwd TEXT, title TEXT, custom_title TEXT,
+                created_at INTEGER, last_activity_at INTEGER, deleted_at INTEGER
+            );
+            CREATE TABLE workspaces (
+                path TEXT PRIMARY KEY, name TEXT, last_opened_at INTEGER
+            );
+            INSERT INTO sessions VALUES (
+                'real-session', '/fixture/project', 'Fixture', NULL, 1000, 2000, NULL
+            );
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    content = _line({
+        "type": "message",
+        "session_id": "real-session",
+        "role": "user",
+        "content": "read through production adapter",
+    })
+    (projects_dir / "opaque.jsonl").write_text(
+        content + _line({"type": "reasoning", "text": "filtered"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wb_upload, "get_known_shas", lambda *args, **kwargs: {})
+    posted = []
+    monkeypatch.setattr(
+        wb_upload,
+        "post_transcript",
+        lambda server_url, session_id, payload, **kwargs: posted.append(
+            (session_id, payload)
+        ) or {"ok": True},
+    )
+
+    result = wb_upload.upload_conversations(
+        {"service": {"host": "127.0.0.1", "port": 8765}},
+        "student-a",
+        db_path=db_path,
+        projects_dir=projects_dir,
+    )
+
+    assert result == {"total": 1, "synced": 1, "skipped": 0, "failed": 0}
+    assert posted == [(
+        "real-session",
+        {
+            "student_id": "student-a",
+            "filtered_content": content,
+            "sha": wb_upload.content_sha256(content),
+        },
+    )]
+    assert not (forbidden_home / ".workbuddy").exists()

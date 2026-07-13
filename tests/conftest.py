@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import ast
 from fnmatch import fnmatchcase
+import json
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,13 @@ _COLLECTION_HOME.mkdir()
 os.environ["HOME"] = str(_COLLECTION_HOME)
 os.environ["USERPROFILE"] = str(_COLLECTION_HOME)
 os.environ["APPDATA"] = str(_COLLECTION_HOME / "AppData")
+_COLLECTION_CONFIG = _COLLECTION_SANDBOX / "config.json"
+_config = json.loads(
+    (Path(__file__).resolve().parents[1] / "config.example.json").read_text(encoding="utf-8")
+)
+_config["store"]["db_path"] = str(_COLLECTION_SANDBOX / "copilot.db")
+_COLLECTION_CONFIG.write_text(json.dumps(_config), encoding="utf-8")
+os.environ["COPILOT_CONFIG"] = str(_COLLECTION_CONFIG)
 atexit.register(shutil.rmtree, _COLLECTION_SANDBOX, ignore_errors=True)
 
 

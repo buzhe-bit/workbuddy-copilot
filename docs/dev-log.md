@@ -1929,3 +1929,16 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | 平台合同（3.14 诊断） | `<venv>/python -m pytest tests/test_platform_imports.py -q` | FAIL（1 failed, 12 passed）：Student Core 运行时导入树含 `fcntl`。在同一 3.14 下对比 websockets 12.0/14.2/16.1 均为 `fcntl=True`，无证据添加版本上界；等待 CI 3.13 门。 |
 | 尽可能全量（3.14 诊断） | loopback `NO_PROXY` + 真 Chromium 下 `<venv>/python -m pytest -q` | 542 passed, 2 failed, 1 warning；除上述平台合同外，既有多 worker 真进程用例稳定观察到一个 worker 短暂提供 `/health` 后 supervisor 才终止；不在 Task 1 改动 Task 2+ 业务实现。 |
 | 语法与差异 | Ruby YAML 解析、`py_compile`、`git diff --check` | PASS。 |
+
+### Task 1 独立审查修复 — 2026-07-14
+
+| 审查项 | RED | GREEN |
+|---|---|---|
+| C1 collection 安全 | 临时仓库同时放 root danger config 和显式 sandbox config；`tests/test_collection_isolation.py -q` 为 2 failed：主测试进程无 `COPILOT_CONFIG`，子进程实际打开 forbidden DB。 | `load_config()` 显式遵循 `COPILOT_CONFIG`，conftest 在任何 app import 前生成 sandbox config/DB；collection + config 聚焦 23 passed，预置 sentinel DB 字节与 WAL/SHM 状态未变。 |
+| I1 Python 合同 | `tests/test_python_contract.py -q` 为 3 failed：无 `pyproject.toml`、无上下界函数、无可执行 preflight。 | PEP 621 声明 `>=3.13,<3.14`并显式只发现 `copilot*`；preflight 上下界与当前 3.14 非零均通过（3 passed），三 CI lane/README 均调用。 |
+| I2 机器摘要 | 成功、collection error、KeyboardInterrupt+旧 passed 行、no-tests 与旧参数兼容共 6 failed：新参数不识别，旧参数假绿。 | `--pytest-exit-code` 可选兼容；只有 exit 0 + 有效终态为 passed，非零为 failed，不可解析为 unknown；6 passed，三 lane 传入保存退出码。 |
+| I3 production None | 新用例使用真临时 WorkBuddy SQLite/projects JSONL 且不传 adapter；在 None 分支放 breaker 后 1 failed。 | 撤销 breaker 后 1 passed：真实 `read_sessions`、生产 adapter 构造、`read_transcript` 与过滤后上传全链路通过，forbidden HOME 未产生 `.workbuddy`。 |
+| 审查修复聚焦 | — | `tests/test_collection_isolation.py tests/test_config.py tests/test_python_contract.py tests/test_quality_summary.py tests/test_wb_upload.py -q`：47 passed。 |
+| server/core 业务子集 | — | 61 passed；3.14 平台诊断仍为 12 passed/1 `fcntl` failed，preflight 正确非零拒绝。 |
+| macOS 真 Chromium | — | loopback `NO_PROXY` 下 29 passed。 |
+| 尽可能全量（3.14 诊断） | — | 553 passed, 2 failed, 1 warning；仍仅为已登记的 3.14 `fcntl` 合同差异与既有多 worker 短暂 `/health` 失败，本修复未改 Task 2+ 业务代码。 |
