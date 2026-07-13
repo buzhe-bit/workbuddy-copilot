@@ -121,7 +121,12 @@ class StudentCoordinator:
             accepted = False
             try:
                 try:
-                    result = await _maybe_await(self.transport.post_hook(entry.payload))
+                    result = await _maybe_await(
+                        self.transport.post_hook(
+                            entry.payload,
+                            event_id=entry.event_id,
+                        )
+                    )
                 except (TemporaryNetworkError, PermanentTransportError):
                     result = None
                 except Exception as exc:

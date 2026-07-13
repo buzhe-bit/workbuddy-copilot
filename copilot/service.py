@@ -35,12 +35,14 @@ from .llm import (
     coerce_analysis_outcome,
     question_fallback_answer,
 )
-from .models import AnalysisResult
+from .models import AnalysisResult, normalize_event_id
 from .services import (
     EXPLICIT_RAW_TRANSCRIPT_MARKER,
+    AnalysisRetriesExhausted,
     AnalysisService,
     MessageService,
     SessionQueryService,
+    bounded_analysis_input,
 )
 from .store import Store
 from .upload_service import (
@@ -58,10 +60,35 @@ logging.basicConfig(
 log = logging.getLogger("copilot.service")
 
 
+class _EventId(str):
+    """Pydantic 1/2 compatible hook id type backed by the Store invariant."""
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        from pydantic_core import core_schema
+
+        return core_schema.no_info_after_validator_function(
+            cls.validate,
+            core_schema.str_schema(),
+        )
+
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, value, *args):
+        normalized = normalize_event_id(value)
+        if normalized is None:
+            raise ValueError("invalid event_id")
+        return cls(normalized)
+
+
 class ReportIn(BaseModel):
     student_id: str
     session_id: str | None = None
     event: str
+    event_id: _EventId | None = None
     prompt: str = ""
     transcript_tail: str | None = None
     transcript_full: str | None = None
@@ -185,14 +212,18 @@ async def _handle_stop_background(
     prompt: str,
     transcript_content: str,
     report_id: int,
+    *,
+    sleeper=None,
 ) -> None:
     try:
-        await analysis_svc.handle_stop(
+        kwargs = {"sleeper": sleeper} if sleeper is not None else {}
+        await analysis_svc.handle_stop_with_retry(
             student_id=student_id,
             session_id=session_id,
             prompt_text=prompt,
             transcript_content=transcript_content,
             report_id=report_id,
+            **kwargs,
         )
     except Exception as exc:
         log.exception("background Stop analysis failed report_id=%s: %s", report_id, exc)
@@ -530,18 +561,42 @@ async def _retry_upload_request_analysis_background(
         )
 
 
-async def _recover_pending_reports(ctx: AppContext) -> None:
-    pending_reports = ctx.store.list_pending_reports()
-    if not pending_reports:
+def _prepare_report_recovery(ctx: AppContext) -> tuple[int, ...]:
+    """Repair crash state and enumerate work without invoking a provider."""
+    if not ctx.report_recovery_prepared:
+        interrupted = ctx.store.recover_interrupted_report_analyses(max_attempts=3)
+        if interrupted:
+            log.warning("recovered %d interrupted Stop analysis claims", interrupted)
+        pending_reports = ctx.store.list_recoverable_reports(max_attempts=3)
+        ctx.report_recovery_prepared = True
+    else:
+        pending_reports = ctx.store.list_recoverable_reports(max_attempts=3)
+    return tuple(
+        int(row["id"])
+        for row in pending_reports
+        if row.get("event") == "Stop"
+    )
+
+
+async def _recover_pending_reports(
+    ctx: AppContext,
+    *,
+    sleeper=None,
+    report_ids: tuple[int, ...] | None = None,
+) -> None:
+    if report_ids is None:
+        report_ids = _prepare_report_recovery(ctx)
+    if not report_ids:
         return
 
-    stop_reports = [row for row in pending_reports if row.get("event") == "Stop"]
     log.warning(
         "recovering %d pending Stop reports from previous process",
-        len(stop_reports),
+        len(report_ids),
     )
-    for row in stop_reports:
-        report_id = int(row["id"])
+    for report_id in report_ids:
+        row = ctx.store.get_report(report_id)
+        if not row or row.get("event") != "Stop":
+            continue
         student_id = str(row.get("student_id") or "")
         session_id = str(row.get("session_id") or "")
         if ctx.store.analysis_exists_for_report(report_id):
@@ -549,16 +604,28 @@ async def _recover_pending_reports(ctx: AppContext) -> None:
                 "pending Stop report_id=%s already has analysis; clearing pending flag",
                 report_id,
             )
-            ctx.store.set_analysis_pending(report_id, False)
+            ctx.store.mark_report_analysis_done(report_id)
             continue
 
-        transcript_content = ""
+        persisted_analysis_input = row.get("analysis_input")
         if (
-            session_id
+            persisted_analysis_input is None
+            and session_id
             and row.get("transcript_path") == EXPLICIT_RAW_TRANSCRIPT_MARKER
         ):
             raw = ctx.store.get_raw_transcript_for_report(session_id, row.get("created_at"))
-            transcript_content = (raw or {}).get("content") or ""
+            if raw is not None:
+                ctx.store.set_report_analysis_input_if_missing(
+                    report_id,
+                    bounded_analysis_input(raw.get("content") or ""),
+                )
+                row = ctx.store.get_report(report_id) or row
+                persisted_analysis_input = row.get("analysis_input")
+        transcript_content = (
+            str(persisted_analysis_input)
+            if persisted_analysis_input is not None
+            else ""
+        )
         log.info(
             "requeue pending Stop report_id=%s student=%s session=%s transcript_bytes=%d",
             report_id,
@@ -566,14 +633,51 @@ async def _recover_pending_reports(ctx: AppContext) -> None:
             (session_id or "?")[:8],
             len(transcript_content.encode("utf-8")),
         )
-        await _handle_stop_background(
-            ctx.analysis_svc,
-            student_id,
-            session_id,
-            str(row.get("prompt") or ""),
-            transcript_content,
-            report_id,
+        kwargs = {"sleeper": sleeper} if sleeper is not None else {}
+        try:
+            await ctx.analysis_svc.handle_stop_with_retry(
+                student_id=student_id,
+                session_id=session_id,
+                prompt_text=str(row.get("prompt") or ""),
+                transcript_content=transcript_content,
+                report_id=report_id,
+                **kwargs,
+            )
+        except AnalysisRetriesExhausted as exc:
+            log.error(
+                "recovered Stop analysis exhausted report_id=%s error=%s",
+                report_id,
+                exc,
+            )
+
+
+def _log_report_recovery_failure(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error(
+            "report recovery task failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
         )
+
+
+def _start_report_recovery(
+    ctx: AppContext,
+    report_ids: tuple[int, ...],
+) -> asyncio.Task | None:
+    existing = ctx.report_recovery_task
+    if existing is not None:
+        return existing
+    if not report_ids:
+        return None
+    task = asyncio.create_task(
+        _recover_pending_reports(ctx, report_ids=report_ids),
+        name="report-recovery",
+    )
+    task.add_done_callback(_log_report_recovery_failure)
+    ctx.report_recovery_task = task
+    return task
 
 
 def create_app(context: AppContext | None = None) -> FastAPI:
@@ -594,11 +698,27 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                     "recovered %d interrupted upload analyses",
                     len(recovered_uploads),
                 )
-            await _recover_pending_reports(ctx)
+            report_ids = _prepare_report_recovery(ctx)
+            _start_report_recovery(ctx, report_ids)
             yield
         finally:
-            release_worker_lock(ctx)
-            log.info("Copilot service stopped")
+            task = ctx.report_recovery_task
+            requested_cancel = False
+            try:
+                if task is not None and not task.done():
+                    requested_cancel = True
+                    task.cancel()
+                if task is not None:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        if not requested_cancel:
+                            raise
+            finally:
+                ctx.report_recovery_task = None
+                ctx.report_recovery_prepared = False
+                release_worker_lock(ctx)
+                log.info("Copilot service stopped")
 
     app = FastAPI(title="WorkBuddy Copilot", version="0.2.0", lifespan=lifespan)
     app.state.context = ctx
@@ -630,7 +750,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     ):
         transcript_content = data.transcript_tail or ""
         try:
-            report_id, session_id, snap = analysis_svc.accept_report(
+            accepted = analysis_svc.accept_report(
                 student_id=data.student_id,
                 session_id=data.session_id,
                 event=data.event,
@@ -638,9 +758,15 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                 transcript_content=transcript_content,
                 raw_transcript_content=data.transcript_full,
                 cwd=data.cwd,
+                event_id=data.event_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        report_id, session_id, snap = accepted
+        duplicate = bool(getattr(accepted, "duplicate", False))
+        analysis_status = str(
+            getattr(accepted, "analysis_status", "not_requested")
+        )
         log.info(
             "report accepted student=%s session=%s event=%s msgs=%d tools=%d",
             data.student_id,
@@ -650,14 +776,20 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             snap.tool_calls,
         )
 
-        body: dict[str, Any] = {"status": "accepted", "report_id": report_id}
+        body: dict[str, Any] = {
+            "status": "accepted",
+            "report_id": report_id,
+            "duplicate": duplicate,
+            "analysis_status": analysis_status,
+        }
         if data.event == "UserPromptSubmit":
             body["prompt_id"] = await analysis_svc.handle_user_prompt_submit(
                 data.student_id,
                 session_id,
                 data.prompt,
+                report_id=report_id,
             )
-        elif data.event == "Stop":
+        elif data.event == "Stop" and not duplicate:
             background_tasks.add_task(
                 _handle_stop_background,
                 analysis_svc,

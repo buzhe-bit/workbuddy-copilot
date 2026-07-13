@@ -71,6 +71,24 @@ def test_post_hook_sends_contract_and_auth_headers_without_logging_token() -> No
     assert captured["timeout"] == 2.5
 
 
+def test_post_hook_includes_spool_event_id_when_supplied() -> None:
+    captured: dict[str, object] = {}
+
+    def opener(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return Response(202, b'{"status":"accepted"}')
+
+    transport = StudentTransport(
+        "https://copilot.example",
+        student_id="student-1",
+        opener=opener,
+    )
+
+    transport.post_hook(event(), event_id="spool-event-1")
+
+    assert captured["body"] == {**event().to_dict(), "event_id": "spool-event-1"}
+
+
 @pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
 def test_post_hook_classifies_retryable_http_failures(status: int) -> None:
     def opener(request, timeout):

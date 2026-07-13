@@ -7,7 +7,7 @@ import pytest
 
 from copilot.eventbus import EventBus
 from copilot.llm import AnalysisOutcome
-from copilot.services import AnalysisService
+from copilot.services import AnalysisService, MAX_ANALYSIS_INPUT_BYTES
 from copilot.store import Store
 
 
@@ -55,6 +55,114 @@ def test_stop_tail_is_analysis_input_not_raw_transcript(tmp_path):
             "student-a", "tail-only"
         ) is None
         assert llm_inputs == ["tail used only for analysis"]
+
+    asyncio.run(scenario())
+
+
+def test_oversized_stop_uses_same_bounded_tail_for_snapshot_and_live_analysis(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "service.db")
+        seen_messages: list[list[str]] = []
+        oversized = (
+            _line({
+                "type": "message",
+                "role": "user",
+                "content": "PREFIX-MUST-BE-DROPPED-" + ("x" * MAX_ANALYSIS_INPUT_BYTES),
+                "sessionId": "bounded-tail",
+            })
+            + _line({
+                "type": "message",
+                "role": "user",
+                "content": "TAIL-MARKER-MUST-SURVIVE",
+                "sessionId": "bounded-tail",
+            })
+        )
+
+        async def fake_llm(cfg, snap, event, latest_prompt):
+            seen_messages.append([message.text for message in snap.messages])
+            return {"topic": "bounded", "diagnosis": "same durable tail"}
+
+        service = AnalysisService(store, fake_llm, {"llm": {}}, EventBus())
+        accepted = service.accept_report(
+            student_id="student-bounded",
+            session_id="bounded-tail",
+            event="Stop",
+            prompt_text="bounded",
+            transcript_content=oversized,
+        )
+        row = store.get_report(accepted.report_id)
+
+        assert len(row["analysis_input"].encode("utf-8")) <= MAX_ANALYSIS_INPUT_BYTES
+        assert "PREFIX-MUST-BE-DROPPED" not in row["analysis_input"]
+        assert "TAIL-MARKER-MUST-SURVIVE" in row["analysis_input"]
+        assert [message.text for message in accepted.snapshot.messages] == [
+            "TAIL-MARKER-MUST-SURVIVE",
+        ]
+
+        async def no_sleep(delay: float) -> None:
+            return None
+
+        await service.handle_stop_with_retry(
+            "student-bounded",
+            accepted.session_id,
+            "bounded",
+            oversized,
+            accepted.report_id,
+            sleeper=no_sleep,
+        )
+        assert seen_messages == [["TAIL-MARKER-MUST-SURVIVE"]]
+
+    asyncio.run(scenario())
+
+
+def test_empty_stop_tail_uses_explicit_full_as_durable_analysis_input(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "service.db"
+        store = Store(db_path)
+        seen_messages: list[list[str]] = []
+        explicit_full = _line({
+            "type": "message",
+            "role": "user",
+            "content": "EXPLICIT-FULL-FALLBACK",
+            "sessionId": "full-fallback",
+        })
+
+        async def fake_llm(cfg, snap, event, latest_prompt):
+            seen_messages.append([message.text for message in snap.messages])
+            return {"topic": "full fallback", "diagnosis": "explicit only"}
+
+        service = AnalysisService(store, fake_llm, {"llm": {}}, EventBus())
+        accepted = service.accept_report(
+            student_id="student-full-fallback",
+            session_id="full-fallback",
+            event="Stop",
+            prompt_text="analyze explicit full",
+            transcript_content="",
+            raw_transcript_content=explicit_full,
+        )
+        assert store.get_report(accepted.report_id)["analysis_input"] == explicit_full
+        assert store.get_raw_transcript("full-fallback")["content"] == explicit_full
+        assert [message.text for message in accepted.snapshot.messages] == [
+            "EXPLICIT-FULL-FALLBACK",
+        ]
+
+        restarted_store = Store(db_path)
+        restarted = AnalysisService(
+            restarted_store, fake_llm, {"llm": {}}, EventBus(),
+        )
+
+        async def no_sleep(delay: float) -> None:
+            return None
+
+        await restarted.handle_stop_with_retry(
+            "student-full-fallback",
+            "full-fallback",
+            "analyze explicit full",
+            "",
+            accepted.report_id,
+            sleeper=no_sleep,
+        )
+        assert seen_messages == [["EXPLICIT-FULL-FALLBACK"]]
 
     asyncio.run(scenario())
 
@@ -315,12 +423,13 @@ def test_handle_stop_keeps_report_pending_and_persists_no_false_analysis_on_prov
     asyncio.run(scenario())
 
 
-def test_handle_stop_retry_reuses_one_persisted_prompt_and_publishes_it_once(tmp_path):
+def test_handle_stop_with_retry_uses_zero_one_five_and_succeeds_on_third_attempt(tmp_path):
     async def scenario():
         store = Store(tmp_path / "service.db")
         bus = EventBus()
         events = []
         attempts = 0
+        sleeps: list[float] = []
 
         async def collect(payload):
             events.append(payload)
@@ -353,22 +462,16 @@ def test_handle_stop_retry_reuses_one_persisted_prompt_and_publishes_it_once(tmp
             transcript_content="",
         )
 
-        for _ in range(2):
-            with pytest.raises(RuntimeError, match="TimeoutError"):
-                await service.handle_stop(
-                    "stu-retry",
-                    session_id,
-                    "persist me across retries",
-                    "",
-                    report_id,
-                )
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
 
-        result = await service.handle_stop(
+        result = await service.handle_stop_with_retry(
             "stu-retry",
             session_id,
             "persist me across retries",
             "",
             report_id,
+            sleeper=fake_sleep,
         )
 
         assert result.topic == "recovered"
@@ -387,12 +490,173 @@ def test_handle_stop_retry_reuses_one_persisted_prompt_and_publishes_it_once(tmp
                     ("sess-retry",),
                 ).fetchall()
             ]
+            report = dict(conn.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone())
+            analyses = conn.execute(
+                "SELECT COUNT(*) FROM analyses WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()[0]
+        assert attempts == 3
+        assert sleeps == [0, 1, 5]
         assert len(prompts) == 1
         assert prompts[0]["seq_in_session"] == 0
         assert prompts[0]["content"] == "persist me across retries"
         assert len(summaries) == 1
+        assert analyses == 1
         assert summaries[0]["prompt_id"] == prompts[0]["id"]
         assert [event["type"] for event in events] == ["prompt", "ai_summary", "analysis"]
         assert store.list_pending_reports() == []
+        assert report["analysis_status"] == "done"
+        assert report["analysis_attempts"] == 3
+        assert report["analysis_error"] == ""
+        assert report["analysis_next_retry_at"] is None
+        assert report["analysis_input"] is None
+
+    asyncio.run(scenario())
+
+
+def test_handle_stop_with_retry_caps_provider_failure_and_keeps_input(tmp_path, caplog):
+    async def scenario():
+        store = Store(tmp_path / "service.db")
+        attempts = 0
+        sleeps: list[float] = []
+        retry_snapshots: list[dict] = []
+        transcript_tail = _line({
+            "type": "message",
+            "role": "user",
+            "content": "durable failure tail",
+            "sessionId": "sess-failed",
+        })
+
+        async def failed_llm(cfg, snap, event, latest_prompt):
+            nonlocal attempts
+            attempts += 1
+            return AnalysisOutcome(
+                ok=False,
+                value={},
+                error="LLM provider HTTP 503 provider-secret-body",
+            )
+
+        service = AnalysisService(store, failed_llm, {"llm": {}}, EventBus())
+        report_id, session_id, _ = service.accept_report(
+            student_id="stu-failed",
+            session_id="sess-failed",
+            event="Stop",
+            prompt_text="retry me",
+            transcript_content=transcript_tail,
+        )
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+            with store._conn() as conn:
+                retry_snapshots.append(dict(conn.execute(
+                    "SELECT * FROM reports WHERE id = ?",
+                    (report_id,),
+                ).fetchone()))
+
+        with pytest.raises(RuntimeError, match="llm_provider_http_503") as exc_info:
+            await service.handle_stop_with_retry(
+                "stu-failed",
+                session_id,
+                "retry me",
+                "IGNORED TRANSIENT INPUT",
+                report_id,
+                sleeper=fake_sleep,
+            )
+        assert "provider-secret-body" not in str(exc_info.value)
+
+        with store._conn() as conn:
+            report = dict(conn.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone())
+            prompt_count = conn.execute(
+                "SELECT COUNT(*) FROM prompts WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()[0]
+            analysis_count = conn.execute(
+                "SELECT COUNT(*) FROM analyses WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()[0]
+
+        assert attempts == 3
+        assert sleeps == [0, 1, 5]
+        assert [row["analysis_attempts"] for row in retry_snapshots] == [0, 1, 2]
+        assert [row["analysis_error"] for row in retry_snapshots] == [
+            "",
+            "llm_provider_http_503",
+            "llm_provider_http_503",
+        ]
+        assert retry_snapshots[1]["analysis_next_retry_at"] is not None
+        assert retry_snapshots[2]["analysis_next_retry_at"] is not None
+        assert report["analysis_status"] == "failed"
+        assert report["analysis_attempts"] == 3
+        assert report["analysis_error"] == "llm_provider_http_503"
+        assert report["analysis_next_retry_at"] is None
+        assert report["analysis_input"] == transcript_tail
+        assert prompt_count == 1
+        assert analysis_count == 0
+
+    asyncio.run(scenario())
+    assert "provider-secret-body" not in caplog.text
+
+
+def test_concurrent_retry_claims_create_one_analysis(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "service.db")
+        provider_started = asyncio.Event()
+        provider_release = asyncio.Event()
+        llm_calls = 0
+
+        async def blocking_llm(cfg, snap, event, latest_prompt):
+            nonlocal llm_calls
+            llm_calls += 1
+            provider_started.set()
+            await provider_release.wait()
+            return {"topic": "claimed once", "diagnosis": "single winner"}
+
+        service = AnalysisService(store, blocking_llm, {"llm": {}}, EventBus())
+        report_id, session_id, _ = service.accept_report(
+            student_id="stu-race",
+            session_id="sess-race",
+            event="Stop",
+            prompt_text="race",
+            transcript_content=_line({
+                "type": "message",
+                "role": "user",
+                "content": "race tail",
+                "sessionId": "sess-race",
+            }),
+        )
+
+        async def no_sleep(delay: float) -> None:
+            return None
+
+        first = asyncio.create_task(service.handle_stop_with_retry(
+            "stu-race", session_id, "race", "", report_id, sleeper=no_sleep,
+        ))
+        await provider_started.wait()
+        second = asyncio.create_task(service.handle_stop_with_retry(
+            "stu-race", session_id, "race", "", report_id, sleeper=no_sleep,
+        ))
+        await asyncio.wait_for(second, timeout=1)
+        provider_release.set()
+        await first
+
+        with store._conn() as conn:
+            analysis_count = conn.execute(
+                "SELECT COUNT(*) FROM analyses WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()[0]
+            report = dict(conn.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone())
+        assert llm_calls == 1
+        assert analysis_count == 1
+        assert report["analysis_status"] == "done"
+        assert report["analysis_attempts"] == 1
 
     asyncio.run(scenario())

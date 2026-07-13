@@ -6,7 +6,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+import re
+from typing import Iterator, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .transcript import TranscriptSnapshot
+
+
+_EVENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def normalize_event_id(value: str | None) -> str | None:
+    """Validate a durable hook id while preserving legacy empty ids."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or _EVENT_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("invalid event_id")
+    return value
 
 
 @dataclass
@@ -91,6 +107,26 @@ class TimelineEntry:
     understanding: str = ""
     topic: str = ""
     is_technical: bool = False
+
+
+@dataclass(frozen=True)
+class AcceptedReport:
+    """Durable result of accepting one hook report.
+
+    Iteration preserves the legacy ``report_id, session_id, snapshot`` unpacking
+    contract while callers migrate to the explicit delivery fields.
+    """
+
+    report_id: int
+    session_id: str
+    snapshot: TranscriptSnapshot
+    duplicate: bool = False
+    analysis_status: str = "not_requested"
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.report_id
+        yield self.session_id
+        yield self.snapshot
 
 
 @dataclass

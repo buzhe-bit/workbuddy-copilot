@@ -151,7 +151,7 @@ def test_failed_post_does_not_ack(tmp_path: Path) -> None:
     spool.enqueue(make_event(), event_id="keep")
 
     class OfflineTransport:
-        def post_hook(self, event: HookEvent) -> Accepted:
+        def post_hook(self, event: HookEvent, *, event_id: str = "") -> Accepted:
             raise TemporaryNetworkError("offline")
 
     assert consume_one(spool, OfflineTransport()) is False
@@ -166,7 +166,7 @@ def test_failed_post_releases_claim_for_later_retry(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.attempts = 0
 
-        def post_hook(self, event: HookEvent) -> Accepted:
+        def post_hook(self, event: HookEvent, *, event_id: str = "") -> Accepted:
             self.attempts += 1
             if self.attempts == 1:
                 raise TemporaryNetworkError("offline")
@@ -183,11 +183,27 @@ def test_post_is_acked_only_after_accepted(tmp_path: Path) -> None:
     spool.enqueue(make_event(), event_id="accepted")
 
     class AcceptedTransport:
-        def post_hook(self, event: HookEvent) -> Accepted:
+        def post_hook(self, event: HookEvent, *, event_id: str = "") -> Accepted:
             return Accepted(status_code=202, body={"accepted": True})
 
     assert consume_one(spool, AcceptedTransport()) is True
     assert spool.pending() == []
+
+
+def test_consume_one_forwards_spool_event_id(tmp_path: Path) -> None:
+    spool = EventSpool(tmp_path)
+    spool.enqueue(make_event(), event_id="durable-event")
+    received_event_ids: list[str] = []
+
+    class AcceptedTransport:
+        def post_hook(
+            self, event: HookEvent, *, event_id: str = "",
+        ) -> Accepted:
+            received_event_ids.append(event_id)
+            return Accepted(status_code=202)
+
+    assert consume_one(spool, AcceptedTransport()) is True
+    assert received_event_ids == ["durable-event"]
 
 
 def test_concurrent_enqueue_same_id_has_one_winner(tmp_path: Path) -> None:
@@ -217,7 +233,7 @@ def test_concurrent_consume_claims_event_once(tmp_path: Path) -> None:
     calls_lock = threading.Lock()
 
     class SlowAcceptedTransport:
-        def post_hook(self, event: HookEvent) -> Accepted:
+        def post_hook(self, event: HookEvent, *, event_id: str = "") -> Accepted:
             nonlocal calls
             with calls_lock:
                 calls += 1

@@ -90,10 +90,12 @@ class StudentTransport:
         query = urllib.parse.urlencode({"student_id": self.student_id})
         return f"{scheme}://{host}/ws?{query}"
 
-    def post_hook(self, event: HookEvent) -> Accepted:
+    def post_hook(self, event: HookEvent, *, event_id: str = "") -> Accepted:
         payload = event.to_dict()
         if not payload["student_id"]:
             payload["student_id"] = self.student_id
+        if event_id:
+            payload["event_id"] = str(event_id)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/report",

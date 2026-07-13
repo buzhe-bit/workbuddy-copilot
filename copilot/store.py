@@ -13,6 +13,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .models import normalize_event_id
+
 log = logging.getLogger("copilot.store")
 
 LEGACY_PROMPT_BACKFILL_WINDOW_SECONDS = 30.0
@@ -29,6 +31,12 @@ CREATE TABLE IF NOT EXISTS reports (
     msg_count INTEGER,
     tool_calls INTEGER,
     analysis_pending INTEGER DEFAULT 0,
+    event_id TEXT,
+    analysis_input TEXT,
+    analysis_status TEXT NOT NULL DEFAULT 'not_requested',
+    analysis_attempts INTEGER NOT NULL DEFAULT 0,
+    analysis_error TEXT NOT NULL DEFAULT '',
+    analysis_next_retry_at REAL,
     created_at REAL NOT NULL
 );
 
@@ -185,6 +193,12 @@ CREATE TABLE IF NOT EXISTS prompt_configs (
 # 注意：session 索引必须在迁移补列之后创建，否则旧库 executescript 会因缺列报错
 _MIGRATIONS = [
     ("reports", "analysis_pending", "INTEGER DEFAULT 0"),
+    ("reports", "event_id", "TEXT"),
+    ("reports", "analysis_input", "TEXT"),
+    ("reports", "analysis_status", "TEXT NOT NULL DEFAULT 'not_requested'"),
+    ("reports", "analysis_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("reports", "analysis_error", "TEXT NOT NULL DEFAULT ''"),
+    ("reports", "analysis_next_retry_at", "REAL"),
     ("analyses", "session_id", "TEXT"),
     ("analyses", "session_title", "TEXT"),
     ("analyses", "is_technical", "INTEGER DEFAULT 0"),
@@ -208,6 +222,18 @@ _MIGRATIONS = [
 ]
 
 _POST_MIGRATION_SQL = [
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_student_event_id_unique
+       ON reports(student_id, event_id)
+       WHERE event_id IS NOT NULL AND event_id != ''""",
+    """UPDATE reports
+       SET analysis_status = 'done',
+           analysis_pending = 0,
+           analysis_input = NULL,
+           analysis_error = '',
+           analysis_next_retry_at = NULL
+       WHERE EXISTS (SELECT 1 FROM analyses WHERE analyses.report_id = reports.id)""",
+    """UPDATE reports SET analysis_status = 'pending'
+       WHERE analysis_pending = 1 AND analysis_status = 'not_requested'""",
     "CREATE INDEX IF NOT EXISTS idx_analyses_session ON analyses(session_id, created_at)",
     # 回填旧数据的 session_id（从 reports 表关联）
     "UPDATE analyses SET session_id = (SELECT session_id FROM reports WHERE reports.id = analyses.report_id) WHERE analyses.session_id IS NULL",
@@ -422,6 +448,78 @@ class Store:
                 tool_calls=tool_calls,
             )
 
+    def accept_report(
+        self,
+        *,
+        student_id: str,
+        session_id: str | None,
+        event: str,
+        event_id: str | None,
+        prompt: str,
+        transcript_path: str,
+        msg_count: int,
+        tool_calls: int,
+        analysis_input: str | None,
+        work_dir: str = "",
+        title: str = "",
+        raw_transcript_content: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically persist a report or return the original idempotent row."""
+        normalized_event_id = normalize_event_id(event_id)
+        analysis_status = "pending" if event == "Stop" else "not_requested"
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            if normalized_event_id is not None:
+                existing = c.execute(
+                    """SELECT * FROM reports
+                       WHERE student_id = ? AND event_id = ?
+                       LIMIT 1""",
+                    (student_id, normalized_event_id),
+                ).fetchone()
+                if existing:
+                    if str(existing["event"] or "") != event:
+                        raise ValueError(
+                            "event_id already belongs to a different event type"
+                        )
+                    return dict(existing), True
+
+            self._ensure_session_owner_with_conn(c, session_id, student_id)
+
+            report_id = self._add_report_with_conn(
+                c,
+                student_id=student_id,
+                session_id=session_id,
+                event=event,
+                event_id=normalized_event_id,
+                prompt=prompt,
+                transcript_path=transcript_path,
+                msg_count=msg_count,
+                tool_calls=tool_calls,
+                analysis_input=analysis_input if event == "Stop" else None,
+                analysis_status=analysis_status,
+                analysis_pending=event == "Stop",
+            )
+            if session_id:
+                self._upsert_session_with_conn(
+                    c,
+                    session_id=session_id,
+                    student_id=student_id,
+                    work_dir=work_dir,
+                    title=title,
+                )
+            if raw_transcript_content is not None and session_id:
+                self._add_raw_transcript_with_conn(
+                    c,
+                    session_id=session_id,
+                    student_id=student_id,
+                    content=raw_transcript_content,
+                )
+            row = c.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone()
+            return dict(row), False
+
     def _add_report_with_conn(
         self,
         c: sqlite3.Connection,
@@ -433,6 +531,10 @@ class Store:
         msg_count: int,
         tool_calls: int,
         prompt: str = "",
+        event_id: str | None = None,
+        analysis_input: str | None = None,
+        analysis_status: str = "not_requested",
+        analysis_pending: bool = False,
     ) -> int:
         """Insert a report using an existing transaction."""
         now = time.time()
@@ -445,8 +547,9 @@ class Store:
         cur = c.execute(
             """INSERT INTO reports
                (student_id, session_id, event, prompt, transcript_path,
-                msg_count, tool_calls, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                msg_count, tool_calls, analysis_pending, event_id,
+                analysis_input, analysis_status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 student_id,
                 session_id,
@@ -455,6 +558,10 @@ class Store:
                 transcript_path,
                 msg_count,
                 tool_calls,
+                1 if analysis_pending else 0,
+                event_id,
+                analysis_input,
+                analysis_status,
                 now,
             ),
         )
@@ -495,33 +602,61 @@ class Store:
         created = now if created_at is None else created_at
         last_activity = now if last_activity_at is None else last_activity_at
         with self._conn() as c:
-            self._ensure_session_owner_with_conn(c, session_id, student_id)
-            c.execute(
-                """INSERT INTO sessions
-                   (session_id, student_id, work_dir, title, group_type, space_name,
-                    created_at, last_activity_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(session_id) DO UPDATE SET
-                     work_dir = CASE
-                       WHEN sessions.work_dir IS NULL OR sessions.work_dir = ''
-                       THEN excluded.work_dir
-                       ELSE sessions.work_dir
-                     END,
-                     title = COALESCE(NULLIF(excluded.title, ''), sessions.title),
-                     group_type = COALESCE(NULLIF(excluded.group_type, ''), sessions.group_type),
-                     space_name = COALESCE(NULLIF(excluded.space_name, ''), sessions.space_name),
-                     last_activity_at = excluded.last_activity_at""",
-                (
-                    session_id,
-                    student_id,
-                    work_dir,
-                    title,
-                    group_type,
-                    space_name,
-                    created,
-                    last_activity,
-                ),
+            self._upsert_session_with_conn(
+                c,
+                session_id=session_id,
+                student_id=student_id,
+                work_dir=work_dir,
+                title=title,
+                created_at=created,
+                last_activity_at=last_activity,
+                group_type=group_type,
+                space_name=space_name,
             )
+
+    def _upsert_session_with_conn(
+        self,
+        c: sqlite3.Connection,
+        *,
+        session_id: str,
+        student_id: str,
+        work_dir: str,
+        title: str,
+        created_at: float | None = None,
+        last_activity_at: float | None = None,
+        group_type: str | None = None,
+        space_name: str | None = None,
+    ) -> None:
+        now = time.time()
+        created = now if created_at is None else created_at
+        last_activity = now if last_activity_at is None else last_activity_at
+        self._ensure_session_owner_with_conn(c, session_id, student_id)
+        c.execute(
+            """INSERT INTO sessions
+               (session_id, student_id, work_dir, title, group_type, space_name,
+                created_at, last_activity_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 work_dir = CASE
+                   WHEN sessions.work_dir IS NULL OR sessions.work_dir = ''
+                   THEN excluded.work_dir
+                   ELSE sessions.work_dir
+                 END,
+                 title = COALESCE(NULLIF(excluded.title, ''), sessions.title),
+                 group_type = COALESCE(NULLIF(excluded.group_type, ''), sessions.group_type),
+                 space_name = COALESCE(NULLIF(excluded.space_name, ''), sessions.space_name),
+                 last_activity_at = excluded.last_activity_at""",
+            (
+                session_id,
+                student_id,
+                work_dir,
+                title,
+                group_type,
+                space_name,
+                created,
+                last_activity,
+            ),
+        )
 
     def _ensure_session_owner_with_conn(
         self,
@@ -825,15 +960,32 @@ class Store:
     ) -> int:
         """Persist complete raw transcript content without truncation."""
         with self._conn() as c:
-            self._ensure_session_owner_with_conn(c, session_id, student_id)
-            cur = c.execute(
-                """INSERT INTO raw_transcripts
-                   (session_id, student_id, content, content_sha256,
-                    analysis_status, analysis_error, created_at)
-                   VALUES (?, ?, ?, ?, '', '', ?)""",
-                (session_id, student_id, content, content_sha256, time.time()),
+            return self._add_raw_transcript_with_conn(
+                c,
+                session_id=session_id,
+                student_id=student_id,
+                content=content,
+                content_sha256=content_sha256,
             )
-            return cur.lastrowid
+
+    def _add_raw_transcript_with_conn(
+        self,
+        c: sqlite3.Connection,
+        *,
+        session_id: str,
+        student_id: str,
+        content: str,
+        content_sha256: str | None = None,
+    ) -> int:
+        self._ensure_session_owner_with_conn(c, session_id, student_id)
+        cur = c.execute(
+            """INSERT INTO raw_transcripts
+               (session_id, student_id, content, content_sha256,
+                analysis_status, analysis_error, created_at)
+               VALUES (?, ?, ?, ?, '', '', ?)""",
+            (session_id, student_id, content, content_sha256, time.time()),
+        )
+        return int(cur.lastrowid)
 
     def replace_session_messages(
         self,
@@ -1520,6 +1672,224 @@ class Store:
                 (1 if pending else 0, report_id),
             )
             return cur.rowcount
+
+    def mark_report_analysis_done(self, report_id: int) -> int:
+        """Finish one durable delivery and erase its bounded analysis input."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE reports
+                   SET analysis_pending = 0,
+                       analysis_input = NULL,
+                       analysis_status = 'done',
+                       analysis_error = '',
+                       analysis_next_retry_at = NULL
+                   WHERE id = ?""",
+                (report_id,),
+            )
+            return cur.rowcount
+
+    def get_report(self, report_id: int) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_report_analysis_input_if_missing(
+        self,
+        report_id: int,
+        analysis_input: str,
+    ) -> int:
+        """Persist a bounded legacy recovery input before any claim."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE reports
+                   SET analysis_input = ?
+                   WHERE id = ?
+                     AND event = 'Stop'
+                     AND analysis_input IS NULL
+                     AND analysis_status IN ('pending', 'failed')""",
+                (analysis_input, report_id),
+            )
+            return cur.rowcount
+
+    def claim_report_analysis(
+        self,
+        report_id: int,
+        *,
+        max_attempts: int,
+    ) -> dict[str, Any] | None:
+        """Atomically claim one pending/failed report analysis attempt."""
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone()
+            if not row:
+                return None
+            current = dict(row)
+            if (
+                current.get("event") != "Stop"
+                or str(current.get("analysis_status") or "") not in {"pending", "failed"}
+                or int(current.get("analysis_attempts") or 0) >= max_attempts
+            ):
+                return None
+            next_attempt = int(current.get("analysis_attempts") or 0) + 1
+            updated = c.execute(
+                """UPDATE reports
+                   SET analysis_status = 'running',
+                       analysis_attempts = ?,
+                       analysis_error = '',
+                       analysis_next_retry_at = NULL,
+                       analysis_pending = 1
+                   WHERE id = ?
+                     AND analysis_status IN ('pending', 'failed')
+                     AND analysis_attempts < ?""",
+                (next_attempt, report_id, max_attempts),
+            ).rowcount
+            if updated != 1:
+                return None
+            claimed = c.execute(
+                "SELECT * FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone()
+            return dict(claimed)
+
+    def mark_report_analysis_failed(
+        self,
+        report_id: int,
+        *,
+        attempt: int,
+        error_code: str,
+        next_retry_at: float | None,
+    ) -> int:
+        """Persist one failed attempt without erasing its durable input."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE reports
+                   SET analysis_status = 'failed',
+                       analysis_pending = 1,
+                       analysis_error = ?,
+                       analysis_next_retry_at = ?
+                   WHERE id = ?
+                     AND analysis_status = 'running'
+                     AND analysis_attempts = ?""",
+                (error_code, next_retry_at, report_id, attempt),
+            )
+            return cur.rowcount
+
+    def recover_interrupted_report_analyses(self, *, max_attempts: int = 3) -> int:
+        """Make process-crash ``running`` claims visible to startup recovery."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE reports
+                   SET analysis_status = 'failed',
+                       analysis_pending = 1,
+                       analysis_error = 'analysis_interrupted',
+                       analysis_next_retry_at = CASE
+                           WHEN analysis_attempts < ? THEN 0
+                           ELSE NULL
+                       END
+                   WHERE event = 'Stop' AND analysis_status = 'running'""",
+                (max_attempts,),
+            )
+            return cur.rowcount
+
+    def list_recoverable_reports(self, *, max_attempts: int = 3) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM reports
+                   WHERE event = 'Stop'
+                     AND analysis_status IN ('pending', 'failed')
+                     AND analysis_attempts < ?
+                   ORDER BY id ASC""",
+                (max_attempts,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def complete_report_analysis(
+        self,
+        *,
+        report_id: int,
+        prompt_id: int | None,
+        session_id: str,
+        student_id: str,
+        result: dict[str, Any],
+        session_title: str,
+    ) -> tuple[int, bool]:
+        """Commit summary, analysis, done state, and input erasure atomically."""
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            existing = c.execute(
+                "SELECT id FROM analyses WHERE report_id = ? ORDER BY id LIMIT 1",
+                (report_id,),
+            ).fetchone()
+            if existing:
+                c.execute(
+                    """UPDATE reports
+                       SET analysis_pending = 0,
+                           analysis_input = NULL,
+                           analysis_status = 'done',
+                           analysis_error = '',
+                           analysis_next_retry_at = NULL
+                       WHERE id = ?""",
+                    (report_id,),
+                )
+                return int(existing["id"]), False
+
+            summary = str(result.get("ai_reply_summary") or "")
+            if summary:
+                summary_row = (
+                    c.execute(
+                        """SELECT id FROM ai_summaries
+                           WHERE prompt_id = ? ORDER BY id LIMIT 1""",
+                        (prompt_id,),
+                    ).fetchone()
+                    if prompt_id is not None
+                    else None
+                )
+                if summary_row:
+                    c.execute(
+                        """UPDATE ai_summaries
+                           SET session_id = ?, student_id = ?, content = ?, created_at = ?
+                           WHERE id = ?""",
+                        (session_id, student_id, summary, time.time(), summary_row["id"]),
+                    )
+                    c.execute(
+                        "DELETE FROM ai_summaries WHERE prompt_id = ? AND id != ?",
+                        (prompt_id, summary_row["id"]),
+                    )
+                else:
+                    c.execute(
+                        """INSERT INTO ai_summaries
+                           (prompt_id, session_id, student_id, content, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (prompt_id, session_id, student_id, summary, time.time()),
+                    )
+
+            analysis_id = self._add_analysis_with_conn(
+                c,
+                report_id=report_id,
+                student_id=student_id,
+                result=result,
+                session_id=session_id,
+                session_title=session_title,
+            )
+            updated = c.execute(
+                """UPDATE reports
+                   SET analysis_pending = 0,
+                       analysis_input = NULL,
+                       analysis_status = 'done',
+                       analysis_error = '',
+                       analysis_next_retry_at = NULL
+                   WHERE id = ?""",
+                (report_id,),
+            ).rowcount
+            if updated != 1:
+                raise sqlite3.IntegrityError("report disappeared during analysis commit")
+            return analysis_id, True
 
     def list_pending_reports(self) -> list[dict]:
         with self._conn() as c:

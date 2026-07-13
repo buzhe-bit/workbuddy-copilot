@@ -36,11 +36,13 @@ class FakeTransport:
         self.result = result
         self.student_id = student_id
         self.posts: list[HookEvent] = []
+        self.post_event_ids: list[str] = []
         self.sent: list[dict[str, Any]] = []
         self.acked: list[tuple[str, str]] = []
 
-    def post_hook(self, payload: HookEvent) -> object:
+    def post_hook(self, payload: HookEvent, *, event_id: str = "") -> object:
         self.posts.append(payload)
+        self.post_event_ids.append(event_id)
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
@@ -73,6 +75,7 @@ def test_coordinator_acks_only_after_server_accepts(tmp_path: Path) -> None:
         assert accepted == 1
         assert spool.pending() == []
         assert len(transport.posts) == 1
+        assert transport.post_event_ids == ["event-1"]
 
     asyncio.run(scenario())
 

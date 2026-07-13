@@ -15,7 +15,7 @@ from copilot.student_core.transport import Accepted
 class FakeTransport:
     student_id = "student-1"
 
-    def post_hook(self, event: HookEvent) -> Accepted:
+    def post_hook(self, event: HookEvent, *, event_id: str = "") -> Accepted:
         return Accepted(202)
 
 

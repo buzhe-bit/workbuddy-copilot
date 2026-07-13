@@ -302,7 +302,7 @@ def consume_one(spool: EventSpool, transport: Any) -> bool:
     accepted = False
     try:
         try:
-            result = transport.post_hook(entry.payload)
+            result = transport.post_hook(entry.payload, event_id=entry.event_id)
         except (TemporaryNetworkError, PermanentTransportError):
             return False
         accepted = isinstance(result, Accepted)

@@ -114,6 +114,8 @@ class AppContext:
     ws_registry: WSRegistry
     upload_svc: UploadRequestService | None = None
     worker_lock_file: Any | None = None
+    report_recovery_prepared: bool = False
+    report_recovery_task: Any | None = None
 
 
 def build_context(config_path: str | os.PathLike[str] | None = None) -> AppContext:

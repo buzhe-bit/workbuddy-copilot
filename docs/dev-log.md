@@ -1942,3 +1942,38 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | server/core 业务子集 | — | 61 passed；3.14 平台诊断仍为 12 passed/1 `fcntl` failed，preflight 正确非零拒绝。 |
 | macOS 真 Chromium | — | loopback `NO_PROXY` 下 29 passed。 |
 | 尽可能全量（3.14 诊断） | — | 553 passed, 2 failed, 1 warning；仍仅为已登记的 3.14 `fcntl` 合同差异与既有多 worker 短暂 `/health` 失败，本修复未改 Task 2+ 业务代码。 |
+
+### Task 2 Plan B1：Hook 事件幂等与 Stop 持久分析交付 — 2026-07-14
+
+- `event_id` 已从 `EventSpool` 经 coordinator / independent consumer / transport 透传到
+  `POST /report`；旧客户端不传时仍保持非幂等行为。HTTP 与 Store 共享 1–128 位
+  字母、数字、下划线或短横线校验，HTTP 类型同时兼容 Pydantic 1/2。
+- `reports` 增加幂等键与持久分析状态；迁移对旧库可重复执行，非空
+  `(student_id, event_id)` 由部分唯一索引保护。report、session、显式全文和待分析
+  输入在同一 SQLite 事务中接收；重复请求返回原 report，跨事件类型重投则
+  `409`，不产生额外副作用。
+- Stop 接收时持久最多 256 KiB 的分析输入：优先本次 tail，tail 为空时才使用
+  本次显式 `transcript_full`；启动恢复不会借用稍后上传的无关全文。成功后清除
+  `analysis_input`，失败则保留。旧库 `analysis_input=NULL` 但有显式 raw marker 时，先将
+  按 report 时间匹配的 raw 有界化并 CAS 持久，再 claim。
+- 分析使用 SQLite 原子 claim 防止并发重复调用；最多 3 次，注入 sleeper 的延迟为
+  `0/1/5` 秒。每次尝试原子更新 attempts/status/error/next-retry，对外只保留稳定错误码，
+  不将 provider 响应体或密钥写入日志与数据库。
+- 启动只同步执行 running→failed 修复与待恢复 ID 枚举；provider drain 作为单一受管
+  background task，慢 provider 不再阻塞 `/health`。lifespan 退出前先 cancel + await，再释放
+  worker lock；预期的重试耗尽被记录，意外异常在 shutdown 重新抛出。准备失败不置
+  `report_recovery_prepared`，同 Context 可重试。
+- UserPromptSubmit 以 `report_id` 幂等创建 prompt；即使进程在 report commit 后、prompt
+  创建前崩溃，重投也会用原 report 内容补齐，不采信冲突 payload。
+
+| 阶段 | 命令摘要 | 结果与判定 |
+|---|---|---|
+| 初始 HTTP RED | 真临时 Store + 固定 fake LLM；同一 `event_id` 重投 10 次 | FAIL：产生 10 条 report，且 prompt/analysis 重复。 |
+| 初始恢复 RED | 202 后重开同一 SQLite 并触发 recovery | FAIL：普通 Stop tail 未持久，启动后无可恢复任务。 |
+| 端到端 RED | transport / coordinator / independent spool consumer 聚焦用例 | FAIL（3 failed）：transport 不接受 `event_id`，两条消费路径未传递 spool id。 |
+| 重试状态机 RED | `0/1/5`、持续失败、并发 claim、running 恢复 | FAIL：缺少带原子 claim 的有界重试与启动重放。 |
+| 生命周期 RED | 慢 provider readiness、shutdown cancel/await、prepare 失败重试、legacy raw | FAIL（4 failed）：recovery 阻塞 lifespan，flag 过早置位，legacy 分析收到空输入。 |
+| 审查 GREEN | 跨 event 重投、UserPrompt crash-window、意外 recovery 异常、Store event_id 防线 | PASS：冲突返回 409；缺失 prompt 幂等补齐；异常不吞且锁释放；Pydantic 1/2 与 Store 共用规则。 |
+| Task 2 聚焦 GREEN | `pytest tests/test_analysis_service.py tests/test_service_routing.py tests/test_store_phase1.py tests/test_student_agent.py tests/test_student_coordinator.py tests/test_student_spool.py tests/test_student_transport.py -q` | PASS（147 passed，1 个既有 Starlette 弃用 warning）。 |
+| 尽可能全量（3.14 诊断） | loopback `NO_PROXY` + 真 Chromium 下 `pytest -q` | 580 passed / 2 failed / 1 warning；两失败仍仅为 Task 1 已登记的 Python 3.14 `fcntl` 合同差异与多 worker 短暂 `/health` 竞态。 |
+| Python 合同 | `python scripts/python_preflight.py` | 按预期 exit 1：本机 Python 3.14.4 不满足 `>=3.13,<3.14`；本地 3.13 门 **BLOCKED**。 |

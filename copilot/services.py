@@ -9,13 +9,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import copy
+import re
 import time
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .config import _validate_analysis_max_concurrency
 from .models import (
-    Student, Conversation, TimelineEntry, AnalysisResult,
+    AcceptedReport, Student, Conversation, TimelineEntry, AnalysisResult,
 )
 from .eventbus import EventBus
 from .llm import coerce_analysis_outcome
@@ -24,6 +25,39 @@ from .transcript import TranscriptSnapshot, parse_text
 log = logging.getLogger("copilot.services")
 
 EXPLICIT_RAW_TRANSCRIPT_MARKER = "copilot:explicit-raw-transcript"
+MAX_ANALYSIS_INPUT_BYTES = 256 * 1024
+
+
+def bounded_analysis_input(content: str | bytes | None) -> str:
+    raw = (
+        content
+        if isinstance(content, bytes)
+        else str(content or "").encode("utf-8")
+    )
+    return raw[-MAX_ANALYSIS_INPUT_BYTES:].decode("utf-8", errors="ignore")
+
+
+class AnalysisRetriesExhausted(RuntimeError):
+    """Expected terminal state after a durable report uses all attempts."""
+
+
+def stable_analysis_error_code(exc: Exception) -> str:
+    """Return a bounded provider-independent code safe for persistence."""
+    message = str(exc)
+    if message.startswith("LLM provider HTTP "):
+        parts = message.split()
+        status = parts[3] if len(parts) > 3 and parts[3].isdigit() else "unknown"
+        return f"llm_provider_http_{status}"
+    if message.startswith("LLM provider "):
+        parts = message.split()
+        kind = parts[2] if len(parts) > 2 else "error"
+        kind = re.sub(r"(?<!^)(?=[A-Z])", "_", kind)
+        kind = re.sub(r"[^a-zA-Z0-9]+", "_", kind).strip("_").lower()
+        return f"llm_provider_{kind or 'error'}"[:80]
+    if message.startswith("LLM response JSON invalid"):
+        return "llm_response_json_invalid"
+    kind = re.sub(r"(?<!^)(?=[A-Z])", "_", type(exc).__name__).lower()
+    return f"analysis_{kind}"[:80]
 
 
 class AnalysisService:
@@ -91,59 +125,107 @@ class AnalysisService:
         transcript_content: str | bytes | None,
         raw_transcript_content: str | bytes | None = None,
         cwd: str | None = None,
-    ) -> tuple[int, str, TranscriptSnapshot]:
+        event_id: str | None = None,
+    ) -> AcceptedReport:
         """Upsert ownership rows and persist the incoming report metadata."""
-        snap = self.parse_transcript_content(transcript_content)
-        resolved_session_id = session_id or snap.session_id or ""
         raw_content = raw_transcript_content if event == "Stop" else None
+        analysis_source = transcript_content
+        if event == "Stop" and not analysis_source and raw_content:
+            analysis_source = raw_content
+        durable_analysis_input = bounded_analysis_input(analysis_source)
+        snap = self.parse_transcript_content(durable_analysis_input)
+        resolved_session_id = session_id or snap.session_id or ""
         has_explicit_raw = bool(raw_content and resolved_session_id)
         title = snap.ai_title or ""
-        self.copilot.upsert_student(student_id)
-        if resolved_session_id:
-            self.copilot.upsert_session(
-                session_id=resolved_session_id,
-                student_id=student_id,
-                work_dir=cwd or snap.cwd or "",
-                title=title,
+        stored_raw_content: str | None = None
+        if has_explicit_raw:
+            stored_raw_content = (
+                raw_content.decode("utf-8", errors="replace")
+                if isinstance(raw_content, bytes)
+                else str(raw_content)
             )
-        report_id = self.copilot.add_report(
+        report, duplicate = self.copilot.accept_report(
             student_id=student_id,
             session_id=resolved_session_id or None,
             event=event,
+            event_id=event_id,
             prompt=prompt_text,
             transcript_path=(
                 EXPLICIT_RAW_TRANSCRIPT_MARKER if has_explicit_raw else ""
             ),
             msg_count=len(snap.messages),
             tool_calls=snap.tool_calls,
+            analysis_input=durable_analysis_input,
+            work_dir=cwd or snap.cwd or "",
+            title=title,
+            raw_transcript_content=stored_raw_content,
         )
-        if event == "Stop":
-            if has_explicit_raw:
-                content = (
-                    raw_content.decode("utf-8", errors="replace")
-                    if isinstance(raw_content, bytes)
-                    else raw_content
+        report_id = int(report["id"])
+        if duplicate:
+            original_input = report.get("analysis_input")
+            original_snapshot = (
+                self.parse_transcript_content(original_input)
+                if original_input is not None
+                else TranscriptSnapshot(
+                    session_id=str(report.get("session_id") or "") or None,
+                    tool_calls=int(report.get("tool_calls") or 0),
                 )
-                self.copilot.add_raw_transcript(resolved_session_id, student_id, content)
-                self.copilot.set_analysis_pending(report_id, True)
-        return report_id, resolved_session_id, snap
+            )
+            return AcceptedReport(
+                report_id=report_id,
+                session_id=str(report.get("session_id") or ""),
+                snapshot=original_snapshot,
+                duplicate=True,
+                analysis_status=str(report.get("analysis_status") or "not_requested"),
+            )
+        return AcceptedReport(
+            report_id=report_id,
+            session_id=resolved_session_id,
+            snapshot=snap,
+            duplicate=False,
+            analysis_status=str(report.get("analysis_status") or "not_requested"),
+        )
 
     async def handle_user_prompt_submit(
-        self, student_id: str, session_id: str, prompt_text: str,
+        self,
+        student_id: str,
+        session_id: str,
+        prompt_text: str,
+        *,
+        report_id: int | None = None,
     ) -> int:
         """处理 UserPromptSubmit 事件：存 prompt → 发事件。"""
-        seq = len(self.copilot.get_prompts_by_session(session_id))
-        prompt_id = self.copilot.add_prompt(session_id, seq, student_id, prompt_text)
+        created = True
+        if report_id is not None:
+            report = self.copilot.get_report(report_id)
+            if report:
+                student_id = str(report.get("student_id") or "")
+                session_id = str(report.get("session_id") or "")
+                prompt_text = str(report.get("prompt") or "")
+            prompt_row, created = self.copilot.get_or_create_prompt_for_report(
+                report_id=report_id,
+                session_id=session_id,
+                student_id=student_id,
+                content=prompt_text,
+            )
+            prompt_id = int(prompt_row["id"])
+            seq = int(prompt_row["seq_in_session"])
+        else:
+            seq = len(self.copilot.get_prompts_by_session(session_id))
+            prompt_id = self.copilot.add_prompt(
+                session_id, seq, student_id, prompt_text,
+            )
 
-        await self.bus.publish({
-            "type": "prompt",
-            "student_id": student_id,
-            "session_id": session_id,
-            "prompt_id": prompt_id,
-            "seq": seq,
-            "prompt": prompt_text[:120],
-            "timestamp": time.time(),
-        })
+        if created:
+            await self.bus.publish({
+                "type": "prompt",
+                "student_id": student_id,
+                "session_id": session_id,
+                "prompt_id": prompt_id,
+                "seq": seq,
+                "prompt": prompt_text[:120],
+                "timestamp": time.time(),
+            })
         return prompt_id
 
     async def handle_stop(
@@ -195,12 +277,13 @@ class AnalysisService:
         outcome = coerce_analysis_outcome(raw_outcome)
         if not outcome.ok:
             error = outcome.error or "LLM provider analysis failed"
+            error_code = stable_analysis_error_code(RuntimeError(error))
             log.error(
                 "analysis provider failed rid=%d sid=%s session=%s error=%s status=pending",
                 report_id,
                 student_id,
                 (session_id or "?")[:8],
-                error,
+                error_code,
             )
             raise RuntimeError(error)
         result = AnalysisResult.from_dict(outcome.value)
@@ -209,19 +292,22 @@ class AnalysisService:
         session_title = self.copilot.get_session_title(session_id) or snap.ai_title or ""
 
         # 存储
-        self.copilot.add_ai_summary(
-            prompt_id, session_id, student_id, result.ai_reply_summary,
+        _, analysis_created = self.copilot.complete_report_analysis(
+            report_id=report_id,
+            prompt_id=prompt_id,
+            session_id=session_id,
+            student_id=student_id,
+            result=result.to_dict(),
+            session_title=session_title,
         )
-        self.copilot.add_analysis(
-            report_id, student_id, result.to_dict(),
-            session_id=session_id, session_title=session_title,
-        )
-        self.copilot.set_analysis_pending(report_id, False)
 
         log.info(
             "分析完成 rid=%d sid=%s session=%s topic=%s",
             report_id, student_id, (session_id or "?")[:8], result.topic,
         )
+
+        if not analysis_created:
+            return result
 
         # 发布 AI 摘要事件
         if result.ai_reply_summary:
@@ -247,6 +333,73 @@ class AnalysisService:
         })
 
         return result
+
+    async def handle_stop_with_retry(
+        self,
+        student_id: str,
+        session_id: str,
+        prompt_text: str,
+        transcript_content: str | bytes | None,
+        report_id: int,
+        *,
+        max_attempts: int = 3,
+        sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> AnalysisResult | None:
+        """Analyze one durable Stop report with a bounded retry schedule.
+
+        The persisted report row is authoritative; request-local transcript data
+        is deliberately ignored so recovery cannot borrow unrelated content.
+        """
+        del student_id, session_id, prompt_text, transcript_content
+        if max_attempts < 1:
+            return None
+        delays = (0, 1, 5)
+        while True:
+            current = self.copilot.get_report(report_id)
+            if not current:
+                return None
+            status = str(current.get("analysis_status") or "")
+            attempts = int(current.get("analysis_attempts") or 0)
+            if status not in {"pending", "failed"} or attempts >= max_attempts:
+                return None
+
+            delay = delays[min(attempts, len(delays) - 1)]
+            await sleeper(delay)
+            claimed = self.copilot.claim_report_analysis(
+                report_id,
+                max_attempts=max_attempts,
+            )
+            if not claimed:
+                return None
+
+            attempt = int(claimed.get("analysis_attempts") or 0)
+            try:
+                return await self.handle_stop(
+                    student_id=str(claimed.get("student_id") or ""),
+                    session_id=str(claimed.get("session_id") or ""),
+                    prompt_text=str(claimed.get("prompt") or ""),
+                    transcript_content=str(claimed.get("analysis_input") or ""),
+                    report_id=report_id,
+                )
+            except Exception as exc:
+                error_code = stable_analysis_error_code(exc)
+                next_delay = (
+                    delays[min(attempt, len(delays) - 1)]
+                    if attempt < max_attempts
+                    else None
+                )
+                self.copilot.mark_report_analysis_failed(
+                    report_id,
+                    attempt=attempt,
+                    error_code=error_code,
+                    next_retry_at=(
+                        time.time() + next_delay
+                        if next_delay is not None
+                        else None
+                    ),
+                )
+                if attempt >= max_attempts:
+                    raise AnalysisRetriesExhausted(error_code) from None
 
 
 class SessionQueryService:

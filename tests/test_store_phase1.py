@@ -278,6 +278,7 @@ def test_legacy_schema_migration_adds_pending_and_backfills_session_id(tmp_path)
                 transcript_path TEXT,
                 msg_count INTEGER,
                 tool_calls INTEGER,
+                analysis_pending INTEGER DEFAULT 0,
                 created_at REAL NOT NULL
             );
             CREATE TABLE analyses (
@@ -314,8 +315,8 @@ def test_legacy_schema_migration_adds_pending_and_backfills_session_id(tmp_path)
             );
             INSERT INTO reports
                 (student_id, session_id, event, prompt, transcript_path,
-                 msg_count, tool_calls, created_at)
-            VALUES ('legacy-stu', 'legacy-sess', 'Stop', 'old prompt', '', 1, 0, 10.0);
+                 msg_count, tool_calls, analysis_pending, created_at)
+            VALUES ('legacy-stu', 'legacy-sess', 'Stop', 'old prompt', '', 1, 0, 1, 10.0);
             INSERT INTO analyses
                 (report_id, student_id, topic, understanding, off_topic, stuck_at,
                  progress, guidance, alert, raw, created_at)
@@ -324,10 +325,15 @@ def test_legacy_schema_migration_adds_pending_and_backfills_session_id(tmp_path)
             """
         )
 
+    Store(db_path)
     migrated = Store(db_path)
 
     with migrated._conn() as conn:
         report_cols = {row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
+        report_indexes = {
+            row[1] for row in conn.execute("PRAGMA index_list(reports)").fetchall()
+        }
+        report = dict(conn.execute("SELECT * FROM reports WHERE id = 1").fetchone())
         analysis = conn.execute("SELECT * FROM analyses WHERE id = 1").fetchone()
         session = conn.execute(
             "SELECT * FROM sessions WHERE session_id = ?",
@@ -335,11 +341,46 @@ def test_legacy_schema_migration_adds_pending_and_backfills_session_id(tmp_path)
         ).fetchone()
 
     assert "analysis_pending" in report_cols
+    assert {
+        "event_id",
+        "analysis_input",
+        "analysis_status",
+        "analysis_attempts",
+        "analysis_error",
+        "analysis_next_retry_at",
+    }.issubset(report_cols)
+    assert "idx_reports_student_event_id_unique" in report_indexes
+    assert report["analysis_status"] == "done"
+    assert report["analysis_pending"] == 0
+    assert report["analysis_input"] is None
+    assert report["analysis_error"] == ""
+    assert report["analysis_next_retry_at"] is None
     assert analysis["session_id"] == "legacy-sess"
     assert session is not None
     assert session["student_id"] == "legacy-stu"
     assert session["created_at"] == 20.0
     assert session["last_activity_at"] == 20.0
+
+
+@pytest.mark.parametrize("event_id", ["../escape", "contains space", "x" * 129])
+def test_accept_report_rejects_invalid_event_id_at_store_boundary(tmp_path, event_id):
+    store = Store(tmp_path / "copilot.db")
+
+    with pytest.raises(ValueError, match="invalid event_id"):
+        store.accept_report(
+            student_id="student-invalid-event",
+            session_id="session-invalid-event",
+            event="Stop",
+            event_id=event_id,
+            prompt="must not persist",
+            transcript_path="",
+            msg_count=0,
+            tool_calls=0,
+            analysis_input="bounded input",
+        )
+
+    with store._conn() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 0
 
 
 def test_analysis_pending_set_and_list(store):
