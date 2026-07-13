@@ -1543,6 +1543,404 @@ def test_recovery_persists_legacy_raw_input_before_claim(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "legacy_case",
+    [
+        "far_future_raw",
+        "two_raws_in_window",
+        "two_reports_one_raw",
+        "cross_student_raw",
+        "bulk_sha_raw",
+        "no_raw",
+    ],
+)
+def test_recovery_fails_closed_without_unique_immediate_legacy_raw(
+    tmp_path,
+    legacy_case,
+):
+    async def scenario():
+        store = Store(tmp_path / "copilot.db")
+        llm_calls = 0
+
+        async def must_not_run(config, snap, event, latest_prompt):
+            nonlocal llm_calls
+            llm_calls += 1
+            return {"topic": "wrong input", "diagnosis": "must fail closed"}
+
+        bus = EventBus()
+        config = {
+            "student_id": "server",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": str(tmp_path / "copilot.db")},
+            "llm": {},
+        }
+
+        def add_legacy_report(created_at: float) -> int:
+            report_id = store.add_report(
+                "stu-legacy-ambiguous",
+                "sess-legacy-ambiguous",
+                "Stop",
+                "legacy prompt",
+                "copilot:explicit-raw-transcript",
+                1,
+                0,
+            )
+            with store._conn() as conn:
+                conn.execute(
+                    """UPDATE reports
+                       SET analysis_pending = 1,
+                           analysis_status = 'pending',
+                           created_at = ?
+                       WHERE id = ?""",
+                    (created_at, report_id),
+                )
+            return report_id
+
+        def add_raw(
+            student_id: str,
+            created_at: float,
+            content: str,
+            content_sha256: str | None = None,
+        ) -> int:
+            raw_id = store.add_raw_transcript(
+                "sess-legacy-ambiguous",
+                student_id,
+                content,
+                content_sha256,
+            )
+            with store._conn() as conn:
+                conn.execute(
+                    "UPDATE raw_transcripts SET created_at = ? WHERE id = ?",
+                    (created_at, raw_id),
+                )
+            return raw_id
+
+        report_ids = [add_legacy_report(10.0)]
+        if legacy_case == "far_future_raw":
+            add_raw("stu-legacy-ambiguous", 100.0, "UNRELATED-FUTURE-RAW")
+        elif legacy_case == "two_raws_in_window":
+            add_raw("stu-legacy-ambiguous", 11.0, "AMBIGUOUS-RAW-ONE")
+            add_raw("stu-legacy-ambiguous", 12.0, "AMBIGUOUS-RAW-TWO")
+        elif legacy_case == "two_reports_one_raw":
+            report_ids.append(add_legacy_report(9.0))
+            add_raw("stu-legacy-ambiguous", 12.0, "CONTESTED-RAW")
+        elif legacy_case == "cross_student_raw":
+            add_raw("different-student", 11.0, "CROSS-STUDENT-RAW")
+        elif legacy_case == "bulk_sha_raw":
+            add_raw(
+                "stu-legacy-ambiguous",
+                11.0,
+                "BULK-UPLOAD-RAW",
+                "bulk-content-sha",
+            )
+
+        service = AnalysisService(store, must_not_run, config, bus)
+        context = AppContext(
+            config=config,
+            store=store,
+            analysis_svc=service,
+            session_svc=SessionQueryService(store, config),
+            message_svc=MessageService(store, bus),
+            bus=bus,
+            ws_registry=WSRegistry(send_timeout=0.05),
+        )
+
+        async def no_sleep(delay: float) -> None:
+            return None
+
+        await _recover_pending_reports(context, sleeper=no_sleep)
+
+        assert llm_calls == 0
+        for report_id in report_ids:
+            report = store.get_report(report_id)
+            assert report["analysis_status"] == "failed"
+            assert report["analysis_attempts"] == 3
+            assert report["analysis_error"] == "analysis_input_unavailable"
+            assert report["analysis_input"] is None
+
+    asyncio.run(scenario())
+
+
+def test_reopen_does_not_bind_ancient_prompt_to_modern_stop_report(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "copilot.db"
+        store = Store(db_path)
+        store.upsert_session(
+            "sess-modern-prompt",
+            "stu-modern-prompt",
+            "",
+            "",
+        )
+        ancient_prompt_id = store.add_prompt(
+            "sess-modern-prompt",
+            0,
+            "stu-modern-prompt",
+            "继续",
+        )
+        with store._conn() as conn:
+            conn.execute(
+                "UPDATE prompts SET created_at = 1.0 WHERE id = ?",
+                (ancient_prompt_id,),
+            )
+
+        accepted, duplicate = store.accept_report(
+            student_id="stu-modern-prompt",
+            session_id="sess-modern-prompt",
+            event="Stop",
+            event_id="modern-stop-event",
+            prompt="继续",
+            transcript_path="copilot:explicit-raw-transcript",
+            msg_count=1,
+            tool_calls=0,
+            analysis_input=_line({
+                "type": "message",
+                "role": "user",
+                "content": "modern durable input",
+                "sessionId": "sess-modern-prompt",
+            }),
+        )
+        report_id = int(accepted["id"])
+        assert duplicate is False
+        with store._conn() as conn:
+            conn.execute(
+                "UPDATE reports SET created_at = 100000.0 WHERE id = ?",
+                (report_id,),
+            )
+
+        # Repeated initialization must not let the legacy migration claim a
+        # modern event-addressed report for an unrelated ancient prompt.
+        Store(db_path)
+        store = Store(db_path)
+        assert store.get_prompt(ancient_prompt_id)["report_id"] is None
+
+        async def fixed_llm(config, snap, event, latest_prompt):
+            return {"topic": "modern", "diagnosis": "uses its own prompt"}
+
+        bus = EventBus()
+        config = {
+            "student_id": "server",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": str(db_path)},
+            "llm": {},
+        }
+        service = AnalysisService(store, fixed_llm, config, bus)
+        context = AppContext(
+            config=config,
+            store=store,
+            analysis_svc=service,
+            session_svc=SessionQueryService(store, config),
+            message_svc=MessageService(store, bus),
+            bus=bus,
+            ws_registry=WSRegistry(send_timeout=0.05),
+        )
+
+        async def no_sleep(delay: float) -> None:
+            return None
+
+        await _recover_pending_reports(context, sleeper=no_sleep)
+
+        assert store.get_prompt(ancient_prompt_id)["report_id"] is None
+        report_prompt = store.get_prompt_for_report(report_id)
+        assert report_prompt is not None
+        assert report_prompt["id"] != ancient_prompt_id
+        assert report_prompt["content"] == "继续"
+        assert store.get_report(report_id)["analysis_status"] == "done"
+
+    asyncio.run(scenario())
+
+
+def test_legacy_recovery_cannot_borrow_modern_stop_raw(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "copilot.db")
+        legacy_report_id = store.add_report(
+            "stu-shared-raw",
+            "sess-shared-raw",
+            "Stop",
+            "legacy",
+            "copilot:explicit-raw-transcript",
+            1,
+            0,
+        )
+        with store._conn() as conn:
+            conn.execute(
+                """UPDATE reports
+                   SET analysis_pending = 1,
+                       analysis_status = 'pending',
+                       created_at = 10.0
+                   WHERE id = ?""",
+                (legacy_report_id,),
+            )
+
+        modern, duplicate = store.accept_report(
+            student_id="stu-shared-raw",
+            session_id="sess-shared-raw",
+            event="Stop",
+            event_id="modern-raw-owner",
+            prompt="modern",
+            transcript_path="copilot:explicit-raw-transcript",
+            msg_count=1,
+            tool_calls=0,
+            analysis_input=_line({
+                "type": "message",
+                "role": "user",
+                "content": "MODERN-DURABLE-INPUT",
+                "sessionId": "sess-shared-raw",
+            }),
+            raw_transcript_content=_line({
+                "type": "message",
+                "role": "user",
+                "content": "MODERN-RAW",
+                "sessionId": "sess-shared-raw",
+            }),
+        )
+        modern_report_id = int(modern["id"])
+        assert duplicate is False
+        with store._conn() as conn:
+            conn.execute(
+                "UPDATE reports SET created_at = 11.0 WHERE id = ?",
+                (modern_report_id,),
+            )
+            modern_raw_id = conn.execute(
+                """SELECT id FROM raw_transcripts
+                   WHERE student_id = 'stu-shared-raw'
+                     AND session_id = 'sess-shared-raw'""",
+            ).fetchone()["id"]
+            conn.execute(
+                "UPDATE raw_transcripts SET created_at = 12.0 WHERE id = ?",
+                (modern_raw_id,),
+            )
+
+        calls = []
+
+        async def fixed_llm(config, snap, event, latest_prompt):
+            calls.append([message.text for message in snap.messages])
+            return {"topic": "modern", "diagnosis": "uses durable input"}
+
+        bus = EventBus()
+        config = {
+            "student_id": "server",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": str(tmp_path / "copilot.db")},
+            "llm": {},
+        }
+        service = AnalysisService(store, fixed_llm, config, bus)
+        context = AppContext(
+            config=config,
+            store=store,
+            analysis_svc=service,
+            session_svc=SessionQueryService(store, config),
+            message_svc=MessageService(store, bus),
+            bus=bus,
+            ws_registry=WSRegistry(send_timeout=0.05),
+        )
+
+        async def no_sleep(delay: float) -> None:
+            return None
+
+        await _recover_pending_reports(context, sleeper=no_sleep)
+
+        legacy = store.get_report(legacy_report_id)
+        modern = store.get_report(modern_report_id)
+        assert legacy["analysis_status"] == "failed"
+        assert legacy["analysis_error"] == "analysis_input_unavailable"
+        assert legacy["analysis_input"] is None
+        assert modern["analysis_status"] == "done"
+        assert calls == [["MODERN-DURABLE-INPUT"]]
+
+    asyncio.run(scenario())
+
+
+def test_legacy_empty_stop_prompt_does_not_claim_unrelated_user_prompt(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "copilot.db"
+        store = Store(db_path)
+        report_id = store.add_report(
+            "stu-empty-stop",
+            "sess-empty-stop",
+            "Stop",
+            "",
+            "copilot:explicit-raw-transcript",
+            1,
+            0,
+        )
+        unrelated_prompt_id = store.add_prompt(
+            "sess-empty-stop",
+            0,
+            "stu-empty-stop",
+            "UNRELATED-USER-PROMPT",
+        )
+        with store._conn() as conn:
+            conn.execute(
+                """UPDATE reports
+                   SET analysis_pending = 1,
+                       analysis_status = 'pending',
+                       analysis_input = ?,
+                       created_at = 10.0
+                   WHERE id = ?""",
+                (
+                    _line({
+                        "type": "message",
+                        "role": "user",
+                        "content": "EMPTY-STOP-DURABLE-INPUT",
+                        "sessionId": "sess-empty-stop",
+                    }),
+                    report_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE prompts SET created_at = 11.0 WHERE id = ?",
+                (unrelated_prompt_id,),
+            )
+
+        Store(db_path)
+        store = Store(db_path)
+        latest_prompts = []
+
+        async def fixed_llm(config, snap, event, latest_prompt):
+            latest_prompts.append(latest_prompt)
+            return {
+                "topic": "empty stop",
+                "diagnosis": "keeps prompt unbound",
+                "ai_reply_summary": "summary without prompt ownership",
+            }
+
+        bus = EventBus()
+        config = {
+            "student_id": "server",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": str(db_path)},
+            "llm": {},
+        }
+        service = AnalysisService(store, fixed_llm, config, bus)
+        context = AppContext(
+            config=config,
+            store=store,
+            analysis_svc=service,
+            session_svc=SessionQueryService(store, config),
+            message_svc=MessageService(store, bus),
+            bus=bus,
+            ws_registry=WSRegistry(send_timeout=0.05),
+        )
+
+        async def no_sleep(delay: float) -> None:
+            return None
+
+        await _recover_pending_reports(context, sleeper=no_sleep)
+
+        assert latest_prompts == [""]
+        assert store.get_prompt_for_report(report_id) is None
+        assert store.get_prompt(unrelated_prompt_id)["report_id"] is None
+        with store._conn() as conn:
+            summary = conn.execute(
+                "SELECT prompt_id FROM ai_summaries WHERE session_id = ?",
+                ("sess-empty-stop",),
+            ).fetchone()
+        assert summary is not None
+        assert summary["prompt_id"] is None
+
+    asyncio.run(scenario())
+
+
 def test_recovery_requeues_interrupted_running_report(tmp_path):
     async def scenario():
         store = Store(tmp_path / "copilot.db")

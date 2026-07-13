@@ -37,7 +37,7 @@ class TestStore:
         s = Store(db)
         assert db.exists()
 
-    def test_legacy_prompts_schema_backfills_nearby_pending_stop_conservatively(self, tmp_path):
+    def test_legacy_prompt_backfill_does_not_guess_for_empty_stop_prompt(self, tmp_path):
         db = tmp_path / "legacy-prompts.db"
         with sqlite3.connect(db) as conn:
             conn.executescript(
@@ -90,7 +90,7 @@ class TestStore:
             ]
         assert "report_id" in columns
         assert "idx_prompts_report_id_unique" in indexes
-        assert prompts[0]["report_id"] == 1
+        assert prompts[0]["report_id"] is None
         assert prompts[1]["report_id"] is None
 
     def test_legacy_prompt_backfill_leaves_many_to_many_candidates_unlinked(self, tmp_path):
@@ -189,7 +189,7 @@ class TestStore:
         assert report_ids == [1, None]
         assert "idx_prompts_report_id_unique" in indexes
 
-    def test_legacy_prompt_backfill_exact_content_ignores_time_window(self, tmp_path):
+    def test_legacy_prompt_backfill_exact_content_respects_time_window(self, tmp_path):
         db = tmp_path / "legacy-exact-prompt-outside-window.db"
         with sqlite3.connect(db) as conn:
             conn.executescript(
@@ -229,7 +229,68 @@ class TestStore:
             report_id = conn.execute(
                 "SELECT report_id FROM prompts",
             ).fetchone()[0]
-        assert report_id == 1
+        assert report_id is None
+
+    def test_legacy_prompt_backfill_nonempty_pair_is_causal_and_immediate(self, tmp_path):
+        db = tmp_path / "legacy-causal-prompts.db"
+        store = Store(db)
+        immediate_report = store.add_report(
+            "legacy-stu",
+            "legacy-immediate",
+            "Stop",
+            "same prompt",
+            "",
+            1,
+            0,
+        )
+        backwards_report = store.add_report(
+            "legacy-stu",
+            "legacy-backwards",
+            "Stop",
+            "same prompt",
+            "",
+            1,
+            0,
+        )
+        immediate_prompt = store.add_prompt(
+            "legacy-immediate",
+            0,
+            "legacy-stu",
+            "same prompt",
+        )
+        backwards_prompt = store.add_prompt(
+            "legacy-backwards",
+            0,
+            "legacy-stu",
+            "same prompt",
+        )
+        with store._conn() as conn:
+            conn.execute(
+                """UPDATE reports
+                   SET analysis_pending = 1, created_at = 10.0
+                   WHERE id = ?""",
+                (immediate_report,),
+            )
+            conn.execute(
+                """UPDATE reports
+                   SET analysis_pending = 1, created_at = 20.0
+                   WHERE id = ?""",
+                (backwards_report,),
+            )
+            conn.execute(
+                "UPDATE prompts SET created_at = 15.0 WHERE id = ?",
+                (immediate_prompt,),
+            )
+            conn.execute(
+                "UPDATE prompts SET created_at = 19.9 WHERE id = ?",
+                (backwards_prompt,),
+            )
+
+        Store(db)
+        store = Store(db)
+
+        assert store.get_prompt(immediate_prompt)["report_id"] == immediate_report
+        assert store.get_prompt(backwards_prompt)["report_id"] is None
 
     def test_add_report(self, store):
         rid = store.add_report(
@@ -396,14 +457,31 @@ class TestStore:
         assert analysis.suggestion == "Print the loop index."
 
     def test_raw_transcript_for_report_does_not_use_unmatched_latest(self, store):
+        report_id = store.add_report(
+            "alice",
+            "sess-raw",
+            "Stop",
+            "legacy prompt",
+            "copilot:explicit-raw-transcript",
+            1,
+            0,
+        )
         raw_id = store.add_raw_transcript("sess-raw", "alice", "future raw")
         with store._conn() as conn:
+            conn.execute(
+                """UPDATE reports
+                   SET analysis_pending = 1,
+                       analysis_status = 'pending',
+                       created_at = 100.0
+                   WHERE id = ?""",
+                (report_id,),
+            )
             conn.execute(
                 "UPDATE raw_transcripts SET created_at = ? WHERE id = ?",
                 (50.0, raw_id),
             )
 
-        assert store.get_raw_transcript_for_report("sess-raw", 100.0) is None
+        assert store.get_raw_transcript_for_report(report_id) is None
 
     def test_add_and_list_student_asks(self, store):
         first_id = store.add_student_ask(

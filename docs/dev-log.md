@@ -1997,3 +1997,25 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | GREEN：crash-window 聚焦 | 7 passed；pending/failed 可恢复，running/done/exhausted 不调度，取消后可恢复。 |
 | Task 2 七文件 | 153 passed / 1 个既有 warning。 |
 | 最终全量 | 586 passed / 2 个已登记基线 failed / 1 warning。 |
+
+### Task 2 独立 Review 二轮：legacy 证据归属与 session owner — 2026-07-14
+
+- 旧 `analysis_input=NULL` Stop 不再按 session 借用后续 raw。候选必须是同学员/同会话、
+  explicit marker、`content_sha256 IS NULL`、report 后 0–5 秒，且 report↔raw 双向唯一。
+  反向查询统计所有窗口内 explicit-marker Stop，因此 legacy 不能借用已有
+  durable input 的现代 Stop 所属 raw。无可证明候选时写终态
+  `analysis_input_unavailable`，不调 provider，原证据保留。
+- `sessions.student_id IS NULL OR = ''` 的旧行在首个合法写者的
+  `BEGIN IMMEDIATE` 事务内 CAS 绑定。`accept_report`、`upsert_session`、raw 写入与
+  bulk replace 共用 owner 防线；竞争输家显式 `ValueError` 且事务无副作用。
+- prompt backfill 现只允许 `event_id IS NULL`、非空 report prompt、内容精确相同、
+  因果顺序正确且延迟不超过 5 秒的双向唯一配对。现代 event、空 prompt、
+  逆序、超窗或歧义都不回填，重复 Store 初始化后结果不变。
+
+| 阶段 | 结果 |
+|---|---|
+| RED：strict raw | 5 类歧义场景会调 LLM；带 SHA bulk raw 与 modern Stop raw 也可被 legacy 借用。 |
+| RED：blank owner | `NULL/''` 顺序写入与双连接竞争共 6 failed；owner 不绑定，两个学员都可成功。 |
+| RED：prompt backfill | 超窗同文、古老 prompt→modern event、空 Stop→无关 UserPrompt 均复现错绑。 |
+| GREEN：三文件 | `tests/test_store.py tests/test_store_phase1.py tests/test_service_routing.py -q`：102 passed / 1 个既有 warning。 |
+| GREEN：Task 2 七文件 | 168 passed / 1 个既有 warning。 |

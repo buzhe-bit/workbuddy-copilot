@@ -17,7 +17,9 @@ from .models import normalize_event_id
 
 log = logging.getLogger("copilot.store")
 
-LEGACY_PROMPT_BACKFILL_WINDOW_SECONDS = 30.0
+LEGACY_PROMPT_BACKFILL_WINDOW_SECONDS = 5.0
+LEGACY_RAW_MATCH_WINDOW_SECONDS = 5.0
+EXPLICIT_RAW_TRANSCRIPT_MARKER = "copilot:explicit-raw-transcript"
 
 
 SCHEMA = """
@@ -374,6 +376,7 @@ class Store:
                     """SELECT id, student_id, session_id, prompt, created_at
                        FROM reports
                        WHERE event = 'Stop'
+                         AND event_id IS NULL
                          AND analysis_pending = 1
                          AND NOT EXISTS (
                            SELECT 1 FROM prompts
@@ -395,18 +398,18 @@ class Store:
             prompt_candidates: dict[int, set[int]] = {}
             for report in reports:
                 report_prompt = str(report.get("prompt") or "")
+                if not report_prompt:
+                    continue
                 for prompt in prompts:
                     if prompt.get("student_id") != report.get("student_id"):
                         continue
                     if prompt.get("session_id") != report.get("session_id"):
                         continue
-                    if report_prompt:
-                        if str(prompt.get("content") or "") != report_prompt:
-                            continue
-                    else:
-                        delta = float(prompt["created_at"]) - float(report["created_at"])
-                        if not 0 <= delta <= LEGACY_PROMPT_BACKFILL_WINDOW_SECONDS:
-                            continue
+                    delta = float(prompt["created_at"]) - float(report["created_at"])
+                    if not 0 <= delta <= LEGACY_PROMPT_BACKFILL_WINDOW_SECONDS:
+                        continue
+                    if str(prompt.get("content") or "") != report_prompt:
+                        continue
                     report_id = int(report["id"])
                     prompt_id = int(prompt["id"])
                     report_candidates.setdefault(report_id, set()).add(prompt_id)
@@ -437,6 +440,8 @@ class Store:
         tool_calls: int,
     ) -> int:
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            self._ensure_session_owner_with_conn(c, session_id, student_id)
             return self._add_report_with_conn(
                 c,
                 student_id=student_id,
@@ -602,6 +607,7 @@ class Store:
         created = now if created_at is None else created_at
         last_activity = now if last_activity_at is None else last_activity_at
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             self._upsert_session_with_conn(
                 c,
                 session_id=session_id,
@@ -637,6 +643,11 @@ class Store:
                 created_at, last_activity_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id) DO UPDATE SET
+                 student_id = CASE
+                   WHEN sessions.student_id IS NULL OR sessions.student_id = ''
+                   THEN excluded.student_id
+                   ELSE sessions.student_id
+                 END,
                  work_dir = CASE
                    WHEN sessions.work_dir IS NULL OR sessions.work_dir = ''
                    THEN excluded.work_dir
@@ -670,8 +681,25 @@ class Store:
             "SELECT student_id FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
-        existing_student = existing["student_id"] if existing else None
-        if existing_student and existing_student != student_id:
+        if existing is None:
+            return
+        existing_student = str(existing["student_id"] or "")
+        if not existing_student:
+            updated = c.execute(
+                """UPDATE sessions
+                   SET student_id = ?
+                   WHERE session_id = ?
+                     AND (student_id IS NULL OR student_id = '')""",
+                (student_id, session_id),
+            ).rowcount
+            if updated == 1:
+                return
+            current = c.execute(
+                "SELECT student_id FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            existing_student = str(current["student_id"] or "") if current else ""
+        if existing_student != student_id:
             raise ValueError(
                 f"session {session_id!r} belongs to {existing_student!r}, "
                 f"not {student_id!r}"
@@ -960,6 +988,7 @@ class Store:
     ) -> int:
         """Persist complete raw transcript content without truncation."""
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             return self._add_raw_transcript_with_conn(
                 c,
                 session_id=session_id,
@@ -998,6 +1027,7 @@ class Store:
         """Replace one session's bulk-uploaded message content atomically."""
         now = time.time()
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             self._ensure_session_owner_with_conn(c, session_id, student_id)
             c.execute(
                 """INSERT INTO students (student_id, display_name, token_hash, created_at)
@@ -1577,24 +1607,76 @@ class Store:
 
     def get_raw_transcript_for_report(
         self,
-        session_id: str,
-        report_created_at: float | None,
+        report_id: int,
+        *,
+        max_delay_seconds: float = LEGACY_RAW_MATCH_WINDOW_SECONDS,
     ) -> dict | None:
-        """Return the raw transcript captured for a report in a shared session."""
-        if report_created_at is None:
-            return self.get_raw_transcript(session_id)
-        with self._conn() as c:
-            row = c.execute(
-                """SELECT * FROM raw_transcripts
-                   WHERE session_id = ? AND created_at >= ?
-                   ORDER BY created_at ASC, id ASC
-                   LIMIT 1""",
-                (session_id, report_created_at),
-            ).fetchone()
-            if row:
-                return dict(row)
+        """Return a provably unique immediate raw for one legacy report.
+
+        Both directions must be unique inside the short timestamp window: the
+        report has one candidate raw, and that raw has one candidate report.
+        """
+        if max_delay_seconds < 0:
             return None
-        return self.get_raw_transcript(session_id)
+        with self._conn() as c:
+            report = c.execute(
+                """SELECT * FROM reports
+                   WHERE id = ?
+                     AND event = 'Stop'
+                     AND transcript_path = ?
+                     AND analysis_input IS NULL""",
+                (report_id, EXPLICIT_RAW_TRANSCRIPT_MARKER),
+            ).fetchone()
+            if not report:
+                return None
+            student_id = str(report["student_id"] or "")
+            session_id = str(report["session_id"] or "")
+            if not student_id or not session_id or report["created_at"] is None:
+                return None
+            report_created_at = float(report["created_at"])
+            raws = c.execute(
+                """SELECT * FROM raw_transcripts
+                   WHERE student_id = ?
+                     AND session_id = ?
+                     AND content_sha256 IS NULL
+                     AND created_at >= ?
+                     AND created_at <= ?
+                   ORDER BY created_at ASC, id ASC
+                   LIMIT 2""",
+                (
+                    student_id,
+                    session_id,
+                    report_created_at,
+                    report_created_at + max_delay_seconds,
+                ),
+            ).fetchall()
+            if len(raws) != 1:
+                return None
+            raw = raws[0]
+            raw_created_at = float(raw["created_at"])
+            competing_reports = c.execute(
+                """SELECT id FROM reports
+                   WHERE student_id = ?
+                     AND session_id = ?
+                     AND event = 'Stop'
+                     AND transcript_path = ?
+                     AND created_at <= ?
+                     AND created_at >= ?
+                   ORDER BY id ASC
+                   LIMIT 2""",
+                (
+                    student_id,
+                    session_id,
+                    EXPLICIT_RAW_TRANSCRIPT_MARKER,
+                    raw_created_at,
+                    raw_created_at - max_delay_seconds,
+                ),
+            ).fetchall()
+            if len(competing_reports) != 1:
+                return None
+            if int(competing_reports[0]["id"]) != report_id:
+                return None
+            return dict(raw)
 
     def add_student_ask(
         self,
@@ -1733,6 +1815,7 @@ class Store:
             if (
                 current.get("event") != "Stop"
                 or str(current.get("analysis_status") or "") not in {"pending", "failed"}
+                or current.get("analysis_input") is None
                 or int(current.get("analysis_attempts") or 0) >= max_attempts
             ):
                 return None
@@ -1746,6 +1829,7 @@ class Store:
                        analysis_pending = 1
                    WHERE id = ?
                      AND analysis_status IN ('pending', 'failed')
+                     AND analysis_input IS NOT NULL
                      AND analysis_attempts < ?""",
                 (next_attempt, report_id, max_attempts),
             ).rowcount
@@ -1756,6 +1840,30 @@ class Store:
                 (report_id,),
             ).fetchone()
             return dict(claimed)
+
+    def mark_report_analysis_input_unavailable(
+        self,
+        report_id: int,
+        *,
+        max_attempts: int = 3,
+    ) -> int:
+        """Terminally fail a legacy report whose durable input is unknowable."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE reports
+                   SET analysis_status = 'failed',
+                       analysis_pending = 1,
+                       analysis_attempts = ?,
+                       analysis_error = 'analysis_input_unavailable',
+                       analysis_next_retry_at = NULL
+                   WHERE id = ?
+                     AND event = 'Stop'
+                     AND analysis_input IS NULL
+                     AND analysis_status IN ('pending', 'failed')
+                     AND analysis_attempts < ?""",
+                (max_attempts, report_id, max_attempts),
+            )
+            return cur.rowcount
 
     def mark_report_analysis_failed(
         self,

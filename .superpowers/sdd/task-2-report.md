@@ -21,10 +21,18 @@
 5. 启动 readiness 前只同步修复 running 和枚举 report ID；provider drain 使用单一受管
    background task。退出先 cancel + await，后释放 worker lock；意外 task 异常在 shutdown
    重新抛出。准备失败时 flag 保持 false，同 Context 可重试。
-6. 旧库 `analysis_input=NULL` 且带 explicit-raw marker 时，先将按 report 时间匹配的 raw
-   有界化并 CAS 持久，再进入原子 claim。
+6. 旧库 `analysis_input=NULL` 且带 explicit-raw marker 时，只允许同学员、同会话、
+   `content_sha256 IS NULL`、0–5 秒内且 report↔raw 双向唯一的显式全文。反向
+   竞争统计窗口内所有 explicit-marker Stop，不因现代 report 已有 durable input 而
+   忽略它。无法证明唯一归属时终态失败为 `analysis_input_unavailable`，不调 LLM。
 7. UserPrompt 的 prompt 以 `report_id` 幂等创建；如 report 已落库而 prompt 未落库，重投使用
    原 report 内容补齐。
+8. legacy prompt 迁移只考虑 `event_id IS NULL`、report prompt 非空、内容精确相同、
+   prompt 不早于 report 且延迟不超过 5 秒的双向唯一配对。空 prompt、现代
+   `event_id`、逆序、超窗或歧义均不回填。
+9. legacy `sessions.student_id` 为 `NULL/''` 时，第一个合法写入者在
+   `BEGIN IMMEDIATE` 事务内 CAS 绑定 owner；后续其他学员明确失败且整个写入
+   回滚。不从旧 report/raw/prompt 子表猜测 owner。
 
 ## RED / GREEN 证据
 
@@ -72,3 +80,17 @@
   回 failed，保留 input/attempts，写 `analysis_cancelled` 并原样重抛。
 - 追加聚焦：7 passed；Task 2 七文件：153 passed；最终全量：586 passed / 2 个已登记
   baseline failed / 1 warning。
+
+## 独立 Review 二轮追加修复
+
+- legacy raw 先用 5 类过时/歧义/交叉/缺失场景证明旧查询会错配；随后又分别
+  复现带 SHA 的批量 raw 与现代 durable Stop 所属 raw 被 legacy report 借用。
+  修复后只有可证明的唯一即时 raw 可被 CAS 持久，其余均 fail closed。
+- legacy blank session owner 的 `NULL` 和空字符串均已覆盖：顺序 accept、
+  `upsert_session` 与双连接双线程竞争共 6 个用例。竞争结果严格为 1 个
+  success + 1 个 `ValueError`，无 SQLite lock 暴露，输家无 report/raw/prompt 副作用。
+- prompt 迁移先复现了“古老 prompt 绑到现代 event report”和“空 Stop prompt
+  认领任意近邻 UserPrompt”。修复后恢复过程不会用无关 prompt 污染 LLM
+  `latest_prompt` 或 AI summary 归属。
+- 聚焦验证：Store/Service/迁移三文件 102 passed；Task 2 七文件
+  168 passed；均只有 1 个既有 Starlette 弃用 warning。

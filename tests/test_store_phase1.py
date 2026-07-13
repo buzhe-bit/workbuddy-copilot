@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 
 import pytest
 
@@ -484,6 +485,177 @@ def test_upsert_session_existing_row_only_updates_title_and_activity(store):
     assert row["created_at"] == 10.0
     assert row["title"] == "旧标题"
     assert row["last_activity_at"] == 20.0
+
+
+@pytest.mark.parametrize("legacy_owner", [None, ""])
+def test_legacy_blank_session_owner_is_bound_by_first_report_writer(
+    tmp_path,
+    legacy_owner,
+):
+    db_path = tmp_path / "legacy-owner.db"
+    store = Store(db_path)
+    with store._conn() as conn:
+        conn.execute(
+            """INSERT INTO sessions
+               (session_id, student_id, work_dir, title, created_at, last_activity_at)
+               VALUES ('sess-legacy-owner', ?, '', '', 1, 1)""",
+            (legacy_owner,),
+        )
+    Store(db_path)
+    store = Store(db_path)
+
+    first, duplicate = store.accept_report(
+        student_id="alice",
+        session_id="sess-legacy-owner",
+        event="Stop",
+        event_id="legacy-owner-alice",
+        prompt="first legal writer",
+        transcript_path="copilot:explicit-raw-transcript",
+        msg_count=1,
+        tool_calls=0,
+        analysis_input="alice durable input",
+        raw_transcript_content="alice raw",
+    )
+    assert duplicate is False
+    before = {}
+    with store._conn() as conn:
+        owner = conn.execute(
+            "SELECT student_id FROM sessions WHERE session_id = ?",
+            ("sess-legacy-owner",),
+        ).fetchone()["student_id"]
+        for table in ("reports", "raw_transcripts", "prompts"):
+            before[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    assert owner == "alice"
+
+    with pytest.raises(ValueError, match="belongs to 'alice'"):
+        Store(db_path).accept_report(
+            student_id="bob",
+            session_id="sess-legacy-owner",
+            event="Stop",
+            event_id="legacy-owner-bob",
+            prompt="loser must roll back",
+            transcript_path="copilot:explicit-raw-transcript",
+            msg_count=1,
+            tool_calls=0,
+            analysis_input="bob durable input",
+            raw_transcript_content="bob raw",
+        )
+
+    with store._conn() as conn:
+        assert conn.execute(
+            "SELECT student_id FROM sessions WHERE session_id = ?",
+            ("sess-legacy-owner",),
+        ).fetchone()["student_id"] == "alice"
+        for table, count in before.items():
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == count
+    assert first["student_id"] == "alice"
+
+
+@pytest.mark.parametrize("legacy_owner", [None, ""])
+def test_upsert_session_binds_legacy_blank_owner_once(tmp_path, legacy_owner):
+    db_path = tmp_path / "legacy-upsert-owner.db"
+    store = Store(db_path)
+    with store._conn() as conn:
+        conn.execute(
+            """INSERT INTO sessions
+               (session_id, student_id, work_dir, title, created_at, last_activity_at)
+               VALUES ('sess-legacy-upsert', ?, '', '', 1, 1)""",
+            (legacy_owner,),
+        )
+    Store(db_path)
+    store = Store(db_path)
+
+    store.upsert_session(
+        "sess-legacy-upsert",
+        "alice",
+        "/alice",
+        "Alice",
+    )
+    with pytest.raises(ValueError, match="belongs to 'alice'"):
+        Store(db_path).upsert_session(
+            "sess-legacy-upsert",
+            "bob",
+            "/bob",
+            "Bob",
+        )
+
+    with store._conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?",
+            ("sess-legacy-upsert",),
+        ).fetchone()
+    assert row["student_id"] == "alice"
+    assert row["work_dir"] == "/alice"
+    assert row["title"] == "Alice"
+
+
+@pytest.mark.parametrize("legacy_owner", [None, ""])
+def test_concurrent_report_writers_claim_legacy_blank_owner_once(
+    tmp_path,
+    legacy_owner,
+):
+    db_path = tmp_path / "legacy-owner-race.db"
+    store = Store(db_path)
+    with store._conn() as conn:
+        conn.execute(
+            """INSERT INTO sessions
+               (session_id, student_id, work_dir, title, created_at, last_activity_at)
+               VALUES ('sess-owner-race', ?, '', '', 1, 1)""",
+            (legacy_owner,),
+        )
+
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    outcomes = []
+
+    def writer(student_id: str) -> None:
+        candidate = Store(db_path)
+        barrier.wait()
+        try:
+            candidate.accept_report(
+                student_id=student_id,
+                session_id="sess-owner-race",
+                event="Stop",
+                event_id=f"owner-race-{student_id}",
+                prompt=student_id,
+                transcript_path="copilot:explicit-raw-transcript",
+                msg_count=1,
+                tool_calls=0,
+                analysis_input=f"{student_id} input",
+                raw_transcript_content=f"{student_id} raw",
+            )
+        except Exception as exc:
+            outcome = (student_id, type(exc).__name__, str(exc))
+        else:
+            outcome = (student_id, "success", "")
+        with lock:
+            outcomes.append(outcome)
+
+    threads = [
+        threading.Thread(target=writer, args=(student_id,))
+        for student_id in ("alice", "bob")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+
+    assert sorted(outcome[1] for outcome in outcomes) == ["ValueError", "success"]
+    assert all(outcome[1] != "OperationalError" for outcome in outcomes)
+    winner = next(outcome[0] for outcome in outcomes if outcome[1] == "success")
+    with store._conn() as conn:
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?",
+            ("sess-owner-race",),
+        ).fetchone()
+        reports = conn.execute("SELECT student_id FROM reports").fetchall()
+        raws = conn.execute("SELECT student_id FROM raw_transcripts").fetchall()
+        prompt_count = conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0]
+    assert session["student_id"] == winner
+    assert [row["student_id"] for row in reports] == [winner]
+    assert [row["student_id"] for row in raws] == [winner]
+    assert prompt_count == 0
 
 
 def test_upsert_session_preserves_title_on_empty_update_and_fills_blank_work_dir(store):

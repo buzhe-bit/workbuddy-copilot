@@ -613,7 +613,7 @@ async def _recover_pending_reports(
             and session_id
             and row.get("transcript_path") == EXPLICIT_RAW_TRANSCRIPT_MARKER
         ):
-            raw = ctx.store.get_raw_transcript_for_report(session_id, row.get("created_at"))
+            raw = ctx.store.get_raw_transcript_for_report(report_id)
             if raw is not None:
                 ctx.store.set_report_analysis_input_if_missing(
                     report_id,
@@ -621,6 +621,16 @@ async def _recover_pending_reports(
                 )
                 row = ctx.store.get_report(report_id) or row
                 persisted_analysis_input = row.get("analysis_input")
+        if persisted_analysis_input is None:
+            ctx.store.mark_report_analysis_input_unavailable(
+                report_id,
+                max_attempts=3,
+            )
+            log.error(
+                "legacy Stop analysis input unavailable report_id=%s",
+                report_id,
+            )
+            continue
         transcript_content = (
             str(persisted_analysis_input)
             if persisted_analysis_input is not None
