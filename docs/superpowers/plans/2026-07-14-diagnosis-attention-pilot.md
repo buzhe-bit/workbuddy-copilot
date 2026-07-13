@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在不改变现有 Controller–Service–Repository、EventBus、Student Core、本地 spool、SQLite、单 worker 和静态导师台架构的前提下，建立可复现质量门、加固原闭环，并交付 AI 诊断评测、导师干预雷达与小范围试点保障。
+**Goal:** 在不改变现有 Controller–Service–Repository、EventBus、Student Core、本地 spool、SQLite、单 worker 和静态导师台架构的前提下，建立可复现质量门、加固原闭环，并交付 AI 优先解题、导师干预雷达、小范围试点保障、百人级容量证据与可复现实验式成本优化。
 
 **Architecture:** 服务端继续以 FastAPI 路由调用 Service，Service 通过 Store 持久化并经 EventBus/WSRegistry 推送。Hook 仍 stdlib-only，Student Core 仍负责 spool/HTTP/WS/回执。新增 attention 是已持久化 analysis/student_ask/system 结果的可重建投影，不引入 broker、Redis、多 worker 或前端框架。
 
@@ -20,6 +20,11 @@
 - 自动测试默认断网，使用独立临时 HOME/USERPROFILE/APPDATA/SQLite/spool/config；真 DeepSeek 只用于发布冒烟。
 - Windows W0/W1 没有真机证据时必须保持 `BLOCKED: real-machine evidence missing`，不得宣称可 rollout。
 - 导师建议只能填入输入框，不自动发送，保留人的判断。
+- AI 优先尝试解决学员问题；只有降级、未解决、连续低效或高置信风险才进入导师关注，不能把正常学习噪声推给导师。
+- 诊断、问答和导师干预必须能追溯到有界但充分的会话上下文、历史摘要和证据；不得为降成本丢掉判断所需上下文。
+- 容量验收使用真 Store/Service/EventBus/WSRegistry 与固定 fake LLM，覆盖 10/50/100/300 学员；不以引入 Redis、多 worker 或框架重写来掩盖单 worker 架构的真实边界。
+- 成本优化必须在功能和容量基线冻结后执行，至少完成 25 个单变量实验；每个实验先记录假设、预期、指标和停止条件，再记录实际结果、失败路线与修正，不允许只写事后结论。
+- 默认成本实验不得产生付费模型调用；若要运行真实付费 provider 对照，必须单独取得用户授权并保留调用预算。
 
 ---
 
@@ -198,3 +203,53 @@
 - [ ] 核对总需求：event_id 10 次去重、202 后重启恢复、消息不重渲染、同 SHA 仅重试诊断、身份隔离、attention mentor-only、60 条评测和三 viewport。
 - [ ] 触发最终全分支 code review，修复所有 Critical/Important 发现并重验。
 - [ ] 提交 `docs: add pilot release gates and runbook`。
+
+### Task 10: Plan F — 百人级容量、故障与浸泡验证
+
+**Files:**
+- Create: `copilot/scale_validation.py`, `scripts/run_scale_validation.py`
+- Create: `tests/test_scale_validation.py`, `tests/test_scale_validation_cli.py`
+- Create: `docs/scale-validation.md`
+- Modify: `docs/test-plan-v3.md`, `docs/dev-log.md`
+
+**Interfaces:**
+- `ScaleScenario(students, reports_per_student, ws_fraction, duplicate_rate, failure_mode, restart_at)`。
+- `run_scale_scenario(scenario, harness) -> ScaleReport`；报告至少包含 `accepted, completed, lost, duplicates, failed, pending, attention_created, p50_ms, p95_ms, p99_ms, max_queue_depth, sqlite_busy_errors, peak_rss_mb, db_bytes`。
+- CLI 支持 `--students 10,50,100,300 --output <json>`，每个场景写独立原始指标和总 gate；任何数据丢失、跨学员串线、重复副作用或未发现积压都非零退出。
+
+- [ ] 先写确定性 RED：10/50/100/300 学员并发上报、重复 event_id、部分 WS 断线、LLM 超时/失败、202 后重启和恢复 drain。
+- [ ] harness 使用真临时 SQLite、Store、Service、EventBus、WSRegistry 与固定 fake LLM；不得 mock 被测 Service，也不得访问外网或真实用户目录。
+- [ ] 覆盖导师消息/attention 定向 fanout，证明慢连接或断开学员不会阻塞其他学员，且 mentor-only 事件不进入学员浮标。
+- [ ] 覆盖完整上下文与历史摘要选择：高并发下不串 student/session，不因队列合并丢证据，不把系统异常误判为学习异常。
+- [ ] 固定容量门：lost=0、重复副作用=0、跨学员泄漏=0、SQLite busy 未静默、attention 可见 p95≤30 秒、重启后 60 秒内 drain；超时必须保留 pending/failed 证据。
+- [ ] 运行 10→50→100→300 阶梯压力；至少一次 30 分钟等价浸泡（可用加速事件时钟，但必须另跑真实墙钟短 soak）并记录 RSS、DB 增长、队列水位与延迟分位数。
+- [ ] 在 `docs/scale-validation.md` 写清可承载证据、瓶颈、停止条件和仍需真实试点验证的边界；不得把 fake LLM 结果冒充真实 provider 容量。
+- [ ] 运行聚焦、P0/P1、全量回归和 `git diff --check`；追加 dev-log。
+- [ ] 提交 `test: add multi-student scale and failure gates`。
+
+### Task 11: Plan G — 成本优化实验控制器与不少于 25 组实测
+
+**Files:**
+- Create: `copilot/cost_experiments.py`, `scripts/run_cost_experiments.py`
+- Create: `tests/test_cost_experiments.py`, `tests/test_cost_experiments_cli.py`
+- Create: `tests/fixtures/cost/baseline_cases.jsonl`
+- Create: `docs/cost-experiments/index.md`, `docs/cost-experiments/results.jsonl`
+- Modify: `docs/diagnosis-evaluation.md`, `docs/dev-log.md`
+- Mirror final records to: `/Users/xiaoshushenxia/Documents/测试/🏭项目/超脑ai夏令营/黑客松/`
+
+**Interfaces:**
+- `ExperimentSpec` 固定字段：`id, hypothesis, expected_result, baseline_id, single_variable, dataset, metrics, stop_condition`。
+- `ExperimentResult` 固定字段：`actual_result, verdict, failed_routes, corrections, quality_delta, estimated_token_delta, estimated_cost_delta, latency_delta, artifacts, started_at, finished_at`。
+- `run_experiment(spec, runner) -> ExperimentResult`；开始运行前先持久化 spec，结束或失败后原地追加 actual/failure/correction，不得覆盖原假设。
+- CLI `--catalog <jsonl> --results <jsonl> --resume`；少于 25 个完成实验、缺少任一必填记录或质量门下降时非零退出。
+
+- [ ] 先写日志完整性与 resume RED：中断后保留已写 hypothesis/expected，重启不重复实验，不允许事后补写伪装成事前假设。
+- [ ] 冻结同一 baseline commit、同一 60 条诊断集、同一规模场景、同一计价快照；每个实验只改变一个变量并记录停止条件。
+- [ ] 实际完成不少于 25 组实验，至少覆盖：上下文窗口/选择、历史摘要复用、正常学习短路、prompt 压缩、evidence 上限、model routing、max_tokens、重试/退避、并发、缓存、SHA/事件去重、问答与 attention 合并。
+- [ ] 每组记录假设→预期→实际→失败路线/修正；失败、无收益和回退实验同样保留，不能只留下成功样本。
+- [ ] 质量保护沿用 Plan C 门；任何高优先级召回、正常误报、证据真实性或建议可执行性越界的省钱方案自动判为 rejected。
+- [ ] 默认运行离线 deterministic/fake provider 以测调用数、token 估算、缓存命中、延迟与质量；真实 provider 对照必须在获得用户付费授权后另列，不混写为已完成。
+- [ ] 输出推荐组合时只叠加已证明相容的变量，并用一次组合复验确认总收益不是单项估算相加；记录被否决方案和原因。
+- [ ] 将完整 Markdown/JSONL 结果复制到用户指定黑客松目录；只新增或更新本项目实验记录，不删除该目录任何现有文件。
+- [ ] 运行实验控制器测试、25+ 实验重放、质量/容量回归和 `git diff --check`；追加 dev-log。
+- [ ] 提交 `perf: add reproducible cost optimization experiments`。
