@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import re
-from typing import Iterator, Optional, TYPE_CHECKING
+from typing import Iterator, Literal, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .transcript import TranscriptSnapshot
@@ -23,6 +24,42 @@ def normalize_event_id(value: str | None) -> str | None:
     if not isinstance(value, str) or _EVENT_ID_PATTERN.fullmatch(value) is None:
         raise ValueError("invalid event_id")
     return value
+
+
+def normalize_confidence(value: object) -> float:
+    """Return a finite confidence in ``[0, 1]`` with legacy-safe defaults."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.5
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        return 0.5
+    return min(max(normalized, 0.0), 1.0)
+
+
+def normalize_evidence(value: object) -> list[str]:
+    """Keep at most three non-empty textual evidence snippets."""
+    if not isinstance(value, list):
+        return []
+    evidence: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        snippet = item.strip()
+        if not snippet:
+            continue
+        evidence.append(snippet[:160])
+        if len(evidence) == 3:
+            break
+    return evidence
+
+
+def normalize_latency_ms(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return 0
+    return max(0, int(numeric))
 
 
 @dataclass
@@ -89,6 +126,15 @@ class MentorMessage:
     read_at: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class QuestionAnswerOutcome:
+    """Result of one student question without hiding provider degradation."""
+
+    status: Literal["answered", "degraded", "failed"]
+    answer: str
+    error_code: str = ""
+
+
 @dataclass
 class TimelineEntry:
     """时间线条目（三表 UNION 的统一格式）。"""
@@ -144,6 +190,11 @@ class AnalysisResult:
     diagnosis: str = ""
     suggestion: str = ""
     ai_reply_summary: str = ""
+    confidence: float = 0.5
+    evidence: list[str] = field(default_factory=list)
+    model: str = ""
+    prompt_hash: str = ""
+    latency_ms: int = 0
 
     @classmethod
     def from_dict(cls, d: dict) -> AnalysisResult:
@@ -161,6 +212,15 @@ class AnalysisResult:
             diagnosis=d.get("diagnosis", ""),
             suggestion=d.get("suggestion", ""),
             ai_reply_summary=d.get("ai_reply_summary", ""),
+            confidence=normalize_confidence(d.get("confidence", 0.5)),
+            evidence=normalize_evidence(d.get("evidence", [])),
+            model=(str(d.get("model") or "")[:200] if isinstance(d.get("model"), str) else ""),
+            prompt_hash=(
+                str(d.get("prompt_hash") or "")[:128]
+                if isinstance(d.get("prompt_hash"), str)
+                else ""
+            ),
+            latency_ms=normalize_latency_ms(d.get("latency_ms", 0)),
         )
 
     def to_dict(self) -> dict:
@@ -178,4 +238,9 @@ class AnalysisResult:
             "diagnosis": self.diagnosis,
             "suggestion": self.suggestion,
             "ai_reply_summary": self.ai_reply_summary,
+            "confidence": self.confidence,
+            "evidence": list(self.evidence),
+            "model": self.model,
+            "prompt_hash": self.prompt_hash,
+            "latency_ms": self.latency_ms,
         }

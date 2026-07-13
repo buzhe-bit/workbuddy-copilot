@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import urllib.error
 from urllib.parse import parse_qs, urlparse
 
 import copilot.floating_native as floating_native
@@ -302,7 +303,12 @@ def test_student_ask_worker_posts_context_and_dispatches_answer(monkeypatch):
                 "question": "怎么定位循环边界？",
             }
             assert timeout >= 10
-            return {"ask_id": 12, "answer": "先打印最后一次循环的 index。"}
+            return {
+                "ask_id": 12,
+                "answer": "先打印最后一次循环的 index。",
+                "status": "degraded",
+                "needs_attention": True,
+            }
 
     monkeypatch.setattr(floating_native.AppHelper, "callAfter", fake_call_after)
 
@@ -313,7 +319,200 @@ def test_student_ask_worker_posts_context_and_dispatches_answer(monkeypatch):
     func, args = calls[0]
     assert func.__self__ is app
     assert func.__func__ is CopilotNativeApp._handle_ask_answer
-    assert args == ("怎么定位循环边界？", "先打印最后一次循环的 index。", 12)
+    assert args == (
+        "怎么定位循环边界？",
+        "先打印最后一次循环的 index。",
+        12,
+        "degraded",
+        True,
+    )
+
+
+def test_student_ask_answer_renders_status_and_enables_feedback_actions():
+    rendered = []
+
+    class FakeControl:
+        def __init__(self):
+            self.enabled = None
+            self.hidden = None
+            self.value = None
+
+        def setEnabled_(self, value):
+            self.enabled = value
+
+        def setHidden_(self, value):
+            self.hidden = value
+
+        def setStringValue_(self, value):
+            self.value = value
+
+    class FakeApp:
+        _handle_ask_answer = CopilotNativeApp._handle_ask_answer
+
+        def __init__(self):
+            self.ask_send_button = FakeControl()
+            self.ask_input = FakeControl()
+            self.ask_feedback_helpful_button = FakeControl()
+            self.ask_feedback_unresolved_button = FakeControl()
+
+        def _set_ask_answer_text(self, text):
+            rendered.append(text)
+
+        def _end_ask_focus(self):
+            return None
+
+    app = FakeApp()
+    app._handle_ask_answer("为什么失败？", "这是安全降级答案", 31, "degraded", True)
+
+    assert app._current_ask_id == 31
+    assert app._current_ask_status == "degraded"
+    assert "状态：降级回答（建议稍后重试或请导师协助）" in rendered[-1]
+    assert "这是安全降级答案" in rendered[-1]
+    assert app.ask_feedback_helpful_button.hidden is False
+    assert app.ask_feedback_unresolved_button.hidden is False
+    assert app.ask_feedback_helpful_button.enabled is True
+    assert app.ask_feedback_unresolved_button.enabled is True
+
+
+def test_student_ask_feedback_worker_posts_original_ask_and_dispatches_result(monkeypatch):
+    calls = []
+    posts = []
+
+    def fake_call_after(func, *args):
+        calls.append((func, args))
+
+    class FakeApp:
+        _handle_ask_feedback_result = CopilotNativeApp._handle_ask_feedback_result
+        _handle_ask_feedback_error = CopilotNativeApp._handle_ask_feedback_error
+
+        def __init__(self):
+            self._student_id = "student-a"
+
+        def _post_json(self, path, payload, *, timeout):
+            posts.append((path, payload, timeout))
+            return {
+                "ask_id": 31,
+                "feedback": "unresolved",
+                "feedback_note": "",
+                "feedback_at": 123.0,
+                "updated": True,
+            }
+
+    monkeypatch.setattr(floating_native.AppHelper, "callAfter", fake_call_after)
+
+    app = FakeApp()
+    CopilotNativeApp._send_ask_feedback_worker(app, 31, "unresolved")
+
+    assert posts == [(
+        "/api/student/asks/31/feedback",
+        {"student_id": "student-a", "feedback": "unresolved"},
+        5,
+    )]
+    assert len(calls) == 1
+    func, args = calls[0]
+    assert func.__func__ is CopilotNativeApp._handle_ask_feedback_result
+    assert args == (31, "unresolved", True)
+
+
+def test_student_ask_feedback_conflict_is_rendered_as_already_recorded(monkeypatch):
+    calls = []
+
+    def fake_call_after(func, *args):
+        calls.append((func, args))
+
+    class FakeApp:
+        _handle_ask_feedback_result = CopilotNativeApp._handle_ask_feedback_result
+        _handle_ask_feedback_error = CopilotNativeApp._handle_ask_feedback_error
+        _student_id = "student-a"
+
+        def _post_json(self, path, payload, *, timeout):
+            raise urllib.error.HTTPError(path, 409, "Conflict", {}, None)
+
+    monkeypatch.setattr(floating_native.AppHelper, "callAfter", fake_call_after)
+
+    app = FakeApp()
+    CopilotNativeApp._send_ask_feedback_worker(app, 31, "helpful")
+
+    assert len(calls) == 1
+    func, args = calls[0]
+    assert func.__func__ is CopilotNativeApp._handle_ask_feedback_result
+    assert args == (31, "helpful", False)
+
+
+def test_student_ask_feedback_result_is_local_ui_only_and_disables_repeat_actions():
+    rendered = []
+
+    class FakeControl:
+        def __init__(self):
+            self.enabled = True
+            self.hidden = False
+
+        def setEnabled_(self, value):
+            self.enabled = value
+
+        def setHidden_(self, value):
+            self.hidden = value
+
+    class FakeApp:
+        _handle_ask_feedback_result = CopilotNativeApp._handle_ask_feedback_result
+
+        def __init__(self):
+            self._current_ask_rendered_text = "你问：问题\n\nCopilot：回答"
+            self.ask_feedback_helpful_button = FakeControl()
+            self.ask_feedback_unresolved_button = FakeControl()
+
+        def _set_ask_answer_text(self, text):
+            rendered.append(text)
+
+    app = FakeApp()
+    app._current_ask_id = 31
+    app._handle_ask_feedback_result(31, "helpful", True)
+
+    assert rendered[-1].endswith("反馈：已记录“有帮助”。")
+    assert app.ask_feedback_helpful_button.enabled is False
+    assert app.ask_feedback_unresolved_button.enabled is False
+
+
+def test_student_ask_duplicate_or_conflicting_feedback_shows_generic_recorded_state():
+    rendered = []
+
+    class FakeControl:
+        def setEnabled_(self, value):
+            return None
+
+        def setHidden_(self, value):
+            return None
+
+    class FakeApp:
+        _handle_ask_feedback_result = CopilotNativeApp._handle_ask_feedback_result
+        _current_ask_rendered_text = "你问：问题\n\nCopilot：回答"
+        ask_feedback_helpful_button = FakeControl()
+        ask_feedback_unresolved_button = FakeControl()
+
+        def _set_ask_answer_text(self, text):
+            rendered.append(text)
+
+    app = FakeApp()
+    app._current_ask_id = 31
+    app._handle_ask_feedback_result(31, "helpful", False)
+
+    assert rendered[-1].endswith("反馈：该问题已记录过反馈。")
+
+
+def test_late_feedback_result_cannot_overwrite_a_newer_ask():
+    rendered = []
+
+    class FakeApp:
+        _handle_ask_feedback_result = CopilotNativeApp._handle_ask_feedback_result
+        _current_ask_id = 32
+        _current_ask_rendered_text = "新问题正在显示"
+
+        def _set_ask_answer_text(self, text):
+            rendered.append(text)
+
+    FakeApp()._handle_ask_feedback_result(31, "helpful", True)
+
+    assert rendered == []
 
 
 def test_student_ask_worker_dispatches_friendly_error(monkeypatch):

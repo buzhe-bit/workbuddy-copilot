@@ -12,6 +12,7 @@ import copy
 import re
 import time
 import uuid
+from time import monotonic
 from typing import Any, Awaitable, Callable
 
 from .config import _validate_analysis_max_concurrency
@@ -19,7 +20,7 @@ from .models import (
     AcceptedReport, Student, Conversation, TimelineEntry, AnalysisResult,
 )
 from .eventbus import EventBus
-from .llm import coerce_analysis_outcome
+from .llm import analysis_prompt_hash, coerce_analysis_outcome
 from .transcript import TranscriptSnapshot, parse_text
 
 log = logging.getLogger("copilot.services")
@@ -41,8 +42,30 @@ class AnalysisRetriesExhausted(RuntimeError):
     """Expected terminal state after a durable report uses all attempts."""
 
 
+class AnalysisAttemptFailed(RuntimeError):
+    """Safe failed-attempt trace propagated to the durable retry wrapper."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        model: str,
+        prompt_hash: str,
+        latency_ms: int,
+    ):
+        super().__init__(message)
+        self.error_code = error_code
+        self.model = model
+        self.prompt_hash = prompt_hash
+        self.latency_ms = max(0, int(latency_ms))
+
+
 def stable_analysis_error_code(exc: Exception) -> str:
     """Return a bounded provider-independent code safe for persistence."""
+    explicit_code = getattr(exc, "error_code", "")
+    if isinstance(explicit_code, str) and explicit_code:
+        return explicit_code[:80]
     message = str(exc)
     if message.startswith("LLM provider HTTP "):
         parts = message.split()
@@ -267,13 +290,33 @@ class AnalysisService:
         snap = self.parse_transcript_content(transcript_content)
         # LLM 分析
         llm_config = self._config_with_prompt_overrides()
-        async with self.analysis_semaphore:
-            raw_outcome = await self.llm(
-                llm_config,
-                snap,
-                "Stop",
-                effective_prompt,
-            )
+        prompt_hash = analysis_prompt_hash(llm_config)
+        started_at = monotonic()
+        try:
+            async with self.analysis_semaphore:
+                raw_outcome = await self.llm(
+                    llm_config,
+                    snap,
+                    "Stop",
+                    effective_prompt,
+                )
+        except asyncio.CancelledError as exc:
+            exc.model = ""
+            exc.prompt_hash = prompt_hash
+            exc.latency_ms = max(0, int(round((monotonic() - started_at) * 1000)))
+            raise
+        except Exception as exc:
+            latency_ms = max(0, int(round((monotonic() - started_at) * 1000)))
+            safe_error = f"LLM provider {type(exc).__name__}"
+            error_code = stable_analysis_error_code(RuntimeError(safe_error))
+            raise AnalysisAttemptFailed(
+                error_code,
+                error_code=error_code,
+                model="",
+                prompt_hash=prompt_hash,
+                latency_ms=latency_ms,
+            ) from None
+        latency_ms = max(0, int(round((monotonic() - started_at) * 1000)))
         outcome = coerce_analysis_outcome(raw_outcome)
         if not outcome.ok:
             error = outcome.error or "LLM provider analysis failed"
@@ -285,8 +328,20 @@ class AnalysisService:
                 (session_id or "?")[:8],
                 error_code,
             )
-            raise RuntimeError(error)
-        result = AnalysisResult.from_dict(outcome.value)
+            raise AnalysisAttemptFailed(
+                error_code,
+                error_code=error_code,
+                model=str(outcome.model or "")[:200],
+                prompt_hash=prompt_hash,
+                latency_ms=latency_ms,
+            ) from None
+        traced_value = dict(outcome.value)
+        traced_value.update({
+            "model": str(outcome.model or "")[:200],
+            "prompt_hash": prompt_hash,
+            "latency_ms": latency_ms,
+        })
+        result = AnalysisResult.from_dict(traced_value)
 
         # 标题从 copilot.db sessions 表读取；解析出的 ai_title 仅作兜底。
         session_title = self.copilot.get_session_title(session_id) or snap.ai_title or ""
@@ -381,12 +436,15 @@ class AnalysisService:
                     transcript_content=str(claimed.get("analysis_input") or ""),
                     report_id=report_id,
                 )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
                 self.copilot.mark_report_analysis_failed(
                     report_id,
                     attempt=attempt,
                     error_code="analysis_cancelled",
                     next_retry_at=(0 if attempt < max_attempts else None),
+                    model=str(getattr(exc, "model", "") or "")[:200],
+                    prompt_hash=str(getattr(exc, "prompt_hash", "") or "")[:128],
+                    latency_ms=max(0, int(getattr(exc, "latency_ms", 0) or 0)),
                 )
                 raise
             except Exception as exc:
@@ -405,6 +463,9 @@ class AnalysisService:
                         if next_delay is not None
                         else None
                     ),
+                    model=str(getattr(exc, "model", "") or "")[:200],
+                    prompt_hash=str(getattr(exc, "prompt_hash", "") or "")[:128],
+                    latency_ms=max(0, int(getattr(exc, "latency_ms", 0) or 0)),
                 )
                 if attempt >= max_attempts:
                     raise AnalysisRetriesExhausted(error_code) from None

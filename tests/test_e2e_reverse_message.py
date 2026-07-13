@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+from copilot.floating_native import CopilotNativeApp
 from copilot.app_context import AppContext
 from copilot.connections import WSRegistry
 from copilot.eventbus import EventBus
@@ -331,3 +333,112 @@ def test_same_message_id_cannot_create_duplicate_persisted_message(tmp_path):
     assert [row["id"] for row in rows] == [first_id]
     assert [row["message_id"] for row in rows] == ["fixed-message-id"]
     assert [row["text"] for row in rows] == ["Same id"]
+
+
+def test_300_message_history_survives_lost_ack_restart_and_ws_rest_duplicate(tmp_path):
+    """One combined recovery path must render once and acknowledge durably."""
+    app, store, registry = _build_message_app(tmp_path)
+    mentor_ws = FakeWebSocket()
+    registry.register_mentor(mentor_ws)
+    store.upsert_student("student-a")
+    for index in range(299):
+        message_id = f"history-{index:03d}"
+        store.add_mentor_message(
+            student_id="student-a",
+            mentor_id="mentor-1",
+            session_id="",
+            text=f"confirmed history {index}",
+            message_id=message_id,
+        )
+        assert store.mark_message_delivered(message_id, student_id="student-a") == 1
+    target_message_id = "history-target-299"
+    target_row_id = store.add_mentor_message(
+        student_id="student-a",
+        mentor_id="mentor-1",
+        session_id="",
+        text="render this exactly once",
+        message_id=target_message_id,
+    )
+    state_path = tmp_path / "float-state.json"
+
+    class FakeFloat:
+        _handle_mentor_message = CopilotNativeApp._handle_mentor_message
+        _ack_mentor_message = CopilotNativeApp._ack_mentor_message
+        _load_mentor_message_state = CopilotNativeApp._load_mentor_message_state
+        _save_mentor_message_state = CopilotNativeApp._save_mentor_message_state
+
+        def __init__(self, client, *, lose_ack_response: bool):
+            self.client = client
+            self.lose_ack_response = lose_ack_response
+            self._student_id = "student-a"
+            self._seen_mentor_message_ids: set[str] = set()
+            self._seen_mentor_message_order: list[str] = []
+            self._pending_receipt_message_ids: set[str] = set()
+            self._unpersisted_rendered_message_ids: dict[str, int] = {}
+            self._rendering_mentor_message_ids: set[str] = set()
+            self._receipt_ack_inflight_ids: set[str] = set()
+            self._mentor_message_state_lock = threading.RLock()
+            self._last_seen_mentor_message_id = 0
+            self._ws_asyncio_loop = None
+            self.rendered: list[str] = []
+            self.ack_posts: list[str] = []
+
+        def _mentor_message_state_path(self):
+            return str(state_path)
+
+        def _render_mentor_message(self, item):
+            self.rendered.append(item["message_id"])
+            return True
+
+        def _post_json(self, path, payload, *, timeout):
+            assert path == "/api/student/messages/ack"
+            assert timeout == 3
+            self.ack_posts.append(payload["message_id"])
+            response = self.client.post(
+                path,
+                headers=_auth_headers(),
+                json=payload,
+            )
+            assert response.status_code == 200
+            if self.lose_ack_response:
+                raise TimeoutError("response lost after durable server ack")
+            return response.json()
+
+    with TestClient(app) as client:
+        # Hold one REST catch-up response while the same persisted row arrives by WS.
+        held_rest_item = client.get(
+            "/api/student/messages?student_id=student-a&since=0",
+            headers=_auth_headers(),
+        ).json()["items"]
+        assert len(held_rest_item) == 1
+        payload = held_rest_item[0]
+        assert payload["id"] == target_row_id
+
+        writer = FakeFloat(client, lose_ack_response=True)
+        writer._handle_mentor_message(payload)  # WS arrival
+        writer._handle_mentor_message(payload)  # held REST duplicate
+
+        assert writer.rendered == [target_message_id]
+        assert writer._pending_receipt_message_ids == {target_message_id}
+        assert writer.ack_posts == [target_message_id, target_message_id]
+
+        restarted = FakeFloat(client, lose_ack_response=False)
+        restarted._load_mentor_message_state()
+        assert restarted._pending_receipt_message_ids == {target_message_id}
+        restarted._handle_mentor_message(payload)  # replayed WS duplicate after restart
+        restarted._handle_mentor_message(payload)  # replayed REST duplicate after restart
+
+        assert restarted.rendered == []
+        assert restarted.ack_posts == [target_message_id]
+        assert restarted._pending_receipt_message_ids == set()
+        assert client.get(
+            "/api/student/messages?student_id=student-a&since=0",
+            headers=_auth_headers(),
+        ).json()["items"] == []
+
+    rows = store.list_messages_since("student-a", 0)
+    assert len(rows) == 300
+    assert len({row["message_id"] for row in rows}) == 300
+    target = next(row for row in rows if row["message_id"] == target_message_id)
+    assert target["delivered_at"] is not None
+    assert [item["type"] for item in mentor_ws.sent] == ["message_delivered"]

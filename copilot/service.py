@@ -8,6 +8,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -31,11 +32,13 @@ from .app_context import (
     validate_auth_config,
 )
 from .llm import (
+    analysis_prompt_hash,
     answer_question as llm_answer_question,
     coerce_analysis_outcome,
+    coerce_question_answer_outcome,
     question_fallback_answer,
 )
-from .models import AnalysisResult, normalize_event_id
+from .models import AnalysisResult, QuestionAnswerOutcome, normalize_event_id
 from .services import (
     EXPLICIT_RAW_TRANSCRIPT_MARKER,
     AnalysisRetriesExhausted,
@@ -110,6 +113,12 @@ class StudentAskIn(BaseModel):
     student_id: str
     question: str
     session_id: str | None = None
+
+
+class StudentAskFeedbackIn(BaseModel):
+    student_id: str
+    feedback: Literal["helpful", "unresolved"]
+    note: str | None = None
 
 
 class SyncSessionIn(BaseModel):
@@ -340,17 +349,17 @@ async def _analyze_uploaded_session_background(
     request_id: str | None = None,
 ) -> tuple[bool, str]:
     """Run bounded LLM analysis for an uploaded historical session."""
+    started_at = monotonic()
+    prompt_hash = ""
+    analysis_model = ""
+    attempt_claimed = False
+    latency_ms = 0
+    latency_measured = False
     try:
         if request_id:
             await _mark_upload_child_and_publish(
                 context, request_id, student_id, session_id, "running", sha=sha
             )
-        context.store.set_raw_transcript_analysis_status(
-            session_id,
-            student_id,
-            status="running",
-            content_sha256=sha,
-        )
         snap = _snapshot_from_turns(turns)
         latest_prompt = _latest_user_prompt(turns)
         llm_config = (
@@ -358,6 +367,28 @@ async def _analyze_uploaded_session_background(
             if hasattr(context.analysis_svc, "_config_with_prompt_overrides")
             else context.config
         )
+        prompt_hash = analysis_prompt_hash(llm_config)
+        claimed = context.store.set_raw_transcript_analysis_status(
+            session_id,
+            student_id,
+            status="running",
+            content_sha256=sha,
+            prompt_hash=prompt_hash,
+            increment_attempt=True,
+        )
+        if claimed != 1:
+            if request_id:
+                await _mark_upload_child_and_publish(
+                    context,
+                    request_id,
+                    student_id,
+                    session_id,
+                    "failed",
+                    error="analysis stale transcript",
+                    sha=sha,
+                )
+            return False, "analysis stale transcript"
+        attempt_claimed = True
         async with context.analysis_svc.analysis_semaphore:
             raw_outcome = await context.analysis_svc.llm(
                 llm_config,
@@ -365,10 +396,19 @@ async def _analyze_uploaded_session_background(
                 "Stop",
                 latest_prompt,
             )
+        latency_ms = max(0, int(round((monotonic() - started_at) * 1000)))
+        latency_measured = True
         outcome = coerce_analysis_outcome(raw_outcome)
+        analysis_model = str(outcome.model or "")[:200]
         if not outcome.ok:
             raise RuntimeError(outcome.error or "LLM provider analysis failed")
-        result = AnalysisResult.from_dict(outcome.value)
+        traced_value = dict(outcome.value)
+        traced_value.update({
+            "model": analysis_model,
+            "prompt_hash": prompt_hash,
+            "latency_ms": latency_ms,
+        })
+        result = AnalysisResult.from_dict(traced_value)
         session_title = context.store.get_session_title(session_id)
         report_id = context.store.commit_bulk_analysis_if_current(
             student_id=student_id,
@@ -379,6 +419,16 @@ async def _analyze_uploaded_session_background(
             msg_count=len(snap.messages),
         )
         if report_id is None:
+            context.store.set_raw_transcript_analysis_status(
+                session_id,
+                student_id,
+                status="failed",
+                error_message="analysis stale transcript",
+                content_sha256=sha,
+                analysis_model=analysis_model or None,
+                prompt_hash=prompt_hash or None,
+                latency_ms=latency_ms,
+            )
             log.info(
                 "bulk analysis discarded stale_sha student=%s session=%s sha=%s",
                 student_id,
@@ -415,12 +465,18 @@ async def _analyze_uploaded_session_background(
         return True, ""
     except Exception as exc:
         error_code = _stable_background_analysis_error(exc)
+        if not latency_measured:
+            latency_ms = max(0, int(round((monotonic() - started_at) * 1000)))
         context.store.set_raw_transcript_analysis_status(
             session_id,
             student_id,
             status="failed",
             error_message=error_code,
             content_sha256=sha,
+            analysis_model=analysis_model or None,
+            prompt_hash=prompt_hash or None,
+            latency_ms=latency_ms,
+            increment_attempt=not attempt_claimed,
         )
         log.error(
             "bulk upload analysis failed student=%s session=%s error=%s type=%s",
@@ -441,9 +497,12 @@ def _stable_background_analysis_error(exc: Exception) -> str:
     """Return a bounded error code without provider response or exception details."""
     message = str(exc)
     if message.startswith("LLM provider HTTP "):
-        return " ".join(message.split()[:4])[:80]
+        status = message.removeprefix("LLM provider HTTP ").split(maxsplit=1)[0]
+        return f"LLM provider HTTP {status}" if status.isdigit() else "LLM provider error"
+    if message == "LLM provider TimeoutError":
+        return message
     if message.startswith("LLM provider "):
-        return " ".join(message.split()[:3])[:80]
+        return "LLM provider error"
     if message.startswith("LLM response JSON invalid"):
         return "LLM response JSON invalid"
     return f"analysis {type(exc).__name__}"
@@ -1256,32 +1315,105 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="student_id is required")
         if not question:
             raise HTTPException(status_code=400, detail="question is required")
+        if session_id:
+            try:
+                store.ensure_session_owner(session_id, student_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=409,
+                    detail="session belongs to another student",
+                )
 
         context_messages = _build_student_question_context(store, student_id, session_id)
         try:
-            answer = await asyncio.wait_for(
+            raw_outcome = await asyncio.wait_for(
                 llm_answer_question(context.config, question, context_messages),
                 timeout=_student_ask_timeout(context.config),
             )
+            outcome = coerce_question_answer_outcome(raw_outcome)
+        except asyncio.TimeoutError:
+            log.warning("student ask LLM call exceeded outer timeout")
+            outcome = QuestionAnswerOutcome(
+                status="failed",
+                answer=question_fallback_answer(),
+                error_code="llm_timeout",
+            )
         except Exception as exc:
-            log.warning("student ask LLM failed, using fallback: %s", exc)
-            answer = question_fallback_answer()
+            log.warning(
+                "student ask LLM call failed type=%s",
+                type(exc).__name__,
+            )
+            outcome = QuestionAnswerOutcome(
+                status="failed",
+                answer=question_fallback_answer(),
+                error_code="llm_provider_error",
+            )
 
-        ask_id = store.add_student_ask(
-            student_id=student_id,
-            session_id=session_id,
-            question=question,
-            answer=answer,
-        )
+        try:
+            ask_id = store.add_student_ask(
+                student_id=student_id,
+                session_id=session_id,
+                question=question,
+                answer=outcome.answer,
+                answer_status=outcome.status,
+                error_code=outcome.error_code,
+            )
+        except ValueError:
+            raise HTTPException(
+                status_code=409,
+                detail="session belongs to another student",
+            )
         await context.bus.publish({
             "type": "student_ask",
             "student_id": student_id,
             "session_id": session_id or "",
             "ask_id": ask_id,
             "question": question[:300],
+            "answer_status": outcome.status,
+            "error_code": outcome.error_code,
+            "needs_attention": outcome.status != "answered",
             "timestamp": time.time(),
         })
-        return {"ask_id": ask_id, "answer": answer}
+        return {
+            "ask_id": ask_id,
+            "answer": outcome.answer,
+            "status": outcome.status,
+            "needs_attention": outcome.status != "answered",
+        }
+
+    @app.post("/api/student/asks/{ask_id}/feedback")
+    async def record_student_ask_feedback(
+        ask_id: int,
+        data: StudentAskFeedbackIn,
+        _: None = Depends(require_student_token),
+        store: Store = Depends(get_store),
+    ):
+        student_id = data.student_id.strip()
+        if not student_id:
+            raise HTTPException(status_code=400, detail="student_id is required")
+        note = (data.note or "").strip()
+        if len(note) > 500:
+            raise HTTPException(status_code=422, detail="feedback note is too long")
+        try:
+            row, updated = store.record_student_ask_feedback(
+                ask_id=ask_id,
+                student_id=student_id,
+                feedback=data.feedback,
+                note=note,
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="student ask not found")
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="student ask owner mismatch")
+        except ValueError:
+            raise HTTPException(status_code=409, detail="student ask feedback conflict")
+        return {
+            "ask_id": ask_id,
+            "feedback": row["feedback"],
+            "feedback_note": row["feedback_note"],
+            "feedback_at": row["feedback_at"],
+            "updated": updated,
+        }
 
     @app.delete("/api/admin/students/{student_id}")
     async def delete_student(

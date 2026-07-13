@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS reports (
     analysis_attempts INTEGER NOT NULL DEFAULT 0,
     analysis_error TEXT NOT NULL DEFAULT '',
     analysis_next_retry_at REAL,
+    analysis_model TEXT NOT NULL DEFAULT '',
+    analysis_prompt_hash TEXT NOT NULL DEFAULT '',
+    analysis_latency_ms INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
 
@@ -59,6 +62,12 @@ CREATE TABLE IF NOT EXISTS analyses (
     progress TEXT,
     guidance TEXT,
     alert TEXT,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    model TEXT NOT NULL DEFAULT '',
+    prompt_hash TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
     raw TEXT,
     created_at REAL NOT NULL,
     FOREIGN KEY (report_id) REFERENCES reports(id)
@@ -126,6 +135,10 @@ CREATE TABLE IF NOT EXISTS raw_transcripts (
     content_sha256 TEXT,
     analysis_status TEXT DEFAULT '',
     analysis_error TEXT DEFAULT '',
+    analysis_model TEXT NOT NULL DEFAULT '',
+    analysis_prompt_hash TEXT NOT NULL DEFAULT '',
+    analysis_latency_ms INTEGER NOT NULL DEFAULT 0,
+    analysis_attempts INTEGER NOT NULL DEFAULT 0,
     created_at REAL
 );
 
@@ -178,6 +191,11 @@ CREATE TABLE IF NOT EXISTS student_asks (
     session_id TEXT,
     question TEXT,
     answer TEXT,
+    answer_status TEXT NOT NULL DEFAULT 'answered',
+    error_code TEXT NOT NULL DEFAULT '',
+    feedback TEXT NOT NULL DEFAULT '',
+    feedback_note TEXT NOT NULL DEFAULT '',
+    feedback_at REAL,
     created_at REAL NOT NULL,
     FOREIGN KEY (student_id) REFERENCES students(student_id) ON DELETE CASCADE
 );
@@ -201,18 +219,31 @@ _MIGRATIONS = [
     ("reports", "analysis_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("reports", "analysis_error", "TEXT NOT NULL DEFAULT ''"),
     ("reports", "analysis_next_retry_at", "REAL"),
+    ("reports", "analysis_model", "TEXT NOT NULL DEFAULT ''"),
+    ("reports", "analysis_prompt_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("reports", "analysis_latency_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("analyses", "session_id", "TEXT"),
     ("analyses", "session_title", "TEXT"),
     ("analyses", "is_technical", "INTEGER DEFAULT 0"),
     ("analyses", "severity", "TEXT DEFAULT 'info'"),
     ("analyses", "diagnosis", "TEXT"),
     ("analyses", "suggestion", "TEXT"),
+    ("analyses", "confidence", "REAL NOT NULL DEFAULT 0.5"),
+    ("analyses", "evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("analyses", "model", "TEXT NOT NULL DEFAULT ''"),
+    ("analyses", "prompt_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("analyses", "latency_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("analyses", "attempt_count", "INTEGER NOT NULL DEFAULT 0"),
     ("prompts", "report_id", "INTEGER"),
     ("sessions", "group_type", "TEXT"),
     ("sessions", "space_name", "TEXT"),
     ("raw_transcripts", "content_sha256", "TEXT"),
     ("raw_transcripts", "analysis_status", "TEXT DEFAULT ''"),
     ("raw_transcripts", "analysis_error", "TEXT DEFAULT ''"),
+    ("raw_transcripts", "analysis_model", "TEXT NOT NULL DEFAULT ''"),
+    ("raw_transcripts", "analysis_prompt_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("raw_transcripts", "analysis_latency_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("raw_transcripts", "analysis_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("messages", "summary", "TEXT"),
     ("upload_requests", "error_message", "TEXT DEFAULT ''"),
     ("upload_requests", "result_json", "TEXT"),
@@ -221,6 +252,11 @@ _MIGRATIONS = [
     ("upload_requests", "analysis_status", "TEXT NOT NULL DEFAULT 'not_requested'"),
     ("upload_requests", "transfer_error", "TEXT DEFAULT ''"),
     ("upload_requests", "analysis_error", "TEXT DEFAULT ''"),
+    ("student_asks", "answer_status", "TEXT NOT NULL DEFAULT 'answered'"),
+    ("student_asks", "error_code", "TEXT NOT NULL DEFAULT ''"),
+    ("student_asks", "feedback", "TEXT NOT NULL DEFAULT ''"),
+    ("student_asks", "feedback_note", "TEXT NOT NULL DEFAULT ''"),
+    ("student_asks", "feedback_at", "REAL"),
 ]
 
 _POST_MIGRATION_SQL = [
@@ -705,6 +741,12 @@ class Store:
                 f"not {student_id!r}"
             )
 
+    def ensure_session_owner(self, session_id: str, student_id: str) -> None:
+        """Reject a known session owned by another student."""
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            self._ensure_session_owner_with_conn(c, session_id, student_id)
+
     def get_sessions_by_student_from_table(self, student_id: str, limit: int = 1000) -> list[dict]:
         """Read a student's sessions from the new copilot.db sessions table."""
         with self._conn() as c:
@@ -1101,7 +1143,9 @@ class Store:
                 c.execute(
                     """UPDATE raw_transcripts
                        SET content = ?, content_sha256 = ?, created_at = ?,
-                           analysis_status = '', analysis_error = ''
+                           analysis_status = '', analysis_error = '',
+                           analysis_model = '', analysis_prompt_hash = '',
+                           analysis_latency_ms = 0, analysis_attempts = 0
                        WHERE id = ?""",
                     (raw, sha, now, raw_row["id"]),
                 )
@@ -1123,6 +1167,10 @@ class Store:
         status: str,
         error_message: str | None = None,
         content_sha256: str | None = None,
+        analysis_model: str | None = None,
+        prompt_hash: str | None = None,
+        latency_ms: int = 0,
+        increment_attempt: bool = False,
     ) -> int:
         """Update the latest raw transcript analysis status for a student session."""
         where = "session_id = ? AND student_id = ?"
@@ -1131,6 +1179,7 @@ class Store:
             where += " AND content_sha256 = ?"
             params.append(content_sha256)
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             row = c.execute(
                 f"""SELECT id FROM raw_transcripts
                     WHERE {where}
@@ -1140,11 +1189,43 @@ class Store:
             ).fetchone()
             if not row:
                 return 0
+            try:
+                normalized_latency = max(0, int(latency_ms))
+            except (TypeError, ValueError, OverflowError):
+                normalized_latency = 0
+            normalized_model = (
+                str(analysis_model)[:200] if analysis_model is not None else None
+            )
+            normalized_hash = (
+                str(prompt_hash)[:128] if prompt_hash is not None else None
+            )
+            update_where = "id = ?"
+            update_params: list[Any] = [row["id"]]
+            if content_sha256:
+                update_where += " AND content_sha256 = ?"
+                update_params.append(content_sha256)
             cur = c.execute(
-                """UPDATE raw_transcripts
-                   SET analysis_status = ?, analysis_error = ?
-                   WHERE id = ?""",
-                (status, error_message or "", row["id"]),
+                f"""UPDATE raw_transcripts
+                   SET analysis_status = ?,
+                       analysis_error = ?,
+                       analysis_model = CASE
+                         WHEN ? IS NULL THEN analysis_model ELSE ? END,
+                       analysis_prompt_hash = CASE
+                         WHEN ? IS NULL THEN analysis_prompt_hash ELSE ? END,
+                       analysis_latency_ms = analysis_latency_ms + ?,
+                       analysis_attempts = analysis_attempts + ?
+                   WHERE {update_where}""",
+                (
+                    status,
+                    error_message or "",
+                    normalized_model,
+                    normalized_model,
+                    normalized_hash,
+                    normalized_hash,
+                    normalized_latency,
+                    1 if increment_attempt else 0,
+                    *update_params,
+                ),
             )
             return cur.rowcount
 
@@ -1684,17 +1765,91 @@ class Store:
         session_id: str | None,
         question: str,
         answer: str,
+        answer_status: str = "answered",
+        error_code: str = "",
     ) -> int:
         """Persist a student-initiated Copilot question and answer."""
+        if answer_status not in {"answered", "degraded", "failed"}:
+            raise ValueError("invalid student ask answer status")
         self.upsert_student(student_id)
+        now = time.time()
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            if session_id:
+                self._upsert_session_with_conn(
+                    c,
+                    session_id=session_id,
+                    student_id=student_id,
+                    work_dir="",
+                    title="",
+                    created_at=now,
+                    last_activity_at=now,
+                )
             cur = c.execute(
                 """INSERT INTO student_asks
-                   (student_id, session_id, question, answer, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (student_id, session_id, question, answer, time.time()),
+                   (student_id, session_id, question, answer,
+                    answer_status, error_code, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    student_id,
+                    session_id,
+                    question,
+                    answer,
+                    answer_status,
+                    error_code,
+                    now,
+                ),
             )
             return cur.lastrowid
+
+    def record_student_ask_feedback(
+        self,
+        ask_id: int,
+        student_id: str,
+        feedback: str,
+        note: str = "",
+    ) -> tuple[dict, bool]:
+        """Record an ask's immutable first feedback write atomically."""
+        normalized_feedback = str(feedback or "").strip()
+        normalized_note = str(note or "").strip()
+        if normalized_feedback not in {"helpful", "unresolved"}:
+            raise ValueError("invalid student ask feedback")
+        if len(normalized_note) > 500:
+            raise ValueError("student ask feedback note is too long")
+
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT * FROM student_asks WHERE id = ?",
+                (ask_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError("student ask not found")
+            if row["student_id"] != student_id:
+                raise PermissionError("student ask owner mismatch")
+
+            existing_feedback = str(row["feedback"] or "")
+            existing_note = str(row["feedback_note"] or "")
+            if existing_feedback:
+                if (
+                    existing_feedback == normalized_feedback
+                    and existing_note == normalized_note
+                ):
+                    return dict(row), False
+                raise ValueError("student ask feedback is immutable")
+
+            feedback_at = time.time()
+            c.execute(
+                """UPDATE student_asks
+                   SET feedback = ?, feedback_note = ?, feedback_at = ?
+                   WHERE id = ?""",
+                (normalized_feedback, normalized_note, feedback_at, ask_id),
+            )
+            updated = c.execute(
+                "SELECT * FROM student_asks WHERE id = ?",
+                (ask_id,),
+            ).fetchone()
+            return dict(updated), True
 
     def set_prompt_config(
         self,
@@ -1872,6 +2027,9 @@ class Store:
         attempt: int,
         error_code: str,
         next_retry_at: float | None,
+        model: str = "",
+        prompt_hash: str = "",
+        latency_ms: int = 0,
     ) -> int:
         """Persist one failed attempt without erasing its durable input."""
         with self._conn() as c:
@@ -1880,11 +2038,26 @@ class Store:
                    SET analysis_status = 'failed',
                        analysis_pending = 1,
                        analysis_error = ?,
-                       analysis_next_retry_at = ?
+                       analysis_next_retry_at = ?,
+                       analysis_model = CASE
+                           WHEN ? != '' THEN ? ELSE analysis_model END,
+                       analysis_prompt_hash = CASE
+                           WHEN ? != '' THEN ? ELSE analysis_prompt_hash END,
+                       analysis_latency_ms = analysis_latency_ms + ?
                    WHERE id = ?
                      AND analysis_status = 'running'
                      AND analysis_attempts = ?""",
-                (error_code, next_retry_at, report_id, attempt),
+                (
+                    error_code,
+                    next_retry_at,
+                    model,
+                    model,
+                    prompt_hash,
+                    prompt_hash,
+                    max(0, int(latency_ms)),
+                    report_id,
+                    attempt,
+                ),
             )
             return cur.rowcount
 
@@ -1947,6 +2120,20 @@ class Store:
                 )
                 return int(existing["id"]), False
 
+            report_trace = c.execute(
+                """SELECT analysis_attempts, analysis_latency_ms
+                   FROM reports WHERE id = ?""",
+                (report_id,),
+            ).fetchone()
+            if not report_trace:
+                raise sqlite3.IntegrityError("report disappeared during analysis commit")
+            attempt_count = max(1, int(report_trace["analysis_attempts"] or 0))
+            current_latency_ms = max(0, int(result.get("latency_ms") or 0))
+            cumulative_latency_ms = (
+                max(0, int(report_trace["analysis_latency_ms"] or 0))
+                + current_latency_ms
+            )
+
             summary = str(result.get("ai_reply_summary") or "")
             if summary:
                 summary_row = (
@@ -1984,6 +2171,7 @@ class Store:
                 result=result,
                 session_id=session_id,
                 session_title=session_title,
+                attempt_count=attempt_count,
             )
             updated = c.execute(
                 """UPDATE reports
@@ -1991,9 +2179,17 @@ class Store:
                        analysis_input = NULL,
                        analysis_status = 'done',
                        analysis_error = '',
-                       analysis_next_retry_at = NULL
+                       analysis_next_retry_at = NULL,
+                       analysis_model = ?,
+                       analysis_prompt_hash = ?,
+                       analysis_latency_ms = ?
                    WHERE id = ?""",
-                (report_id,),
+                (
+                    str(result.get("model") or "")[:200],
+                    str(result.get("prompt_hash") or "")[:128],
+                    cumulative_latency_ms,
+                    report_id,
+                ),
             ).rowcount
             if updated != 1:
                 raise sqlite3.IntegrityError("report disappeared during analysis commit")
@@ -2043,6 +2239,7 @@ class Store:
         result: dict[str, Any],
         session_id: str | None,
         session_title: str | None,
+        attempt_count: int = 0,
     ) -> int:
         """Insert analysis details using an existing transaction."""
         cur = c.execute(
@@ -2050,8 +2247,9 @@ class Store:
                (report_id, student_id, session_id, session_title,
                 topic, understanding, off_topic, stuck_at,
                 is_technical, severity, diagnosis, suggestion,
-                progress, guidance, alert, raw, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                progress, guidance, alert, confidence, evidence_json,
+                model, prompt_hash, latency_ms, attempt_count, raw, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 report_id,
                 student_id,
@@ -2068,6 +2266,12 @@ class Store:
                 result.get("progress", ""),
                 result.get("guidance", ""),
                 result.get("alert", ""),
+                result.get("confidence", 0.5),
+                json.dumps(result.get("evidence", []), ensure_ascii=False),
+                str(result.get("model") or "")[:200],
+                str(result.get("prompt_hash") or "")[:128],
+                max(0, int(result.get("latency_ms") or 0)),
+                max(0, int(attempt_count)),
                 json.dumps(result, ensure_ascii=False),
                 time.time(),
             ),
@@ -2088,7 +2292,7 @@ class Store:
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
             raw_row = c.execute(
-                """SELECT id, content_sha256
+                """SELECT id, content_sha256, analysis_latency_ms, analysis_attempts
                    FROM raw_transcripts
                    WHERE student_id = ? AND session_id = ?
                      AND content_sha256 IS NOT NULL AND content_sha256 != ''
@@ -2098,6 +2302,13 @@ class Store:
             ).fetchone()
             if not raw_row or str(raw_row["content_sha256"]) != content_sha256:
                 return None
+
+            attempt_latency_ms = max(0, int(result.get("latency_ms") or 0))
+            attempt_count = max(1, int(raw_row["analysis_attempts"] or 0))
+            cumulative_latency_ms = (
+                max(0, int(raw_row["analysis_latency_ms"] or 0))
+                + attempt_latency_ms
+            )
 
             report_id = self._add_report_with_conn(
                 c,
@@ -2115,12 +2326,41 @@ class Store:
                 result=result,
                 session_id=session_id,
                 session_title=session_title,
+                attempt_count=attempt_count,
+            )
+            c.execute(
+                """UPDATE reports
+                   SET analysis_status = 'done',
+                       analysis_attempts = ?,
+                       analysis_model = ?,
+                       analysis_prompt_hash = ?,
+                       analysis_latency_ms = ?
+                   WHERE id = ?""",
+                (
+                    attempt_count,
+                    str(result.get("model") or "")[:200],
+                    str(result.get("prompt_hash") or "")[:128],
+                    cumulative_latency_ms,
+                    report_id,
+                ),
             )
             updated = c.execute(
                 """UPDATE raw_transcripts
-                   SET analysis_status = 'done', analysis_error = ''
+                   SET analysis_status = 'done',
+                       analysis_error = '',
+                       analysis_model = ?,
+                       analysis_prompt_hash = ?,
+                       analysis_latency_ms = ?,
+                       analysis_attempts = ?
                    WHERE id = ? AND content_sha256 = ?""",
-                (raw_row["id"], content_sha256),
+                (
+                    str(result.get("model") or "")[:200],
+                    str(result.get("prompt_hash") or "")[:128],
+                    cumulative_latency_ms,
+                    attempt_count,
+                    raw_row["id"],
+                    content_sha256,
+                ),
             ).rowcount
             if updated != 1:
                 raise sqlite3.IntegrityError("bulk transcript changed during analysis commit")

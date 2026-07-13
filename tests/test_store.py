@@ -498,7 +498,7 @@ class TestStore:
         )
         store.add_student_ask(
             student_id="bob",
-            session_id="sess-1",
+            session_id="sess-bob",
             question="Bob 的问题",
             answer="Bob 的答案",
         )

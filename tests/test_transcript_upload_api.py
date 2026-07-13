@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from typing import Any
 
 from fastapi.testclient import TestClient
 
+from copilot import service as service_module
 from copilot.app_context import AppContext
 from copilot.connections import WSRegistry
 from copilot.eventbus import EventBus
-from copilot.llm import AnalysisOutcome
+from copilot.llm import AnalysisOutcome, analysis_prompt_hash
 from copilot.service import (
     _analyze_uploaded_session_background,
     _handle_stop_background,
@@ -148,10 +150,90 @@ def test_post_transcript_persists_messages_raw_and_runs_background_analysis(tmp_
     assert raw is not None
     assert raw["content"] == _transcript()
     assert raw["content_sha256"] == "sha-upload-1"
+    assert raw["analysis_model"] == ""
+    assert len(raw["analysis_prompt_hash"]) == 64
+    assert raw["analysis_latency_ms"] >= 0
+    assert raw["analysis_attempts"] == 1
     analyses = store.recent_analyses("student-a", limit=10, session_id="sess-upload")
     assert len(analyses) == 1
     assert analyses[0]["topic"] == "loop debugging"
     assert analyses[0]["diagnosis"] == "学生在定位循环边界。"
+    assert analyses[0]["confidence"] == 0.5
+    assert json.loads(analyses[0]["evidence_json"]) == []
+    assert analyses[0]["model"] == ""
+    assert len(analyses[0]["prompt_hash"]) == 64
+    assert analyses[0]["latency_ms"] >= 0
+    assert analyses[0]["attempt_count"] == 1
+    report = store.get_report(analyses[0]["report_id"])
+    assert report["analysis_status"] == "done"
+    assert report["analysis_prompt_hash"] == analyses[0]["prompt_hash"]
+
+
+def test_legacy_raw_transcript_migrates_trace_defaults(tmp_path):
+    db_path = tmp_path / "legacy-raw.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """CREATE TABLE raw_transcripts (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id TEXT,
+                   student_id TEXT,
+                   content TEXT,
+                   content_sha256 TEXT,
+                   analysis_status TEXT DEFAULT '',
+                   analysis_error TEXT DEFAULT '',
+                   created_at REAL
+               );
+               INSERT INTO raw_transcripts
+                   (session_id, student_id, content, content_sha256,
+                    analysis_status, analysis_error, created_at)
+               VALUES ('legacy-session', 'legacy-student', 'raw', 'legacy-sha',
+                       'failed', 'old error', 1.0);"""
+        )
+
+    store = Store(db_path)
+    raw = store.get_raw_transcript_for_student_session_sha(
+        "legacy-student", "legacy-session", "legacy-sha"
+    )
+
+    assert raw["analysis_model"] == ""
+    assert raw["analysis_prompt_hash"] == ""
+    assert raw["analysis_latency_ms"] == 0
+    assert raw["analysis_attempts"] == 0
+
+
+def test_bulk_failure_never_persists_provider_error_body(tmp_path):
+    app, store, _registry, _llm_calls = _build_upload_app(tmp_path)
+
+    async def secret_failure(config, snap, event, latest_prompt):
+        return AnalysisOutcome(
+            ok=False,
+            value={"topic": "must not persist"},
+            error="LLM provider secret-token=abc123 response-body",
+            model="safe-model-name",
+        )
+
+    app.state.context.analysis_svc.llm = secret_failure
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/student/sessions/sess-secret/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": _transcript(),
+                "sha": "sha-secret",
+            },
+        )
+
+    assert response.status_code == 200
+    raw = store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-secret", "sha-secret"
+    )
+    assert raw["analysis_status"] == "failed"
+    assert raw["analysis_error"] == "LLM provider error"
+    assert "secret-token" not in json.dumps(raw, ensure_ascii=False)
+    assert raw["analysis_model"] == "safe-model-name"
+    assert len(raw["analysis_prompt_hash"]) == 64
+    assert raw["analysis_attempts"] == 1
 
 
 def test_stop_and_full_upload_share_configured_analysis_gate(tmp_path):
@@ -455,6 +537,96 @@ def test_real_requested_multi_session_analysis_waits_for_transfer_completion(tmp
     assert len(llm_calls) == 2
 
 
+def test_requested_multi_session_partial_analysis_keeps_success_and_failure_isolated(tmp_path):
+    app, store, _registry, _llm_calls = _build_upload_app(tmp_path)
+
+    async def partial_llm(config, snap, event, latest_prompt):
+        if "失败" in latest_prompt:
+            return AnalysisOutcome(
+                ok=False,
+                value={"topic": "must not persist"},
+                error="LLM provider TimeoutError",
+                model="partial-model",
+            )
+        return AnalysisOutcome(
+            ok=True,
+            value={
+                "topic": "successful child",
+                "understanding": "medium",
+                "severity": "info",
+                "diagnosis": "成功项应独立保留",
+            },
+            model="partial-model",
+        )
+
+    app.state.context.analysis_svc.llm = partial_llm
+    ok_transcript = _line({
+        "type": "message", "role": "user", "content": "这个会话成功",
+    })
+    failed_transcript = _line({
+        "type": "message", "role": "user", "content": "这个会话失败",
+    })
+
+    with TestClient(app) as client:
+        request_id = client.post(
+            "/api/mentor/students/student-a/request-upload",
+            headers=_headers(),
+        ).json()["request_id"]
+        client.post(
+            f"/api/student/upload-requests/{request_id}/status",
+            headers=_headers(),
+            json={"student_id": "student-a", "status": "running"},
+        )
+        for session_id, content, sha in (
+            ("sess-ok", ok_transcript, "sha-ok"),
+            ("sess-failed", failed_transcript, "sha-failed"),
+        ):
+            response = client.post(
+                f"/api/student/sessions/{session_id}/transcript",
+                headers=_headers(),
+                json={
+                    "student_id": "student-a",
+                    "filtered_content": content,
+                    "sha": sha,
+                    "request_id": request_id,
+                },
+            )
+            assert response.status_code == 200
+        completed = client.post(
+            f"/api/student/upload-requests/{request_id}/status",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "status": "done",
+                "result": {"total": 2, "synced": 2, "skipped": 0, "failed": 0},
+            },
+        )
+
+    assert completed.json()["analysis_status"] == "failed"
+    children = store.list_upload_request_sessions(request_id)
+    assert {
+        row["session_id"]: row["analysis_status"] for row in children
+    } == {"sess-ok": "done", "sess-failed": "failed"}
+    analyses = store.recent_analyses("student-a", limit=10)
+    assert [(row["session_id"], row["topic"]) for row in analyses] == [
+        ("sess-ok", "successful child")
+    ]
+    ok_raw = store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-ok", "sha-ok"
+    )
+    failed_raw = store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-failed", "sha-failed"
+    )
+    assert ok_raw["analysis_status"] == "done"
+    assert ok_raw["analysis_model"] == "partial-model"
+    assert ok_raw["analysis_attempts"] == 1
+    assert failed_raw["analysis_status"] == "failed"
+    assert failed_raw["analysis_error"] == "LLM provider TimeoutError"
+    assert failed_raw["analysis_model"] == "partial-model"
+    assert failed_raw["analysis_attempts"] == 1
+    assert len(failed_raw["analysis_prompt_hash"]) == 64
+
+
 def test_requested_same_sha_empty_probe_registers_done_child_without_reparse(tmp_path):
     app, store, _registry, llm_calls = _build_upload_app(tmp_path)
     with TestClient(app) as client:
@@ -588,7 +760,7 @@ def test_requested_transcript_with_llm_disabled_keeps_analysis_not_requested(tmp
     assert completed.json()["analysis_status"] == "not_requested"
 
 
-def test_same_sha_retries_background_analysis_after_previous_failure(tmp_path):
+def test_same_sha_retries_background_analysis_after_previous_failure(tmp_path, monkeypatch):
     store = Store(tmp_path / "copilot.db")
     bus = EventBus()
     registry = WSRegistry(send_timeout=0.05)
@@ -608,21 +780,29 @@ def test_same_sha_retries_background_analysis_after_previous_failure(tmp_path):
                     "ai_reply_summary": "must not be stored",
                 },
                 error="LLM provider TimeoutError",
+                model="provider-a",
             )
-        return {
-            "topic": "retry worked",
-            "understanding": "medium",
-            "off_topic": False,
-            "stuck_at": "",
-            "is_technical": True,
-            "severity": "info",
-            "diagnosis": "retry succeeded",
-            "suggestion": "continue",
-            "progress": "ok",
-            "guidance": "ok",
-            "alert": "",
-            "ai_reply_summary": "retry summary",
-        }
+        return AnalysisOutcome(
+            ok=True,
+            value={
+                "topic": "retry worked",
+                "understanding": "medium",
+                "off_topic": False,
+                "stuck_at": "",
+                "is_technical": True,
+                "severity": "info",
+                "diagnosis": "retry succeeded",
+                "suggestion": "continue",
+                "progress": "ok",
+                "guidance": "ok",
+                "alert": "",
+                "ai_reply_summary": "retry summary",
+            },
+            model="provider-b",
+        )
+
+    ticks = iter([1.0, 1.01, 2.0, 2.02])
+    monkeypatch.setattr(service_module, "monotonic", lambda: next(ticks))
 
     config = {
         "student_id": "mentor-host",
@@ -699,6 +879,10 @@ def test_same_sha_retries_background_analysis_after_previous_failure(tmp_path):
     assert raw_after_failure["content"] == _transcript()
     assert raw_after_failure["analysis_status"] == "failed"
     assert raw_after_failure["analysis_error"] == "LLM provider TimeoutError"
+    assert raw_after_failure["analysis_model"] == "provider-a"
+    assert len(raw_after_failure["analysis_prompt_hash"]) == 64
+    assert raw_after_failure["analysis_latency_ms"] == 10
+    assert raw_after_failure["analysis_attempts"] == 1
     assert analyses_after_failure == []
     assert second.status_code == 200
     assert second.json()["skipped"] is True
@@ -713,9 +897,19 @@ def test_same_sha_retries_background_analysis_after_previous_failure(tmp_path):
     assert raw["content"] == _transcript()
     assert raw["analysis_status"] == "done"
     assert raw["analysis_error"] == ""
+    assert raw["analysis_model"] == "provider-b"
+    assert len(raw["analysis_prompt_hash"]) == 64
+    assert raw["analysis_latency_ms"] == 30
+    assert raw["analysis_attempts"] == 2
     analyses = store.recent_analyses("student-a", limit=10, session_id="sess-retry")
     assert len(analyses) == 1
     assert analyses[0]["topic"] == "retry worked"
+    assert analyses[0]["model"] == "provider-b"
+    assert analyses[0]["latency_ms"] == 20
+    assert analyses[0]["attempt_count"] == 2
+    report = store.get_report(analyses[0]["report_id"])
+    assert report["analysis_attempts"] == 2
+    assert report["analysis_latency_ms"] == 30
     with store._conn() as conn:
         messages_after_retry = [
             dict(row)
@@ -809,7 +1003,63 @@ def test_stale_bulk_analysis_result_is_discarded_after_new_sha_replaces_it(tmp_p
         assert current is not None
         assert current["analysis_status"] == "pending"
         assert current["analysis_error"] == ""
+        assert current["analysis_model"] == ""
+        assert current["analysis_prompt_hash"] == ""
+        assert current["analysis_latency_ms"] == 0
+        assert current["analysis_attempts"] == 0
         assert [event for event in events if event.get("type") == "analysis"] == []
+
+    asyncio.run(scenario())
+
+
+def test_missing_target_sha_is_rejected_before_bulk_llm_call(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "copilot.db")
+        bus = EventBus()
+        calls = 0
+
+        async def must_not_call(config, snap, event, latest_prompt):
+            nonlocal calls
+            calls += 1
+            return {"topic": "must not run"}
+
+        config = {"llm": {}}
+        context = AppContext(
+            config=config,
+            store=store,
+            analysis_svc=AnalysisService(store, must_not_call, config, bus),
+            session_svc=SessionQueryService(store, config),
+            message_svc=MessageService(store, bus),
+            bus=bus,
+            ws_registry=WSRegistry(send_timeout=0.05),
+        )
+        turns = [{"seq": 0, "role": "user", "text": "old", "ts": 1.0}]
+        store.replace_session_messages(
+            "sess-pre-stale", "student-a", turns, "new raw", "sha-new"
+        )
+        store.set_raw_transcript_analysis_status(
+            "sess-pre-stale",
+            "student-a",
+            status="pending",
+            content_sha256="sha-new",
+        )
+
+        result = await _analyze_uploaded_session_background(
+            context,
+            "student-a",
+            "sess-pre-stale",
+            turns,
+            "sha-old",
+        )
+
+        assert result == (False, "analysis stale transcript")
+        assert calls == 0
+        current = store.get_raw_transcript_for_student_session_sha(
+            "student-a", "sess-pre-stale", "sha-new"
+        )
+        assert current["analysis_status"] == "pending"
+        assert current["analysis_attempts"] == 0
+        assert current["analysis_prompt_hash"] == ""
 
     asyncio.run(scenario())
 
@@ -927,7 +1177,12 @@ def test_stop_and_bulk_analysis_share_configured_concurrency_gate(tmp_path):
         stop_result, bulk_result = await asyncio.gather(stop_task, bulk_task)
 
         assert sorted(llm_prompts) == ["bulk upload prompt", "ordinary stop prompt"]
-        assert stop_result.to_dict() == {
+        stop_result_dict = stop_result.to_dict()
+        trace = {
+            key: stop_result_dict.pop(key)
+            for key in ("confidence", "evidence", "model", "prompt_hash", "latency_ms")
+        }
+        assert stop_result_dict == {
             "topic": "analysis for ordinary stop prompt",
             "understanding": "medium",
             "off_topic": False,
@@ -941,6 +1196,14 @@ def test_stop_and_bulk_analysis_share_configured_concurrency_gate(tmp_path):
             "alert": "",
             "ai_reply_summary": "Deterministic summary.",
         }
+        latency_ms = trace.pop("latency_ms")
+        assert trace == {
+            "confidence": 0.5,
+            "evidence": [],
+            "model": "",
+            "prompt_hash": analysis_prompt_hash(config),
+        }
+        assert latency_ms >= 0
         assert bulk_result == (True, "")
         assert max_active_calls == 1
 

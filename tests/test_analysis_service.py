@@ -2,17 +2,264 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 
 import pytest
 
 from copilot.eventbus import EventBus
 from copilot.llm import AnalysisOutcome
+from copilot import services as services_module
 from copilot.services import AnalysisService, MAX_ANALYSIS_INPUT_BYTES
 from copilot.store import Store
 
 
 def _line(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+def test_legacy_analysis_schema_migrates_trace_columns_with_safe_defaults(tmp_path):
+    db_path = tmp_path / "legacy-analysis.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """CREATE TABLE analyses (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   report_id INTEGER NOT NULL,
+                   student_id TEXT NOT NULL,
+                   session_id TEXT,
+                   session_title TEXT,
+                   topic TEXT,
+                   understanding TEXT,
+                   off_topic INTEGER,
+                   stuck_at TEXT,
+                   is_technical INTEGER DEFAULT 0,
+                   severity TEXT DEFAULT 'info',
+                   diagnosis TEXT,
+                   suggestion TEXT,
+                   progress TEXT,
+                   guidance TEXT,
+                   alert TEXT,
+                   raw TEXT,
+                   created_at REAL NOT NULL
+               );
+               INSERT INTO analyses
+                   (report_id, student_id, topic, raw, created_at)
+               VALUES (1, 'legacy-student', 'legacy topic', '{}', 1.0);"""
+        )
+
+    store = Store(db_path)
+
+    with store._conn() as conn:
+        row = dict(conn.execute("SELECT * FROM analyses WHERE id = 1").fetchone())
+    assert row["confidence"] == 0.5
+    assert json.loads(row["evidence_json"]) == []
+    assert row["model"] == ""
+    assert row["prompt_hash"] == ""
+    assert row["latency_ms"] == 0
+    assert row["attempt_count"] == 0
+
+
+def test_successful_analysis_persists_effective_trace_and_attempt_count(tmp_path, monkeypatch):
+    async def scenario():
+        store = Store(tmp_path / "trace-success.db")
+        bus = EventBus()
+
+        async def traced_fake(cfg, snap, event, latest_prompt):
+            return AnalysisOutcome(
+                ok=True,
+                value={
+                    "topic": "traceable diagnosis",
+                    "confidence": 0.82,
+                    "evidence": ["学员明确贴出 TimeoutError"],
+                    "model": "spoofed-provider-model",
+                    "prompt_hash": "spoofed-provider-hash",
+                    "latency_ms": 999999,
+                },
+                model="deterministic-fake",
+            )
+
+        ticks = iter([10.0, 10.125])
+        monkeypatch.setattr(
+            services_module, "monotonic", lambda: next(ticks), raising=False
+        )
+        config = {
+            "llm": {"model": "configured-model-must-not-be-assumed"},
+            "analysis": {"process_reminder_prompt": "只在反复失败时提醒。"},
+        }
+        service = AnalysisService(store, traced_fake, config, bus)
+        report_id, session_id, _ = service.accept_report(
+            student_id="trace-student",
+            session_id="trace-session",
+            event="Stop",
+            prompt_text="为什么超时？",
+            transcript_content="",
+        )
+
+        result = await service.handle_stop_with_retry(
+            "trace-student",
+            session_id,
+            "为什么超时？",
+            "",
+            report_id,
+            sleeper=lambda _delay: asyncio.sleep(0),
+        )
+
+        with store._conn() as conn:
+            analysis = dict(conn.execute(
+                "SELECT * FROM analyses WHERE report_id = ?", (report_id,)
+            ).fetchone())
+            report = dict(conn.execute(
+                "SELECT * FROM reports WHERE id = ?", (report_id,)
+            ).fetchone())
+        assert result.model == "deterministic-fake"
+        assert analysis["model"] == "deterministic-fake"
+        assert analysis["prompt_hash"] == result.prompt_hash
+        assert len(analysis["prompt_hash"]) == 64
+        assert analysis["latency_ms"] == 125
+        assert analysis["attempt_count"] == 1
+        assert analysis["confidence"] == pytest.approx(0.82)
+        assert json.loads(analysis["evidence_json"]) == ["学员明确贴出 TimeoutError"]
+        assert report["analysis_model"] == "deterministic-fake"
+        assert report["analysis_prompt_hash"] == analysis["prompt_hash"]
+        assert report["analysis_latency_ms"] == 125
+
+    asyncio.run(scenario())
+
+
+def test_failed_analysis_persists_bounded_trace_across_attempts(tmp_path, monkeypatch):
+    async def scenario():
+        store = Store(tmp_path / "trace-failure.db")
+        bus = EventBus()
+
+        async def failed_fake(cfg, snap, event, latest_prompt):
+            return AnalysisOutcome(
+                ok=False,
+                value={"topic": "display fallback only"},
+                error="LLM provider TimeoutError",
+                model="deterministic-fake",
+            )
+
+        ticks = iter([1.0, 1.010, 2.0, 2.020, 3.0, 3.030])
+        monkeypatch.setattr(
+            services_module, "monotonic", lambda: next(ticks), raising=False
+        )
+        service = AnalysisService(
+            store,
+            failed_fake,
+            {"llm": {}, "analysis": {"process_reminder_prompt": "固定协议"}},
+            bus,
+        )
+        report_id, session_id, _ = service.accept_report(
+            student_id="failed-student",
+            session_id="failed-session",
+            event="Stop",
+            prompt_text="失败也要可追溯",
+            transcript_content="",
+        )
+
+        with pytest.raises(Exception, match="llm_provider_timeout_error"):
+            await service.handle_stop_with_retry(
+                "failed-student",
+                session_id,
+                "失败也要可追溯",
+                "",
+                report_id,
+                sleeper=lambda _delay: asyncio.sleep(0),
+            )
+
+        report = store.get_report(report_id)
+        assert report["analysis_status"] == "failed"
+        assert report["analysis_attempts"] == 3
+        assert report["analysis_error"] == "llm_provider_timeout_error"
+        assert report["analysis_model"] == "deterministic-fake"
+        assert len(report["analysis_prompt_hash"]) == 64
+        assert report["analysis_latency_ms"] == 60
+        assert store.recent_analyses(
+            "failed-student", session_id="failed-session"
+        ) == []
+
+    asyncio.run(scenario())
+
+
+def test_failed_outcome_exception_message_never_contains_provider_text(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "trace-secret.db")
+
+        async def secret_failure(cfg, snap, event, latest_prompt):
+            return AnalysisOutcome(
+                ok=False,
+                value={"topic": "fallback"},
+                error="LLM provider HTTP 503 provider-secret-body",
+                model="deterministic-fake",
+            )
+
+        service = AnalysisService(store, secret_failure, {"llm": {}}, EventBus())
+        report_id, session_id, _ = service.accept_report(
+            student_id="secret-student",
+            session_id="secret-session",
+            event="Stop",
+            prompt_text="secret failure",
+            transcript_content="",
+        )
+
+        with pytest.raises(Exception) as captured:
+            await service.handle_stop(
+                "secret-student", session_id, "secret failure", "", report_id
+            )
+
+        assert str(captured.value) == "llm_provider_http_503"
+        assert "provider-secret-body" not in str(captured.value)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_claim_persists_prompt_hash_and_elapsed_latency(tmp_path, monkeypatch):
+    async def scenario():
+        store = Store(tmp_path / "trace-cancelled.db")
+        provider_started = asyncio.Event()
+
+        async def blocked_fake(cfg, snap, event, latest_prompt):
+            provider_started.set()
+            await asyncio.Event().wait()
+
+        ticks = iter([5.0, 5.025])
+        monkeypatch.setattr(
+            services_module, "monotonic", lambda: next(ticks), raising=False
+        )
+        service = AnalysisService(
+            store,
+            blocked_fake,
+            {"llm": {}, "analysis": {"process_reminder_prompt": "固定协议"}},
+            EventBus(),
+        )
+        report_id, session_id, _ = service.accept_report(
+            student_id="cancel-student",
+            session_id="cancel-session",
+            event="Stop",
+            prompt_text="cancel trace",
+            transcript_content="",
+        )
+        task = asyncio.create_task(service.handle_stop_with_retry(
+            "cancel-student",
+            session_id,
+            "cancel trace",
+            "",
+            report_id,
+            sleeper=lambda _delay: asyncio.sleep(0),
+        ))
+        await provider_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        report = store.get_report(report_id)
+        assert report["analysis_status"] == "failed"
+        assert report["analysis_attempts"] == 1
+        assert report["analysis_error"] == "analysis_cancelled"
+        assert report["analysis_model"] == ""
+        assert len(report["analysis_prompt_hash"]) == 64
+        assert report["analysis_latency_ms"] == 25
+
+    asyncio.run(scenario())
 
 
 def test_stop_tail_is_analysis_input_not_raw_transcript(tmp_path):
@@ -402,7 +649,7 @@ def test_handle_stop_keeps_report_pending_and_persists_no_false_analysis_on_prov
             }),
         )
 
-        with pytest.raises(RuntimeError, match="provider timeout"):
+        with pytest.raises(RuntimeError, match="analysis_runtime_error"):
             await service.handle_stop(
                 "stu-fail",
                 session_id,

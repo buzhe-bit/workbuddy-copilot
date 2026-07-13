@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
@@ -566,6 +567,10 @@ class CopilotNativeApp(NSObject):
         self._mentor_unread = 0
         self._student_id = self.cfg.get("student_id") or os.environ.get("COPILOT_STUDENT_ID", "")
         self._upload_requests_inflight = set()
+        self._current_ask_id = 0
+        self._current_ask_status = ""
+        self._current_ask_rendered_text = ""
+        self._ask_feedback_inflight = False
         self._load_mentor_message_state()
         # 多对话状态
         self._sessions = {}            # session_id -> {title, last_ts, unread, last_result}
@@ -701,9 +706,10 @@ class CopilotNativeApp(NSObject):
         bar_h = 38.0                 # 对话切换栏高度
         gap = 8.0
         ask_input_h = 30.0
-        ask_answer_h = 92.0
+        ask_answer_h = 72.0
+        ask_feedback_h = 26.0
         ask_gap = 6.0
-        ask_area_h = ask_input_h + ask_gap + ask_answer_h
+        ask_area_h = ask_input_h + ask_gap + ask_feedback_h + ask_gap + ask_answer_h
         scroll_y = margin + ask_area_h + gap
         scroll_h = PANEL_MAX_HEIGHT - titlebar_reserve - bar_h - gap - ask_area_h - gap
         inner_w = PANEL_WIDTH - margin * 2
@@ -739,7 +745,8 @@ class CopilotNativeApp(NSObject):
         content_view.addSubview_(self.scroll_view)
 
         # Copilot 回答区（底部，可滚动）
-        answer_y = margin + ask_input_h + ask_gap
+        feedback_y = margin + ask_input_h + ask_gap
+        answer_y = feedback_y + ask_feedback_h + ask_gap
         self.ask_answer_scroll = NSScrollView.alloc().initWithFrame_(
             NSMakeRect(margin, answer_y, inner_w, ask_answer_h)
         )
@@ -760,6 +767,31 @@ class CopilotNativeApp(NSObject):
         self.ask_answer_view.setString_("有问题可以直接问 Copilot。")
         self.ask_answer_scroll.setDocumentView_(self.ask_answer_view)
         content_view.addSubview_(self.ask_answer_scroll)
+
+        # 回答反馈（仅在拿到可持久化 ask_id 后显示）
+        feedback_button_w = 92.0
+        self.ask_feedback_helpful_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin, feedback_y, feedback_button_w, ask_feedback_h)
+        )
+        self.ask_feedback_helpful_button.setTitle_("有帮助")
+        self.ask_feedback_helpful_button.setTarget_(self)
+        self.ask_feedback_helpful_button.setAction_("helpfulFeedbackClicked:")
+        self.ask_feedback_helpful_button.setHidden_(True)
+        content_view.addSubview_(self.ask_feedback_helpful_button)
+
+        self.ask_feedback_unresolved_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(
+                margin + feedback_button_w + 8,
+                feedback_y,
+                feedback_button_w,
+                ask_feedback_h,
+            )
+        )
+        self.ask_feedback_unresolved_button.setTitle_("未解决")
+        self.ask_feedback_unresolved_button.setTarget_(self)
+        self.ask_feedback_unresolved_button.setAction_("unresolvedFeedbackClicked:")
+        self.ask_feedback_unresolved_button.setHidden_(True)
+        content_view.addSubview_(self.ask_feedback_unresolved_button)
 
         # 提问输入框 + 发送按钮
         send_w = 68.0
@@ -1781,6 +1813,16 @@ class CopilotNativeApp(NSObject):
             self.ask_answer_view.setTextColor_(_panel_text_color())
             self.ask_answer_view.setString_(text)
 
+    def _set_ask_feedback_controls(self, *, hidden: bool, enabled: bool):
+        for name in (
+            "ask_feedback_helpful_button",
+            "ask_feedback_unresolved_button",
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.setHidden_(hidden)
+                control.setEnabled_(enabled)
+
     def sendAskClicked_(self, sender):
         question = ""
         if hasattr(self, "ask_input"):
@@ -1795,6 +1837,9 @@ class CopilotNativeApp(NSObject):
 
         if hasattr(self, "ask_send_button"):
             self.ask_send_button.setEnabled_(False)
+        self._current_ask_id = 0
+        self._ask_feedback_inflight = False
+        CopilotNativeApp._set_ask_feedback_controls(self, hidden=True, enabled=False)
         self._set_ask_answer_text("思考中...")
         session_id = self._current_session_id or None
         thread = threading.Thread(
@@ -1826,7 +1871,16 @@ class CopilotNativeApp(NSObject):
             )
             answer = str(data.get("answer") or "Copilot 暂时没有返回答案。")
             ask_id = int(data.get("ask_id") or 0)
-            AppHelper.callAfter(self._handle_ask_answer, question, answer, ask_id)
+            status = str(data.get("status") or "answered")
+            needs_attention = bool(data.get("needs_attention", status != "answered"))
+            AppHelper.callAfter(
+                self._handle_ask_answer,
+                question,
+                answer,
+                ask_id,
+                status,
+                needs_attention,
+            )
         except Exception as exc:
             log.debug("学员提问发送失败: %s", exc)
             AppHelper.callAfter(
@@ -1834,12 +1888,38 @@ class CopilotNativeApp(NSObject):
                 "暂时没能连接 Copilot，请稍后再试，或把问题补充完整后重发。",
             )
 
-    def _handle_ask_answer(self, question: str, answer: str, ask_id: int = 0):
+    def _handle_ask_answer(
+        self,
+        question: str,
+        answer: str,
+        ask_id: int = 0,
+        status: str = "answered",
+        needs_attention: bool = False,
+    ):
         if hasattr(self, "ask_send_button"):
             self.ask_send_button.setEnabled_(True)
         if hasattr(self, "ask_input"):
             self.ask_input.setStringValue_("")
-        self._set_ask_answer_text(f"你问：{question}\n\nCopilot：{answer}")
+        normalized_status = status if status in {"answered", "degraded", "failed"} else "failed"
+        status_labels = {
+            "answered": "已回答",
+            "degraded": "降级回答（建议稍后重试或请导师协助）",
+            "failed": "回答失败（已保留问题，建议重试或请导师协助）",
+        }
+        self._current_ask_id = max(0, int(ask_id))
+        self._current_ask_status = normalized_status
+        self._ask_feedback_inflight = False
+        rendered = (
+            f"状态：{status_labels[normalized_status]}\n\n"
+            f"你问：{question}\n\nCopilot：{answer}"
+        )
+        self._current_ask_rendered_text = rendered
+        self._set_ask_answer_text(rendered)
+        CopilotNativeApp._set_ask_feedback_controls(
+            self,
+            hidden=self._current_ask_id <= 0,
+            enabled=self._current_ask_id > 0,
+        )
         self._end_ask_focus()
 
     def _handle_ask_error(self, message: str):
@@ -1847,6 +1927,83 @@ class CopilotNativeApp(NSObject):
             self.ask_send_button.setEnabled_(True)
         self._set_ask_answer_text(message)
         self._end_ask_focus()
+
+    def helpfulFeedbackClicked_(self, sender):
+        self._submit_ask_feedback("helpful")
+
+    def unresolvedFeedbackClicked_(self, sender):
+        self._submit_ask_feedback("unresolved")
+
+    def _submit_ask_feedback(self, feedback: str):
+        ask_id = int(getattr(self, "_current_ask_id", 0) or 0)
+        if ask_id <= 0 or getattr(self, "_ask_feedback_inflight", False):
+            return
+        self._ask_feedback_inflight = True
+        CopilotNativeApp._set_ask_feedback_controls(self, hidden=False, enabled=False)
+        threading.Thread(
+            target=self._send_ask_feedback_worker,
+            args=(ask_id, feedback),
+            daemon=True,
+        ).start()
+
+    def _send_ask_feedback_worker(self, ask_id: int, feedback: str):
+        try:
+            data = self._post_json(
+                f"/api/student/asks/{ask_id}/feedback",
+                {"student_id": self._student_id, "feedback": feedback},
+                timeout=5,
+            )
+            AppHelper.callAfter(
+                self._handle_ask_feedback_result,
+                ask_id,
+                feedback,
+                bool(data.get("updated", False)),
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                AppHelper.callAfter(
+                    self._handle_ask_feedback_result,
+                    ask_id,
+                    feedback,
+                    False,
+                )
+                return
+            log.debug("学员问答反馈 HTTP 失败 status=%s", exc.code)
+            AppHelper.callAfter(
+                self._handle_ask_feedback_error,
+                ask_id,
+                "反馈暂时未提交成功，请稍后重试。",
+            )
+        except Exception as exc:
+            log.debug("学员问答反馈发送失败 type=%s", type(exc).__name__)
+            AppHelper.callAfter(
+                self._handle_ask_feedback_error,
+                ask_id,
+                "反馈暂时未提交成功，请稍后重试。",
+            )
+
+    def _handle_ask_feedback_result(self, ask_id: int, feedback: str, updated: bool):
+        if int(getattr(self, "_current_ask_id", 0) or 0) != int(ask_id):
+            return
+        self._ask_feedback_inflight = False
+        label = "有帮助" if feedback == "helpful" else "未解决"
+        base = getattr(self, "_current_ask_rendered_text", "")
+        suffix = (
+            f"\n\n反馈：已记录“{label}”。"
+            if updated
+            else "\n\n反馈：该问题已记录过反馈。"
+        )
+        self._current_ask_rendered_text = base + suffix
+        self._set_ask_answer_text(self._current_ask_rendered_text)
+        CopilotNativeApp._set_ask_feedback_controls(self, hidden=False, enabled=False)
+
+    def _handle_ask_feedback_error(self, ask_id: int, message: str):
+        if int(getattr(self, "_current_ask_id", 0) or 0) != int(ask_id):
+            return
+        self._ask_feedback_inflight = False
+        base = getattr(self, "_current_ask_rendered_text", "")
+        self._set_ask_answer_text(base + f"\n\n{message}")
+        CopilotNativeApp._set_ask_feedback_controls(self, hidden=False, enabled=True)
 
     def _service_base(self) -> str:
         return service_url(self.cfg)

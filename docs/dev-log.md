@@ -2019,3 +2019,28 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | RED：prompt backfill | 超窗同文、古老 prompt→modern event、空 Stop→无关 UserPrompt 均复现错绑。 |
 | GREEN：三文件 | `tests/test_store.py tests/test_store_phase1.py tests/test_service_routing.py -q`：102 passed / 1 个既有 warning。 |
 | GREEN：Task 2 七文件 | 168 passed / 1 个既有 warning。 |
+
+### Task 3 Plan B2：诊断可追溯与学员问答状态 — 2026-07-14
+
+- 诊断结果新增 `confidence/evidence/model/prompt_hash/latency_ms`；prompt hash 只覆盖生效的
+  静态协议与过程提醒。Stop 与 Bulk 均持久 attempts、可信 model、hash 和累计耗时；
+  provider 失败正文不入库，Bulk running 对目标 SHA 原子领取，stale 结果不污染最新全文。
+- 学员问答区分 answered/degraded/failed。custom outcome 校验 status、非空 answer 与有界
+  snake-case error code；禁用/缺配置与已配置 provider 失败不再混为同一类。
+- `student_asks` 增加状态和首次不可变反馈。反馈支持 helpful/unresolved、500 字 note、
+  幂等重投与 owner 校验，不自动发送导师消息。
+- session owner 防线覆盖提问前检查、LLM 期间竞态和未知 session 的写入时原子绑定；跨学员
+  session 不会落 ask 或事件。
+- 原生浮标显示回答状态与两种反馈；仅 ask_id 有效时显示，成功/409 后禁用，旧反馈线程
+  不会覆盖新问题。
+- 新增 300 条导师消息组合回归，将 WS/REST 重复、ack 响应丢失和重启串在同一场景；仍只
+  渲染一次、只产生一次 delivered 事件。上传组合回归覆盖同批部分失败、同 SHA 重试和 stale。
+
+| 阶段 | 结果 |
+|---|---|
+| Task 3 指定六文件 | 146 passed / 1 个既有 Starlette warning。 |
+| 指定六文件 + Store | 177 passed / 1 个既有 warning。 |
+| 当前沙箱非端口全量 | 616 passed / 1 个既有 warning。 |
+| 修正 fixture 后独立非 e2e 复跑 | 628 passed / 2 个已登记失败；无 Task 3 新失败。 |
+| 完整 3.14 沙箱诊断 | 627 passed / 3 failed / 29 errors；29 error 均为 loopback bind 权限；其中旧 Store fixture 已按 owner 新合同修正并在 177 项中转绿。剩余两项为已登记的 3.14 `fcntl` 探针与端口型 single-worker 门。 |
+| 详细行为/RED-GREEN | 见 `.superpowers/sdd/task-3-report.md`。 |
