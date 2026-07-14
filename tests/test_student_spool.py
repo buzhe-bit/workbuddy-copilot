@@ -66,7 +66,7 @@ def test_receipt_ledger_persists_rendered_and_acked_state_across_spool_restart(t
 def test_receipt_ledger_bounds_acked_history_without_pruning_unacknowledged_rendered(tmp_path: Path) -> None:
     ledger = EventSpool(tmp_path).receipt_ledger
     ledger.mark_rendered("student-1", "must-not-prune")
-    for index in range(300):
+    for index in range(305):
         ledger.mark_acked("student-1", f"acked-{index}")
 
     with sqlite3.connect(ledger.path) as connection:
@@ -75,7 +75,9 @@ def test_receipt_ledger_bounds_acked_history_without_pruning_unacknowledged_rend
             ("student-1",),
         ).fetchone()[0]
 
-    assert acked_count <= 256
+    assert acked_count == 300
+    assert ledger.status("student-1", "acked-0") is None
+    assert ledger.status("student-1", "acked-304") == "acked"
     assert ledger.status("student-1", "must-not-prune") == "rendered"
 
 

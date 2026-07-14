@@ -78,7 +78,9 @@ class ReceiptLedger:
 
     _FILENAME = ".copilot-receipts.sqlite3"
     _VALID_STATES = {"rendered", "acked"}
-    _MAX_ACKED_PER_STUDENT = 256
+    # Match the native inbox's terminal-history window so a startup receipt
+    # reconciliation cannot lose an otherwise retained Windows card.
+    _MAX_ACKED_PER_STUDENT = 300
 
     def __init__(self, directory: Path) -> None:
         self.path = directory / self._FILENAME
