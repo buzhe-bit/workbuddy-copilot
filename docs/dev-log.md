@@ -2096,3 +2096,30 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | Task 2 adjacent | 124 passed / 1 个既有 warning。 |
 | 非 e2e 全量（Python 3.14 诊断） | 645 passed / 2 个已登记基线 failed / 1 warning；仍是 `fcntl` 导入探针与双 worker 短暂 `/health`。 |
 | 详细合同 | 见 `.superpowers/sdd/task-3-report.md` 的“独立审查修复附录”。 |
+
+### Task 4 Plan C：诊断质量评测门禁与 60 条脱敏目录 — 2026-07-14
+
+- 新增完全离线的 diagnosis evaluation engine 与仓库根目录 CLI。固定检查 JSON / 协议有效率、
+  high precision / recall、normal high 误报、人工 actionability、证据真实性、forbidden claim、
+  insufficient-context confidence 和原因码 overlap；任一失败都非零退出。
+- 真实目录固定 60 条及 15/15/10/10/5/5 类别分布。draft priority 使用
+  `none|medium|high`；repeated/off-topic 中单次偏题或低效提醒为 medium，明确连续反复为 high。
+- ground-truth 与 prediction review 是两层独立人工审核，均要求两名审核者和一名仲裁者，
+  三方 ID 互异。prediction 与 review 分文件，拒绝模型内嵌自评。
+- 60 条真实 fixture 的人工字段仍全部为 null，因此当前真实集会明确报告
+  `human_review_incomplete`，不声称门禁已获人工放行。provider 生成不在默认 CI，也未发起付费调用。
+
+| 阶段 | 结果 |
+|---|---|
+| 最小 RED / GREEN | 缺模块 collection error → 单边界 1 passed |
+| expanded RED / GREEN | 16 failed / 1 passed → 第一轮 18 passed |
+| priority + reason RED / GREEN | boolean priority 与 none-reason 矛盾复现 → 字符串 priority、medium 口径、reason overlap 全绿 |
+| 双评审边界 RED / GREEN | 5 failed / 2 passed → 三方 ID、非空注释、分文件自评拒绝 7 passed |
+| Task 4 focused | review 修复后 62 passed |
+| focused + 相邻 | review 修复后 131 passed |
+| 非 e2e 全量（Python 3.14 诊断） | review 修复后 707 passed / 2 个已登记基线 failed / 1 warning |
+| compile / diff | `compileall` 与 `git diff --check` 均 PASS |
+| 首轮独立 review | C1 / I3 / M0：主 API 自评、空 evidence/action、catalog 边界和 normal reason 漏洞均已 RED→GREEN |
+| 复审补充 | category / priority 的 JSON 容器型 unhashable 漏洞 4 failed → 16 passed |
+| 最终独立复审 | 实现快照 `8981432`：C0 / I0 / M0，Approved |
+| 详细合同 | 见 `docs/diagnosis-evaluation.md` 与 `.superpowers/sdd/task-4-report.md` |
