@@ -79,9 +79,11 @@ fixture 修正后的独立非 e2e 复跑为 628 passed，只剩上述两项已�
 ### 修复后合同
 
 1. Bulk 使用 SQLite 专用 claim，只允许当前最新 SHA 的 `pending/failed -> running`。
-   `analysis_generation` 不随 SHA 更换清零；成功提交与失败写回同时校验
-   `raw_id + SHA + generation + running`，防止并发双写和 A→B→A ABA。`analysis_attempts`
-   仍表示当前 SHA 的尝试数。
+   同一 raw row 被新 SHA 复用时 `analysis_generation` 单调递增；成功提交与失败
+   写回同时校验 `raw_id + SHA + generation + running`，防止并发双写和
+   A→B→A ABA。不同 raw row 的 generation 可重新从 1 开始，仍由 `raw_id`
+   隔离；不依赖 session 全局 generation。`analysis_attempts` 仍表示当前 SHA
+   的尝试数。
 2. raw claim/commit/fail 在同一事务内投影所有匹配
    `student/session/SHA` 的 upload request child，事务后汇总并发布 parent。child
    注册在 `BEGIN IMMEDIATE` 内从当前最新 raw 派生 `pending/running/done`，因此同
@@ -93,10 +95,21 @@ fixture 修正后的独立非 e2e 复跑为 628 passed，只剩上述两项已�
    child/parent 一起进入可 retry 状态；已经原子提交为 raw/child done 的 parent 则重新
    聚合为 done，不会被误报 failed。不允许普通工作者直接抢占 `running`。
 5. provider provenance `model` 只接受响应 JSON 中的 string，执行 `strip()` 后最多
-   200 字符。响应缺字段、空白、HTTP 失败或网络失败均保持空，不再冒充请求 alias。
+   200 字符。已解析出 model 后即使 `choices/message/content` envelope 结构错误也
+   保留该 provenance；响应缺 model、空白、HTTP 失败或网络失败均保持空，
+   不再冒充请求 alias。
 6. 首个 ask 在构造上下文和调用 LLM 前，以 `BEGIN IMMEDIATE` 原子 ensure-or-create
    最小 session owner。后到学员绑定失败，先到的 ask 正常落库；已知归属冲突仍在
    LLM 前 409 且零 provider 调用。
+7. upload child 注册在同一 `BEGIN IMMEDIATE` 中校验 parent 归属、session 范围和
+   终态合同，然后才写 child。parent analysis=done 后只允许既有同
+   request/session/SHA 且 child/raw 均 done 的精确重放；新 session 或新 SHA 在任何
+   child/raw 写入前 409。parent 的 done CAS 也在更新语句中复核所有 child，关闭
+   “先终态、后插子项”的反向竞态。
+8. 多个 failed request 共享同一 `student/session/SHA` raw 时，任一显式 retry 成功的
+   commit 都会在同一事务内将匹配的 `failed/pending/running` child 全部投影为
+   done，并刷新对应 parent。其他 request 无需再调一次 LLM，但独立 failed request
+   仍必须通过显式 retry 才能重启计算。
 
 ### 补充 RED / GREEN 证据
 
@@ -109,18 +122,25 @@ fixture 修正后的独立非 e2e 复跑为 628 passed，只剩上述两项已�
 | 注册前失败窗口 | 路由缓存 running，注册时已 failed 导致 child pending 但无 worker | 注册后重读当前 raw，并以 child 原子投影 pending 决定调度 |
 | model provenance | 请求 alias 被误记为实际 model | provider 返回值 trim+有界；缺失/空白/错误为空 |
 | ask-first | A 阻塞在 LLM 时 B 可抢占，A 最终 409 | A 在 LLM 前绑定，B 失败，A 200 且 ask/event 各 1 |
+| 终态后迟到上传 | API 虽 409，但已留下新 child pending 或覆盖原 child SHA | 新 session/新 SHA 均零副作用；精确 done 重放保持幂等 |
+| envelope provenance | 已取得 actual model，但 choices 结构错误后 model 被清空 | `choices=[]`/缺 message/缺 content 均保留 actual model，HTTP/网络仍为空 |
+| 共享 raw 的 failed retry | r1/raw done 后 r2 child/parent 永久 failed，且无法再 retry | 一次 LLM commit 原子 fanout，r1/r2 child 与 parent 均 done |
+| 不同 raw row 的旧 token | 原报告将 generation 误述为跨 SHA/全 session 不清零 | 新旧 row generation 同为 1 时，旧 `raw_id` token 仍无法 commit |
 
 ### 最终验证
 
 | 范围 | 结果 |
 |---|---|
-| Task 3 指定六文件 + `tests/test_store.py` | 184 passed / 1 个既有 warning |
-| Task 2 相邻 transport/coordinator/routing/upload retry + 恢复窗口回归 | 123 passed / 1 个既有 warning |
-| 非 e2e 全量（Python 3.14 诊断） | 636 passed / 2 failed / 1 warning |
+| Task 3 指定六文件 + `tests/test_store.py` | 191 passed / 1 个既有 warning |
+| Task 2 相邻 transport/coordinator/routing/upload retry + 恢复窗口回归 | 124 passed / 1 个既有 warning |
+| 终态/shared-raw/provider 相关四文件 | 118 passed / 1 个既有 warning |
+| 非 e2e 全量（Python 3.14 诊断） | 645 passed / 2 failed / 1 warning |
 | 沙箱外单独复跑 single-worker 端口用例 | 1 failed；稳定复现既登记的多 worker 短暂 `/health` 竞态 |
 | 修复后独立再审 | Critical 0 / Important 0；四个相关文件 111 passed |
 | `git diff --check` | PASS |
 
 非 e2e 全量的两项失败均为 Task 1 已登记基线：Python 3.14 运行时导入树包含
 `fcntl`，以及 uvicorn 两 worker 中一个在 supervisor 终止前短暂提供 `/health`。
-本修复未改 attention 或导师消息 receipt 语义，未推送远端。
+本修复未改 attention 或导师消息 receipt 语义，未推送远端。本轮 RED 分别为：
+终态迟到/provider envelope 聚焦 6 个实例中 5 failed / 1 passed；parent done CAS
+1 failed；共享 raw retry 1 failed。修复后核心聚焦 8 passed。

@@ -4,7 +4,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from .store import Store, UploadRetryClaimConflict
+from .store import (
+    Store,
+    UploadRetryClaimConflict,
+    UploadSessionRegistrationConflict,
+)
 
 log = logging.getLogger("copilot.upload_service")
 
@@ -87,13 +91,18 @@ class UploadRequestService:
             raise InvalidStateTransition(
                 f"upload request is scoped to session_id={requested_session}"
             )
-        child = self.store.upsert_upload_request_session(
-            request_id,
-            student_id,
-            session_id,
-            sha,
-            analysis_status=analysis_status,
-        )
+        try:
+            child = self.store.upsert_upload_request_session(
+                request_id,
+                student_id,
+                session_id,
+                sha,
+                analysis_status=analysis_status,
+            )
+        except UploadSessionRegistrationConflict as exc:
+            if "not found" in str(exc):
+                raise UploadRequestNotFound(str(exc)) from exc
+            raise InvalidStateTransition(str(exc)) from exc
         return child, self.refresh_parent_analysis(request_id, student_id)
 
     def mark_session_analysis(

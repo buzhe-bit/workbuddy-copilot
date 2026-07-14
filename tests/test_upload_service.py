@@ -159,6 +159,49 @@ def test_store_compare_and_set_rejects_stale_expected_without_overwriting(store:
     assert row["transfer_error"] == ""
 
 
+def test_parent_done_cas_rechecks_children_before_terminal_transition(
+    store: Store,
+    service: UploadRequestService,
+):
+    request_id = service.create("mentor-1", "student-a")
+    service.mark_transfer(request_id, "student-a", "running")
+    service.mark_transfer(request_id, "student-a", "stored")
+    service.register_session(
+        request_id, "student-a", "sess-finished", "sha-finished"
+    )
+    store.compare_and_set_upload_request_session(
+        request_id,
+        "student-a",
+        "sess-finished",
+        expected="pending",
+        new_status="running",
+        sha="sha-finished",
+    )
+    store.compare_and_set_upload_request_session(
+        request_id,
+        "student-a",
+        "sess-finished",
+        expected="running",
+        new_status="done",
+        sha="sha-finished",
+    )
+    service.mark_analysis(request_id, "student-a", "running")
+
+    service.register_session(
+        request_id, "student-a", "sess-late", "sha-late"
+    )
+    with pytest.raises(InvalidStateTransition, match="concurrent"):
+        service.mark_analysis(request_id, "student-a", "done")
+
+    parent = store.get_upload_request(request_id)
+    assert parent is not None
+    assert parent["analysis_status"] == "running"
+    assert {
+        child["session_id"]: child["analysis_status"]
+        for child in store.list_upload_request_sessions(request_id)
+    } == {"sess-finished": "done", "sess-late": "pending"}
+
+
 def test_store_compare_and_set_rejects_unapproved_axis_name(store: Store):
     request_id = store.add_upload_request("mentor-1", "student-a")
     with pytest.raises(ValueError, match="axis"):

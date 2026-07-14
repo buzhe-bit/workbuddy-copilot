@@ -322,6 +322,10 @@ class UploadRetryClaimConflict(RuntimeError):
     """Raised when an analysis retry cannot be claimed atomically."""
 
 
+class UploadSessionRegistrationConflict(RuntimeError):
+    """Raised when an upload child cannot be registered atomically."""
+
+
 class Store:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path).expanduser()
@@ -1658,10 +1662,25 @@ class Store:
         analysis_status: str = "pending",
         analysis_error: str = "",
     ) -> dict:
-        """Register a child and atomically project the current raw analysis state."""
+        """Validate the parent and register a child in one write transaction."""
         now = time.time()
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
+            parent = c.execute(
+                """SELECT student_id, session_id, analysis_status
+                   FROM upload_requests WHERE request_id = ?""",
+                (request_id,),
+            ).fetchone()
+            if parent is None or str(parent["student_id"] or "") != student_id:
+                raise UploadSessionRegistrationConflict(
+                    f"upload request not found: {request_id}"
+                )
+            requested_session = str(parent["session_id"] or "")
+            if requested_session and requested_session != session_id:
+                raise UploadSessionRegistrationConflict(
+                    f"upload request is scoped to session_id={requested_session}"
+                )
+
             current_raw = c.execute(
                 """SELECT content_sha256, analysis_status
                    FROM raw_transcripts
@@ -1684,6 +1703,22 @@ class Store:
                    WHERE request_id = ? AND session_id = ?""",
                 (request_id, session_id),
             ).fetchone()
+            if str(parent["analysis_status"] or "") == "done":
+                exact_done_replay = (
+                    existing is not None
+                    and str(existing["student_id"] or "") == student_id
+                    and str(existing["sha"] or "") == sha
+                    and str(existing["analysis_status"] or "") == "done"
+                    and current_raw is not None
+                    and str(current_raw["content_sha256"] or "") == sha
+                    and str(current_raw["analysis_status"] or "") == "done"
+                )
+                if not exact_done_replay:
+                    raise UploadSessionRegistrationConflict(
+                        "upload request analysis is already done"
+                    )
+                return dict(existing)
+
             if existing is None:
                 c.execute(
                     """INSERT INTO upload_request_sessions
@@ -2038,10 +2073,31 @@ class Store:
                 expected,
             )
         else:
-            sql = """UPDATE upload_requests
-                     SET analysis_status = ?, analysis_error = ?, updated_at = ?
-                     WHERE request_id = ? AND student_id = ?
-                       AND analysis_status = ?"""
+            child_guard = ""
+            if new_status == "done":
+                child_guard = """
+                       AND (
+                         NOT EXISTS (
+                           SELECT 1 FROM upload_request_sessions AS child
+                           WHERE child.request_id = upload_requests.request_id
+                         )
+                         OR (
+                           EXISTS (
+                             SELECT 1 FROM upload_request_sessions AS child
+                             WHERE child.request_id = upload_requests.request_id
+                               AND child.analysis_status != 'not_requested'
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1 FROM upload_request_sessions AS child
+                             WHERE child.request_id = upload_requests.request_id
+                               AND child.analysis_status NOT IN ('done', 'not_requested')
+                           )
+                         )
+                       )"""
+            sql = f"""UPDATE upload_requests
+                      SET analysis_status = ?, analysis_error = ?, updated_at = ?
+                      WHERE request_id = ? AND student_id = ?
+                        AND analysis_status = ?{child_guard}"""
             params = (
                 new_status,
                 error,
@@ -2732,7 +2788,7 @@ class Store:
                 student_id,
                 session_id,
                 content_sha256,
-                ("pending", "running"),
+                ("pending", "running", "failed"),
             )
 
             report_id = self._add_report_with_conn(
@@ -2798,7 +2854,7 @@ class Store:
                 """UPDATE upload_request_sessions
                    SET analysis_status = 'done', analysis_error = '', updated_at = ?
                    WHERE student_id = ? AND session_id = ? AND sha = ?
-                     AND analysis_status IN ('pending', 'running')""",
+                     AND analysis_status IN ('pending', 'running', 'failed')""",
                 (now, student_id, session_id, content_sha256),
             )
             return {"report_id": report_id, "request_ids": request_ids}

@@ -396,6 +396,7 @@ async def analyze(
         "Content-Type": "application/json",
     }
     url = llm_cfg["api_base"].rstrip("/") + "/chat/completions"
+    provider_model = ""
 
     try:
         async with httpx.AsyncClient(timeout=llm_cfg.get("timeout", 30)) as client:
@@ -439,7 +440,7 @@ async def analyze(
         ok=False,
         value=_fallback(snap, event),
         error=error,
-        model="",
+        model=provider_model,
         prompt_hash=prompt_hash,
         latency_ms=_elapsed_ms(started_at),
     )

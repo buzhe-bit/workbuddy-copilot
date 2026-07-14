@@ -506,6 +506,60 @@ def test_retry_analysis_reuses_saved_raw_without_rewriting_transfer(tmp_path):
     assert _bulk_messages_snapshot(store, "sess-a") == messages_before
 
 
+def test_retry_success_fans_out_to_failed_requests_sharing_the_same_raw(tmp_path):
+    llm_calls = []
+
+    async def counting_llm(config, snap, event, latest_prompt):
+        llm_calls.append(latest_prompt)
+        return await _fake_llm(config, snap, event, latest_prompt)
+
+    app, store = _build_app(tmp_path, llm=counting_llm, enable_llm=True)
+    service = app.state.context.upload_svc
+    request_ids = [
+        service.create("mentor-1", "student-a", session_id="sess-shared"),
+        service.create("mentor-1", "student-a", session_id="sess-shared"),
+    ]
+    for request_id in request_ids:
+        service.mark_transfer(request_id, "student-a", "running")
+        _add_request_child(
+            service,
+            store,
+            request_id,
+            "sess-shared",
+            "sha-shared",
+            "failed",
+        )
+        service.mark_transfer(request_id, "student-a", "stored")
+        service.refresh_parent_analysis(request_id, "student-a")
+    store.set_raw_transcript_analysis_status(
+        "sess-shared",
+        "student-a",
+        status="failed",
+        error_message="provider failed",
+        content_sha256="sha-shared",
+    )
+
+    with TestClient(app) as client:
+        first_retry = client.post(
+            f"/api/mentor/upload-requests/{request_ids[0]}/retry-analysis",
+            headers=_mentor_headers(),
+        )
+        second_retry = client.post(
+            f"/api/mentor/upload-requests/{request_ids[1]}/retry-analysis",
+            headers=_mentor_headers(),
+        )
+
+    assert first_retry.status_code == 202
+    assert second_retry.status_code == 409
+    assert len(llm_calls) == 1
+    assert store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-shared", "sha-shared"
+    )["analysis_status"] == "done"
+    for request_id in request_ids:
+        assert store.get_upload_request(request_id)["analysis_status"] == "done"
+        assert store.list_upload_request_sessions(request_id)[0]["analysis_status"] == "done"
+
+
 def test_retry_analysis_failure_remains_failed_with_bounded_error(tmp_path):
     async def failed_llm(config, snap, event, latest_prompt):
         raise TimeoutError("provider leaked detail must not reach browser")

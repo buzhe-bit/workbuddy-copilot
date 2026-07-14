@@ -730,6 +730,147 @@ def test_requested_same_sha_empty_probe_registers_done_child_without_reparse(tmp
     assert store.get_raw_transcript_for_student_session("student-a", "sess-same")["content"] == _transcript()
 
 
+@pytest.mark.parametrize(
+    ("late_session_id", "late_sha"),
+    [
+        ("sess-late-new", "sha-late-new"),
+        ("sess-terminal", "sha-late-replacement"),
+    ],
+)
+def test_completed_upload_request_rejects_late_child_before_any_store_mutation(
+    tmp_path,
+    late_session_id,
+    late_sha,
+):
+    app, store, _registry, llm_calls = _build_upload_app(tmp_path)
+
+    with TestClient(app) as client:
+        request_id = client.post(
+            "/api/mentor/students/student-a/request-upload",
+            headers=_headers(),
+        ).json()["request_id"]
+        client.post(
+            f"/api/student/upload-requests/{request_id}/status",
+            headers=_headers(),
+            json={"student_id": "student-a", "status": "running"},
+        )
+        uploaded = client.post(
+            "/api/student/sessions/sess-terminal/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": _transcript(),
+                "sha": "sha-terminal",
+                "request_id": request_id,
+            },
+        )
+        completed = client.post(
+            f"/api/student/upload-requests/{request_id}/status",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "status": "done",
+                "result": {"total": 1, "synced": 1, "skipped": 0, "failed": 0},
+            },
+        )
+        children_before = store.list_upload_request_sessions(request_id)
+        parent_before = store.get_upload_request(request_id)
+        with store._conn() as conn:
+            raw_before = [dict(row) for row in conn.execute(
+                """SELECT * FROM raw_transcripts
+                   WHERE student_id = ? ORDER BY id""",
+                ("student-a",),
+            ).fetchall()]
+
+        rejected = client.post(
+            f"/api/student/sessions/{late_session_id}/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": _transcript(),
+                "sha": late_sha,
+                "request_id": request_id,
+            },
+        )
+
+    assert uploaded.status_code == 200
+    assert completed.status_code == 200
+    assert completed.json()["analysis_status"] == "done"
+    assert rejected.status_code == 409
+    assert store.list_upload_request_sessions(request_id) == children_before
+    assert store.get_upload_request(request_id) == parent_before
+    with store._conn() as conn:
+        raw_after = [dict(row) for row in conn.execute(
+            """SELECT * FROM raw_transcripts
+               WHERE student_id = ? ORDER BY id""",
+            ("student-a",),
+        ).fetchall()]
+    assert raw_after == raw_before
+    assert store.get_raw_transcript_for_student_session_sha(
+        "student-a", late_session_id, late_sha
+    ) is None
+    assert len(llm_calls) == 1
+
+
+def test_completed_upload_request_allows_exact_done_child_replay(tmp_path):
+    app, store, _registry, llm_calls = _build_upload_app(tmp_path)
+
+    with TestClient(app) as client:
+        request_id = client.post(
+            "/api/mentor/students/student-a/request-upload",
+            headers=_headers(),
+        ).json()["request_id"]
+        client.post(
+            f"/api/student/upload-requests/{request_id}/status",
+            headers=_headers(),
+            json={"student_id": "student-a", "status": "running"},
+        )
+        client.post(
+            "/api/student/sessions/sess-terminal-replay/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": _transcript(),
+                "sha": "sha-terminal-replay",
+                "request_id": request_id,
+            },
+        )
+        client.post(
+            f"/api/student/upload-requests/{request_id}/status",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "status": "done",
+                "result": {"total": 1, "synced": 1, "skipped": 0, "failed": 0},
+            },
+        )
+        children_before = store.list_upload_request_sessions(request_id)
+        raw_before = store.get_raw_transcript_for_student_session_sha(
+            "student-a", "sess-terminal-replay", "sha-terminal-replay"
+        )
+
+        replayed = client.post(
+            "/api/student/sessions/sess-terminal-replay/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": "must not reparse",
+                "sha": "sha-terminal-replay",
+                "request_id": request_id,
+            },
+        )
+
+    assert replayed.status_code == 200
+    assert replayed.json()["skipped"] is True
+    assert replayed.json()["analysis_scheduled"] is False
+    assert store.get_upload_request(request_id)["analysis_status"] == "done"
+    assert store.list_upload_request_sessions(request_id) == children_before
+    assert store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-terminal-replay", "sha-terminal-replay"
+    ) == raw_before
+    assert len(llm_calls) == 1
+
+
 def test_specific_upload_request_rejects_different_session_before_parsing(tmp_path):
     app, store, _registry, _llm_calls = _build_upload_app(tmp_path)
     with TestClient(app) as client:
@@ -1374,6 +1515,95 @@ def test_bulk_generation_rejects_old_worker_after_a_b_a_replacement(tmp_path):
     assert [analysis["topic"] for analysis in store.recent_analyses(
         student_id, limit=10, session_id=session_id
     )] == ["new A persists"]
+
+
+def test_bulk_token_rejects_old_worker_after_same_sha_moves_to_new_raw_row(tmp_path):
+    store = Store(tmp_path / "copilot.db")
+    student_id = "student-a"
+    session_id = "sess-new-raw-row"
+    sha = "sha-shared"
+    turns = [{"seq": 0, "role": "user", "text": "prompt", "ts": 1.0}]
+    result = {
+        "topic": "new row persists",
+        "understanding": "medium",
+        "off_topic": False,
+        "stuck_at": "",
+        "is_technical": True,
+        "severity": "info",
+        "diagnosis": "new row owns the token",
+        "suggestion": "",
+        "progress": "",
+        "guidance": "",
+        "alert": "",
+        "confidence": 0.8,
+        "evidence": [],
+        "model": "provider-model",
+        "prompt_hash": "prompt-hash",
+        "latency_ms": 1,
+    }
+
+    store.replace_session_messages(
+        session_id, student_id, turns, "same raw", sha
+    )
+    store.set_raw_transcript_analysis_status(
+        session_id,
+        student_id,
+        status="pending",
+        content_sha256=sha,
+    )
+    old_claim = store.claim_raw_transcript_analysis(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256=sha,
+        prompt_hash="old-hash",
+    )
+    replacement_raw_id = store.add_raw_transcript(
+        session_id, student_id, "same raw", sha
+    )
+    store.set_raw_transcript_analysis_status(
+        session_id,
+        student_id,
+        status="pending",
+        content_sha256=sha,
+    )
+    new_claim = store.claim_raw_transcript_analysis(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256=sha,
+        prompt_hash="new-hash",
+    )
+
+    assert old_claim["state"] == new_claim["state"] == "claimed"
+    assert old_claim["generation"] == new_claim["generation"] == 1
+    assert old_claim["raw_id"] != replacement_raw_id == new_claim["raw_id"]
+    assert store.commit_bulk_analysis_if_current(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256=sha,
+        raw_id=old_claim["raw_id"],
+        generation=old_claim["generation"],
+        result={**result, "topic": "old row must not persist"},
+        session_title="",
+        msg_count=1,
+    ) is None
+    assert store.recent_analyses(
+        student_id, limit=10, session_id=session_id
+    ) == []
+
+    committed = store.commit_bulk_analysis_if_current(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256=sha,
+        raw_id=new_claim["raw_id"],
+        generation=new_claim["generation"],
+        result=result,
+        session_title="",
+        msg_count=1,
+    )
+    assert committed is not None
+    assert [analysis["topic"] for analysis in store.recent_analyses(
+        student_id, limit=10, session_id=session_id
+    )] == ["new row persists"]
 
 
 def test_same_sha_replacement_and_queue_cannot_reopen_running_claim(tmp_path):

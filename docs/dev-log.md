@@ -2048,8 +2048,10 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 ### Task 3 独立 Review 修复：claim、provenance 与 ask-first — 2026-07-14
 
 - Bulk 改为 `raw_id + SHA + analysis_generation` 专用 SQLite claim/commit/fail；
-  attempts 仍按当前 SHA 统计，generation 不清零以防 A→B→A ABA。同一 raw 的终态在
-  事务内 fanout 到同/异 request_id child，启动恢复同步释放 raw running。
+  attempts 仍按当前 SHA 统计；同一 raw row 复用时 generation 单调递增以防
+  A→B→A ABA，不同 raw row 仍由 `raw_id` 隔离，不声称 session 全局不清零。
+  同一 raw 的终态在事务内 fanout 到同/异 request_id child，启动恢复同步释放
+  raw running。
 - 关闭同 SHA TOCTOU：retry 不再用通用 setter 重置 pending；queue 只做
   `''/skipped -> pending` CAS；duplicate bulk replace 在事务内识别当前同 SHA 并 no-op。
 - `AnalysisOutcome.model` 只采信 provider JSON 中 trim 后的 200 字符内字符串；
@@ -2068,3 +2070,29 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | 非 e2e 全量（3.14 诊断） | 636 passed / 2 个已登记基线 failed / 1 warning；沙箱外复跑端口用例仍复现多 worker 短暂 `/health` |
 | 修复后独立再审 | Critical 0 / Important 0；相关四文件 111 passed |
 | 详细合同 | 见 `.superpowers/sdd/task-3-report.md` 的“独立审查修复附录” |
+
+### Task 3 独立 Review 三轮：迟到上传、provenance 窗口与 shared-raw retry — 2026-07-14
+
+- upload child 注册在同一 `BEGIN IMMEDIATE` 中原子校验 parent 归属、session 范围和
+  analysis 终态。parent done 后，只允许同 request/session/SHA 且 child/raw 均 done
+  的精确重放；新 session/新 SHA 在 child 和 raw 写入前直接 409。parent done CAS
+  同时在 SQL 内复核 child 集合，关闭反向竞态。
+- provider JSON 一旦取得 actual model，后续 `choices/message/content` envelope 结构错误不再
+  清空 provenance；HTTP/网络失败仍为空。
+- 共享同一 `student/session/SHA` raw 的多个 failed request，任一显式 retry 成功后，
+  commit 在同一事务将匹配的 failed/pending/running child 全部投影 done，再刷新
+  所有 parent；只调用一次 LLM。
+- Bulk 安全 token 的精确合同是 `raw_id + SHA + generation + running`。新回归证明
+  不同 raw row 的 generation 同为 1 时，旧 raw_id 仍无法 commit。
+
+| 阶段 | 结果 |
+|---|---|
+| RED：迟到上传 + envelope | 6 个实例中 5 failed / 1 passed；409 后 child 已被写入/覆盖，三种 envelope 错误都丢 actual model。 |
+| RED：parent done CAS | 1 failed；新 pending child 存在时仍可将 parent 写为 done。 |
+| RED：shared raw | 1 failed；r1/raw done 但 r2 parent 仍 failed。 |
+| 核心聚焦 GREEN | 8 passed；终态零副作用、精确重放、done CAS、envelope provenance 和 shared-raw fanout 均通过。 |
+| 相关四文件 | 118 passed / 1 个既有 warning。 |
+| Task 3 指定六文件 + Store | 191 passed / 1 个既有 warning。 |
+| Task 2 adjacent | 124 passed / 1 个既有 warning。 |
+| 非 e2e 全量（Python 3.14 诊断） | 645 passed / 2 个已登记基线 failed / 1 warning；仍是 `fcntl` 导入探针与双 worker 短暂 `/health`。 |
+| 详细合同 | 见 `.superpowers/sdd/task-3-report.md` 的“独立审查修复附录”。 |

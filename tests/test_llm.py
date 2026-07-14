@@ -393,6 +393,64 @@ class TestAnalyze:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("payload", "expected_error"),
+        [
+            ({"model": "provider-envelope-model", "choices": []}, "LLM provider IndexError"),
+            (
+                {"model": "provider-envelope-model", "choices": [{}]},
+                "LLM provider KeyError",
+            ),
+            (
+                {
+                    "model": "provider-envelope-model",
+                    "choices": [{"message": {}}],
+                },
+                "LLM provider KeyError",
+            ),
+        ],
+    )
+    async def test_invalid_provider_envelope_keeps_model_resolved_before_failure(
+        self,
+        monkeypatch,
+        payload,
+        expected_error,
+    ):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        class FakeClient:
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json, headers):
+                return FakeResponse()
+
+        monkeypatch.setattr("copilot.llm.httpx.AsyncClient", FakeClient)
+        result = await analyze({
+            "llm": {
+                "enable_llm": True,
+                "api_key": "sk-test",
+                "model": "requested-alias",
+                "api_base": "https://llm.example/v1",
+            }
+        }, TranscriptSnapshot(), "Stop", "hi")
+
+        assert result.ok is False
+        assert result.error == expected_error
+        assert result.model == "provider-envelope-model"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         ("response_model", "expected_model"),
         [
             (
