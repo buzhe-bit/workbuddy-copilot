@@ -2150,3 +2150,4 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 独立审查后补强了不可变失败 occurrence、Stop 终态恢复边界、legacy seed
 顺序、并发游标 CAS、精确身份/删除级联和持久化后 fanout 隔离。实现已
 修复。最终独立复审为 Critical 0 / Important 0 / Minor 0，APPROVE。
+功能提交：`d7ed73c` (`feat: add durable mentor attention projection`)。
