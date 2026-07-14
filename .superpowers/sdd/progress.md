@@ -20,10 +20,10 @@ Tasks:
 - Task 6: completed and independently APPROVED (`b9f9e52`, C0/I0/M0); mentor UI 72 passed, adjacent backend 149 passed, real Student Agent system 4 passed. Local Python 3.14 non-mentor-UI diagnostic 804 passed / 2 known baseline failures / 1 warning; Python 3.13 release lane remains external.
 - Task 7: completed and independently APPROVED (`cfeae49`, C0/I0/M0); responsive Chromium 8 passed, mentor UI + static 80 passed. Local Python 3.14 non-mentor diagnostic remains 752 passed / 2 known baseline failures after excluding unavailable PyObjC native collection; Python 3.13 release lane remains external.
 - Task 8: completed and independently APPROVED (`740e0c1`, fixes `2e95dd5`, C0/I0/M0); focused + adjacent 357 passed, broader non-e2e 823 passed / 3 known environment gates deselected / 2 warnings. Python 3.13, real Chromium/loopback and Windows W0/W1 remain external gates.
-- Task 9: pending — Windows WorkBuddy/runtime/Stop transcript durability and hosted Windows system lane.
-- Task 10: pending — Windows floating UI, installer lifecycle, evidence tooling and first-class client candidate.
+- Task 9: completed and independently reviewed (`92e405d`, P0=0/P1=0; final JUnit 1110 tests / 0 failures / 0 errors / 3 Windows real-machine skips). Two P2 follow-ups remain: used-order tombstone compaction/health and pre-publication owner residue.
+- Task 10: in progress — Windows floating UI, installer lifecycle, evidence tooling and first-class client candidate.
 - Task 11: pending — dual-platform pilot/release gates; Windows rollout remains externally blocked without W0/W1.
 - Task 12: pending — 10/50/100/300 student scale, failure and soak gates.
 - Task 13: pending — at least 25 pre-registered cost experiments plus external mirror.
 
-Current branch: `codex/workbuddy-e1-student-identity`
+Current branch: `codex/workbuddy-e2-windows-runtime`
