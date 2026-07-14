@@ -170,6 +170,7 @@ def test_configured_provider_failure_persists_failed_attention_status(tmp_path, 
         "ask_id": resp.json()["ask_id"],
         "answer": "安全降级回答",
         "status": "failed",
+        "error_code": "llm_timeout",
         "needs_attention": True,
     }
     stored = store.list_student_asks("stu-1")[0]

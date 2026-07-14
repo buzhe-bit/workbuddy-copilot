@@ -255,6 +255,7 @@ def test_pending_retry_and_query_do_not_call_model_or_publish_terminal_event(
         "ask_id": row["id"],
         "answer": "",
         "status": "pending",
+        "error_code": "",
         "needs_attention": False,
     }
     assert replay.status_code == 200

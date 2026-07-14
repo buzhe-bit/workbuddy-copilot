@@ -261,6 +261,7 @@ def _student_ask_response(row: dict[str, Any]) -> dict[str, Any]:
         "ask_id": int(row["id"]),
         "answer": str(row.get("answer") or ""),
         "status": status,
+        "error_code": str(row.get("error_code") or ""),
         "needs_attention": status in {"degraded", "failed"},
     }
 
@@ -1726,6 +1727,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             "ask_id": ask_id,
             "answer": outcome.answer,
             "status": outcome.status,
+            "error_code": outcome.error_code,
             "needs_attention": outcome.status != "answered",
         }
 
