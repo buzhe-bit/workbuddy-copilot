@@ -15,7 +15,7 @@ Tasks:
 - Task 1: completed and independently APPROVED (`ce6c777`, fix `7481a5d`); local 3.14 diagnostic 553 passed / 2 known failures, Python 3.13 release lane remains external.
 - Task 2: completed and independently APPROVED (`741bc82`, fixes `e5e656a`, `95bed8f`); final local 3.14 full regression 602 passed / 2 known baseline failures / 1 warning, Python 3.13 release lane remains external.
 - Task 3: completed and independently APPROVED (`dd8daad`, fixes `796d974`, `8774436`); final local Python 3.14 full browser regression 674 passed / 2 known baseline failures / 1 warning, Python 3.13 release lane remains external.
-- Task 4: completed and independently APPROVED (`8981432`); final local Python 3.14 diagnostic: focused 62 passed, focused + adjacent 131 passed, non-e2e 707 passed / 2 known baseline failures / 1 warning; Python 3.13 and human dual annotation gates remain external.
+- Task 4: completed and independently APPROVED (`e8f2a4a`); final local Python 3.14 diagnostic: focused 62 passed, focused + adjacent 131 passed, non-e2e 707 passed / 2 known baseline failures / 1 warning; Python 3.13 and human dual annotation gates remain external.
 - Task 5: pending
 - Task 6: pending
 - Task 7: pending

@@ -40,7 +40,7 @@
 | focused + 相邻 AnalysisResult / LLM | 131 passed |
 | 非 e2e 全量（Python 3.14 诊断） | 707 passed / 2 个已登记基线 failed / 1 warning |
 | `compileall` / `git diff --check` | PASS |
-| 独立 review | 首轮 C1 / I3 / M0；复审补充 I1；最终实现快照 `8981432` 为 C0 / I0 / M0，Approved |
+| 独立 review | 首轮 C1 / I3 / M0；复审补充 I1；最终 feature commit `e8f2a4a` 为 C0 / I0 / M0，Approved |
 
 本机为 Python 3.14.4，而项目发布合同是 `>=3.13,<3.14`，因此这里只记录诊断证据，不冒充 Python 3.13 发布门。非 e2e 两项失败仍是已登记基线：student-core 导入探针在 3.14 看到 `fcntl`，以及 uvicorn 双 worker 在 supervisor 收口前短暂提供 `/health`。真实集人工双标注仍是外部 gate，当前实现只保证未完成时明确失败。
 

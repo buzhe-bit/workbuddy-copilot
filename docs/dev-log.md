@@ -2121,5 +2121,5 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | compile / diff | `compileall` 与 `git diff --check` 均 PASS |
 | 首轮独立 review | C1 / I3 / M0：主 API 自评、空 evidence/action、catalog 边界和 normal reason 漏洞均已 RED→GREEN |
 | 复审补充 | category / priority 的 JSON 容器型 unhashable 漏洞 4 failed → 16 passed |
-| 最终独立复审 | 实现快照 `8981432`：C0 / I0 / M0，Approved |
+| 最终独立复审 | feature commit `e8f2a4a`：C0 / I0 / M0，Approved |
 | 详细合同 | 见 `docs/diagnosis-evaluation.md` 与 `.superpowers/sdd/task-4-report.md` |
