@@ -2173,3 +2173,33 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | 详细合同 | `.superpowers/sdd/task-6-report.md` |
 
 最终独立审查为 Critical 0 / Important 0 / Minor 0，APPROVE。
+
+### Task 7 Plan D3：导师台响应式与可用性门禁 — 2026-07-14
+
+- 保留单一 DOM 和单一学员/会话/时间线状态，未改后端架构。宽屏为
+  “关注 + 原三栏”，中屏为上层全宽关注队列与下层导航/时间线双栏，
+  手机为“关注 / 学员 / 对话”三个单栏页签。
+- 手机对话中的消息输入区保持 sticky 且键盘可达；页签支持方向键、
+  Home 和 End。补充可见 focus、控件 label、`aria-live` 与
+  `prefers-reduced-motion`。
+- 关注卡片“查看对话”在手机端自动切到对话页签；若学员尚无可用
+  session，则切到学员页签，不制造空对话假象。
+- Playwright 在 `1440×900`、`700×570`、`390×844` 三个目标尺寸的
+  `tmp_path` 写入验收截图，没有提交浏览器缓存或临时截图。
+
+| 范围 | 结果 |
+|---|---|
+| RED：真 Chromium 响应式合同 | 3 failed / 1 passed；700/390 宽度的 `scrollWidth=1163`，且缺可访问 label；1440 基线通过。 |
+| 响应式聚焦 GREEN | 最终 8 passed，包含三 viewport、全键盘、599/600 断点和空工作区焦点。 |
+| 导师 UI + 静态全量 | 最终 80 passed / 2 warnings。 |
+| P0 | import/app/context 通过；P0-5 按预期拒绝；其余 28 passed。 |
+| P1 聚合 | 367 passed；排除当前 venv 缺 PyObjC 的 native 文件。 |
+| 非导师 UI 全量诊断 | 752 passed / 2 个已登记基线 failed / 1 deselected / 2 warnings；排除两个 PyObjC native 文件及其递归 collection 探针。 |
+| 基线 failed | Python 3.14 `fcntl` 探针；`uvicorn --workers 2` 退出前短暂响应 `/health`。 |
+
+最初多出的一项 collection failure 仅因当前 venv 没有 PyObjC，本轮不将其
+误记为响应式回归。独立审查先后发现断点切换、空对话区和列表 DOM 重绘的
+键盘焦点连续性问题；均先补真实 Chromium RED，再修复为可见工作区/同 ID
+新节点/可见标题的有条件恢复。最终复审为 Critical 0 / Important 0 /
+Minor 0，APPROVE。
+本轮不是 Windows 任务；Task 9–11 仍是后续计划中的一等开发与验收范围。

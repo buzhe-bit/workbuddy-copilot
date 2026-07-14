@@ -4,20 +4,33 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>导师观察台</title>
-  <link rel="stylesheet" href="style.css?v=12" />
+  <link rel="stylesheet" href="style.css?v=14" />
 </head>
-<body>
+<body data-mobile-view="attention">
   <header class="topbar">
     <h1>导师观察台</h1>
-    <span id="ws-status" class="ws-status">未连接</span>
+    <span id="ws-status" class="ws-status" role="status" aria-live="polite">未连接</span>
   </header>
+
+  <nav class="mobile-navigation" aria-label="导师工作区导航">
+    <div class="mobile-tablist" role="tablist" aria-label="导师工作区">
+      <button id="attention-tab" type="button" role="tab" data-view="attention"
+              aria-controls="attention-workspace" aria-selected="true">关注</button>
+      <button id="students-tab" type="button" role="tab" data-view="students"
+              aria-controls="students-workspace" aria-selected="false" tabindex="-1">学员</button>
+      <button id="conversation-tab" type="button" role="tab" data-view="conversation"
+              aria-controls="conversation-workspace" aria-selected="false" tabindex="-1">对话</button>
+    </div>
+  </nav>
 
   <main class="layout">
     <!-- 导师干预雷达：只给决策建议，绝不自动发送学员消息 -->
-    <section class="panel panel-attention" aria-labelledby="attention-heading">
+    <section id="attention-workspace" class="panel panel-attention" role="tabpanel"
+             data-mobile-panel="attention" aria-labelledby="attention-tab">
       <div class="panel-heading-row">
         <h2 id="attention-heading">需要关注</h2>
-        <button id="attention-refresh" class="attention-refresh" type="button">刷新</button>
+        <button id="attention-refresh" class="attention-refresh" type="button"
+                aria-label="刷新导师关注队列">刷新</button>
       </div>
       <div class="attention-filters" aria-label="关注队列筛选">
         <label>
@@ -58,51 +71,57 @@
       <ul id="attention-list" class="attention-list"></ul>
     </section>
 
-    <!-- 左栏：学员列表 -->
-    <section class="panel panel-students">
-      <h2>学员</h2>
-      <ul id="student-list" class="student-list"></ul>
-    </section>
+    <div class="content-workspace">
+      <!-- 左栏：学员列表 -->
+      <section id="students-workspace" class="panel panel-students" role="tabpanel"
+               data-mobile-panel="students" aria-labelledby="students-tab">
+        <h2 id="students-heading">学员</h2>
+        <ul id="student-list" class="student-list"></ul>
+      </section>
 
-    <!-- 中栏：对话列表 -->
-    <section class="panel panel-sessions">
-      <h2>对话</h2>
-      <!-- 针对当前选中学员：触发学员机上传全部对话（未选中学员时禁用） -->
-      <button id="sync-student" class="sync-btn" type="button" disabled>⟳ 同步该学员全部对话</button>
-      <div id="sync-feedback" class="sync-feedback" hidden></div>
-      <button id="retry-analysis" class="retry-analysis-btn" type="button" hidden>仅重试诊断</button>
-      <ul id="session-list" class="session-list"></ul>
-    </section>
+      <div id="conversation-workspace" class="conversation-workspace" role="tabpanel"
+           data-mobile-panel="conversation" aria-labelledby="conversation-tab">
+        <!-- 中栏：对话列表 -->
+        <section class="panel panel-sessions" aria-labelledby="sessions-heading">
+          <h2 id="sessions-heading">对话</h2>
+          <!-- 针对当前选中学员：触发学员机上传全部对话（未选中学员时禁用） -->
+          <button id="sync-student" class="sync-btn" type="button" disabled>⟳ 同步该学员全部对话</button>
+          <div id="sync-feedback" class="sync-feedback" role="status" aria-live="polite" hidden></div>
+          <button id="retry-analysis" class="retry-analysis-btn" type="button" hidden>仅重试诊断</button>
+          <ul id="session-list" class="session-list"></ul>
+        </section>
 
-    <!-- 右栏：时间线 -->
-    <section class="panel panel-timeline">
-      <h2>时间线</h2>
+        <!-- 右栏：时间线 -->
+        <section class="panel panel-timeline" aria-labelledby="timeline-heading">
+          <h2 id="timeline-heading">时间线</h2>
 
-      <!-- 会话级单一入口：查看整段对话原文（懒加载，与逐条摘要解耦） -->
-      <details id="transcript-entry" class="transcript-entry" hidden>
-        <summary>查看完整对话原文</summary>
-        <div id="transcript-body" class="transcript-body pending"></div>
-      </details>
+          <!-- 会话级单一入口：查看整段对话原文（懒加载，与逐条摘要解耦） -->
+          <details id="transcript-entry" class="transcript-entry" hidden>
+            <summary>查看完整对话原文</summary>
+            <div id="transcript-body" class="transcript-body pending"></div>
+          </details>
 
-      <div id="timeline" class="timeline"></div>
+          <div id="timeline" class="timeline"></div>
 
-      <!-- 发消息：定向当前学员 -->
-      <form id="compose" class="compose" autocomplete="off">
-        <input id="compose-input" type="text"
-               placeholder="选中学员后可发送提示…（不改 AI，仅提示学员）" disabled />
-        <button id="compose-send" type="submit" disabled>发送</button>
-      </form>
+          <!-- 发消息：定向当前学员 -->
+          <form id="compose" class="compose" autocomplete="off">
+            <input id="compose-input" type="text" aria-label="发给当前学员的导师提示"
+                   placeholder="选中学员后可发送提示…（不改 AI，仅提示学员）" disabled />
+            <button id="compose-send" type="submit" disabled>发送</button>
+          </form>
 
-      <!-- 四色类型图例：色块同步卡片背景色 -->
-      <div class="legend">
-        <span><span class="sw" style="background:#fef9c3"></span>学员提问</span>
-        <span><span class="sw" style="background:#dcfce7"></span>AI 回复摘要</span>
-        <span><span class="sw" style="background:#eff6ff"></span>学习诊断</span>
-        <span><span class="sw" style="background:#fdf2f8"></span>导师提示（出站）</span>
+          <!-- 四色类型图例：色块同步卡片背景色 -->
+          <div class="legend">
+            <span><span class="sw" style="background:#fef9c3"></span>学员提问</span>
+            <span><span class="sw" style="background:#dcfce7"></span>AI 回复摘要</span>
+            <span><span class="sw" style="background:#eff6ff"></span>学习诊断</span>
+            <span><span class="sw" style="background:#fdf2f8"></span>导师提示（出站）</span>
+          </div>
+        </section>
       </div>
-    </section>
+    </div>
   </main>
 
-  <script src="app.js?v=13"></script>
+  <script src="app.js?v=14"></script>
 </body>
 </html>

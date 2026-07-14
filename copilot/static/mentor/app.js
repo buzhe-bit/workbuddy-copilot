@@ -20,6 +20,8 @@
 // ─────────────────────────────────────────────────────────────
 const state = {
   attention: newAttentionState(),
+  // 响应式界面状态独立于业务数据；移动端一次只展示一个工作区。
+  ui: { mobileView: 'attention' },
   students: [],          // [{student_id, display_name, last_severity, session_count, analysis_count, alert_count, ...}]
   sessions: [],          // [{session_id, session_title, last_severity, analysis_count, alert_count, ...}]
   timeline: [],          // 归一化条目（见 normalize* 函数）
@@ -108,6 +110,22 @@ const transcriptBodyEl = document.getElementById('transcript-body');
 const syncBtn = document.getElementById('sync-student');
 const syncFeedbackEl = document.getElementById('sync-feedback');
 const retryAnalysisBtn = document.getElementById('retry-analysis');
+const mobileTablist = document.querySelector('[role="tablist"][aria-label="导师工作区"]');
+const mobileTabs = Array.from(document.querySelectorAll('[role="tab"][data-view]'));
+const mobilePanels = {
+  attention: document.querySelector('[data-mobile-panel="attention"]') ||
+    document.querySelector('.panel-attention'),
+  students: document.querySelector('[data-mobile-panel="students"]') ||
+    document.querySelector('.panel-students'),
+  conversation: document.querySelector('[data-mobile-panel="conversation"]') ||
+    document.querySelector('.conversation-workspace') ||
+    document.querySelector('.panel-timeline'),
+};
+const mobileMedia = window.matchMedia('(max-width: 599px)');
+let responsiveWasMobile = mobileMedia.matches;
+let lastMobileFocusView = state.ui.mobileView;
+let lastMobileFocusWasTab = false;
+let hadWorkspaceFocus = false;
 
 let outboundSeq = 0; // 出站消息本地唯一 id 生成器
 let uploadPollController = null;
@@ -247,6 +265,179 @@ function el(tag, className, text) {
   if (className) node.className = className;
   if (text != null) node.textContent = text; // textContent → XSS 安全
   return node;
+}
+
+function makeKeyboardActivatable(node, activate) {
+  node.setAttribute('role', 'button');
+  node.tabIndex = 0;
+  node.addEventListener('click', activate);
+  node.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    activate();
+  });
+  return node;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 三档响应式导航（只管理可见工作区，不复制任何业务数据或 DOM）
+// ─────────────────────────────────────────────────────────────
+function isMobileLayout() {
+  return mobileMedia.matches;
+}
+
+function mobileViewForNode(node) {
+  if (!(node instanceof Element)) return null;
+  const tab = node.closest('[role="tab"][data-view]');
+  if (tab && tab.dataset.view) return tab.dataset.view;
+  for (const [view, panel] of Object.entries(mobilePanels)) {
+    if (panel && panel.contains(node)) return view;
+  }
+  return null;
+}
+
+function elementIsRendered(node) {
+  if (!(node instanceof HTMLElement)) return false;
+  return node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden';
+}
+
+function focusWorkspaceEntry(view) {
+  const panel = mobilePanels[view];
+  if (!panel) return;
+  const selected = Array.from(panel.querySelectorAll(
+    '.student-item[aria-pressed="true"], .session-item[aria-pressed="true"]'
+  )).find((candidate) => elementIsRendered(candidate));
+  if (selected) {
+    selected.focus();
+    return;
+  }
+  const candidates = Array.from(panel.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
+    'summary, [role="button"][tabindex="0"]'
+  ));
+  const firstControl = candidates.find((candidate) => elementIsRendered(candidate));
+  if (firstControl) {
+    firstControl.focus();
+    return;
+  }
+  // conversation wrapper 在宽屏是 display:contents，不能作为可靠焦点兜底；
+  // 标题始终对应一个真实可见面板，也能向键盘/读屏用户说明当前位置。
+  const heading = Array.from(panel.querySelectorAll('h2')).find(
+    (candidate) => elementIsRendered(candidate)
+  );
+  const fallback = heading || (elementIsRendered(panel) ? panel : null);
+  if (!fallback) return;
+  fallback.tabIndex = -1;
+  fallback.focus();
+}
+
+function syncResponsiveMode() {
+  const mobile = isMobileLayout();
+  const enteringMobile = mobile && !responsiveWasMobile;
+  const activeBefore = document.activeElement;
+  const focusedView = mobileViewForNode(activeBefore);
+  const leavingMobileTab = !mobile && responsiveWasMobile &&
+    (
+      lastMobileFocusWasTab ||
+      (activeBefore instanceof Element && !!activeBefore.closest('[role="tab"][data-view]'))
+    );
+
+  // 桌面/平板进入移动断点时，以当前键盘焦点所在工作区为准，避免把它隐藏。
+  const enteringFocusView = focusedView || (hadWorkspaceFocus ? lastMobileFocusView : null);
+  if (enteringMobile && enteringFocusView) {
+    state.ui.mobileView = enteringFocusView;
+  }
+  const activeView = state.ui.mobileView;
+  document.body.dataset.mobileView = activeView;
+  mobileTabs.forEach((tab) => {
+    const selected = tab.dataset.view === activeView;
+    tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+    tab.tabIndex = selected ? 0 : -1;
+  });
+  Object.entries(mobilePanels).forEach(([view, panel]) => {
+    if (!panel) return;
+    if (mobile) {
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', view + '-tab');
+      panel.setAttribute('aria-hidden', view === activeView ? 'false' : 'true');
+    } else {
+      // 大/中屏没有页签关系，避免可见区域被一个隐藏 tab 错误命名。
+      panel.removeAttribute('role');
+      panel.removeAttribute('aria-hidden');
+      if (view === 'attention') panel.setAttribute('aria-labelledby', 'attention-heading');
+      else if (view === 'students') panel.setAttribute('aria-labelledby', 'students-heading');
+      else panel.removeAttribute('aria-labelledby');
+    }
+  });
+  responsiveWasMobile = mobile;
+
+  if (leavingMobileTab) {
+    const restoreView = focusedView || lastMobileFocusView || activeView;
+    focusWorkspaceEntry(restoreView);
+    // Chromium 可能在 media change 回调后才完成 display:none 导航的 blur；
+    // 下一帧只在焦点仍不可见时补一次，避免覆盖用户已主动移动的焦点。
+    window.requestAnimationFrame(() => {
+      if (!elementIsRendered(document.activeElement)) focusWorkspaceEntry(restoreView);
+    });
+    lastMobileFocusWasTab = false;
+  } else if (enteringMobile && enteringFocusView && hadWorkspaceFocus) {
+    window.requestAnimationFrame(() => {
+      if (!elementIsRendered(document.activeElement)) focusWorkspaceEntry(enteringFocusView);
+    });
+  } else if (
+    mobile &&
+    activeBefore instanceof HTMLElement &&
+    activeBefore !== document.body &&
+    !elementIsRendered(activeBefore)
+  ) {
+    const activeTab = mobileTabs.find((tab) => tab.dataset.view === activeView);
+    if (activeTab) activeTab.focus();
+  }
+}
+
+function setMobileView(view, { focusTab = false } = {}) {
+  if (!Object.prototype.hasOwnProperty.call(mobilePanels, view)) return;
+  const tab = mobileTabs.find((candidate) => candidate.dataset.view === view);
+  if (focusTab && isMobileLayout() && tab) tab.focus();
+  state.ui.mobileView = view;
+  syncResponsiveMode();
+}
+
+function moveMobileTabFocus(event) {
+  if (!isMobileLayout() || !mobileTabs.length) return;
+  const currentIndex = mobileTabs.indexOf(event.currentTarget);
+  if (currentIndex < 0) return;
+  let nextIndex = currentIndex;
+  if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % mobileTabs.length;
+  else if (event.key === 'ArrowLeft') {
+    nextIndex = (currentIndex - 1 + mobileTabs.length) % mobileTabs.length;
+  } else if (event.key === 'Home') nextIndex = 0;
+  else if (event.key === 'End') nextIndex = mobileTabs.length - 1;
+  else return;
+  event.preventDefault();
+  setMobileView(mobileTabs[nextIndex].dataset.view, { focusTab: true });
+}
+
+mobileTabs.forEach((tab) => {
+  tab.addEventListener('click', () => setMobileView(tab.dataset.view));
+  tab.addEventListener('keydown', moveMobileTabFocus);
+});
+document.addEventListener('focusin', (event) => {
+  const target = event.target;
+  const view = mobileViewForNode(target);
+  if (view) {
+    lastMobileFocusView = view;
+    hadWorkspaceFocus = true;
+  }
+  if (isMobileLayout()) {
+    lastMobileFocusWasTab = target instanceof Element &&
+      !!target.closest('[role="tab"][data-view]');
+  }
+});
+if (typeof mobileMedia.addEventListener === 'function') {
+  mobileMedia.addEventListener('change', syncResponsiveMode);
+} else if (typeof mobileMedia.addListener === 'function') {
+  mobileMedia.addListener(syncResponsiveMode);
 }
 
 // 导师干预雷达：REST 是权威补拉，WS/PATCH 按 id + updated_at 增量合并。
@@ -427,6 +618,7 @@ function buildAttentionCard(item) {
 function renderAttention() {
   if (!attentionListEl) return;
   attentionListEl.innerHTML = '';
+  attentionListEl.setAttribute('aria-busy', state.attention.loading ? 'true' : 'false');
   if (attentionRefreshBtn) attentionRefreshBtn.disabled = state.attention.loading;
   if (attentionFeedbackEl) attentionFeedbackEl.textContent = '';
   if (state.attention.loading) {
@@ -536,6 +728,7 @@ async function focusAttentionContext(item) {
       if (attentionFeedbackEl) {
         attentionFeedbackEl.textContent = '来源对话当前不可用，已定位到学员';
       }
+      setMobileView('students', { focusTab: true });
       return true;
     }
     await selectSession(item.session_id);
@@ -543,12 +736,18 @@ async function focusAttentionContext(item) {
       return false;
     }
   }
+  if (item.session_id) {
+    setMobileView('conversation', { focusTab: true });
+  } else {
+    setMobileView('students', { focusTab: true });
+  }
   return true;
 }
 
 async function prefillAttentionSuggestion(item) {
   const focused = await focusAttentionContext(item);
   if (!focused || !item.suggested_action) return;
+  setMobileView('conversation', { focusTab: true });
   composeInput.value = item.suggested_action;
   composeInput.focus();
 }
@@ -649,6 +848,13 @@ async function loadStudents() {
 }
 
 function renderStudents() {
+  const activeBefore = document.activeElement;
+  const focusedStudent = activeBefore instanceof Element
+    ? activeBefore.closest('.student-item[data-student-id]')
+    : null;
+  const focusedStudentId = focusedStudent && studentListEl.contains(focusedStudent)
+    ? focusedStudent.dataset.studentId
+    : null;
   studentListEl.innerHTML = ''; // 清空骨架（非用户值），安全
   const students = state.students
     .map((student, index) => ({ student: student, index: index }))
@@ -670,7 +876,9 @@ function renderStudents() {
   students.forEach((s) => {
     const li = el('li', 'student-item');
     li.dataset.studentId = s.student_id;
-    if (s.student_id === state.currentStudentId) li.classList.add('selected');
+    const selected = s.student_id === state.currentStudentId;
+    if (selected) li.classList.add('selected');
+    li.setAttribute('aria-pressed', selected ? 'true' : 'false');
 
     li.appendChild(el('span', 'status-dot ' + severityClass(s.last_severity)));
 
@@ -685,9 +893,15 @@ function renderStudents() {
       li.appendChild(el('span', 'attention-count', String(attentionCount)));
     }
 
-    li.addEventListener('click', () => selectStudent(s.student_id));
+    makeKeyboardActivatable(li, () => selectStudent(s.student_id));
     studentListEl.appendChild(li);
   });
+  if (focusedStudentId) {
+    const replacement = Array.from(studentListEl.querySelectorAll('.student-item')).find(
+      (item) => item.dataset.studentId === focusedStudentId
+    );
+    if (replacement && elementIsRendered(replacement)) replacement.focus();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -799,7 +1013,9 @@ function buildSessionItem(s) {
   const hasContent = messageCount > 0;
   // 既无内容也无分析才灰显（判据从"analysis_count==0"升级为"内容与分析皆无"）
   if (!analyzed && !hasContent) item.classList.add('unanalyzed');
-  if (s.session_id === state.currentSessionId) item.classList.add('selected');
+  const selected = s.session_id === state.currentSessionId;
+  if (selected) item.classList.add('selected');
+  item.setAttribute('aria-pressed', selected ? 'true' : 'false');
 
   // 状态点：有分析用 last_severity 三色；否则（有内容待诊断 / 全空）用中性灰点
   const dotCls = analyzed ? severityClass(s.last_severity) : 'status-none';
@@ -819,7 +1035,7 @@ function buildSessionItem(s) {
   info.appendChild(el('div', 'meta', meta));
   item.appendChild(info);
 
-  item.addEventListener('click', () => selectSession(s.session_id));
+  makeKeyboardActivatable(item, () => selectSession(s.session_id));
   return item;
 }
 
@@ -828,10 +1044,11 @@ function buildGroupHeader(groupKey, title, count) {
   const collapsed = !!state.groupCollapsed[groupKey];
   const header = el('div', 'group-header');
   header.dataset.group = groupKey;
+  header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   header.appendChild(el('span', 'group-caret', collapsed ? '▸' : '▾'));
   header.appendChild(el('span', 'group-title', title));
   header.appendChild(el('span', 'group-count', String(count)));
-  header.addEventListener('click', () => {
+  makeKeyboardActivatable(header, () => {
     state.groupCollapsed[groupKey] = !state.groupCollapsed[groupKey];
     renderSessions();
   });
@@ -839,6 +1056,19 @@ function buildGroupHeader(groupKey, title, count) {
 }
 
 function renderSessions() {
+  const activeBefore = document.activeElement;
+  const focusedSession = activeBefore instanceof Element
+    ? activeBefore.closest('.session-item[data-session-id]')
+    : null;
+  const focusedGroup = activeBefore instanceof Element
+    ? activeBefore.closest('.group-header[data-group]')
+    : null;
+  const focusedSessionId = focusedSession && sessionListEl.contains(focusedSession)
+    ? focusedSession.dataset.sessionId
+    : null;
+  const focusedGroupKey = focusedGroup && sessionListEl.contains(focusedGroup)
+    ? focusedGroup.dataset.group
+    : null;
   sessionListEl.innerHTML = '';
   const { spaceSubgroups, spaceCount, tasks } = groupSessions(state.sessions);
 
@@ -870,6 +1100,18 @@ function renderSessions() {
     group.appendChild(body);
     sessionListEl.appendChild(group);
   }
+
+  let replacement = null;
+  if (focusedSessionId) {
+    replacement = Array.from(sessionListEl.querySelectorAll('.session-item')).find(
+      (item) => item.dataset.sessionId === focusedSessionId
+    );
+  } else if (focusedGroupKey) {
+    replacement = Array.from(sessionListEl.querySelectorAll('.group-header')).find(
+      (item) => item.dataset.group === focusedGroupKey
+    );
+  }
+  if (replacement && elementIsRendered(replacement)) replacement.focus();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -877,6 +1119,7 @@ function renderSessions() {
 // ─────────────────────────────────────────────────────────────
 async function selectSession(sessionId) {
   state.currentSessionId = sessionId;
+  setMobileView('conversation', { focusTab: true });
   resetTranscript(); // 换会话 → 原文入口回到未加载/收起态（原文是会话级）
   resetReplies();    // 换会话 → AI 回复展开缓存回到未加载/收起态
   renderSessions(); // 只更新选中态，state.sessions 不变（修 B3 伪状态 bug）
@@ -1136,9 +1379,13 @@ function badge(cls, text) {
 }
 
 function deliveredPill(entry) {
-  if (entry.delivered) return el('span', 'pill', '✓ 已展示');
-  if (entry._failed) return el('span', 'pill failed', '发送失败');
-  return el('span', 'pill sending', '发送中…');
+  let pill;
+  if (entry.delivered) pill = el('span', 'pill', '✓ 已展示');
+  else if (entry._failed) pill = el('span', 'pill failed', '发送失败');
+  else pill = el('span', 'pill sending', '发送中…');
+  pill.setAttribute('role', 'status');
+  pill.setAttribute('aria-live', 'polite');
+  return pill;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1759,6 +2006,7 @@ function connectMentorWS() {
 // 初始化
 // ─────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
+  syncResponsiveMode();
   renderAttention();     // 初始关注队列骨架
   renderTimeline();      // 初始空态提示
   updateComposeEnabled();

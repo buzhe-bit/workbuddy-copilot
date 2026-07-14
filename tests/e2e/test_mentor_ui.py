@@ -3014,3 +3014,337 @@ def test_concurrent_refresh_401_uses_single_shared_token_prompt(page, static_ser
     page.locator("#attention-refresh").click()
     page.wait_for_function("() => !document.querySelector('#attention-refresh').disabled")
     assert page.evaluate("window.__mentorPromptCount") == 2
+
+
+# ─────────────────────────────────────────────────────────────
+# Task 7: 导师台响应式可用性门。这些用例驱动真实 DOM/交互，
+# 不通过搜索 CSS 选择器来假装验收布局。
+# ─────────────────────────────────────────────────────────────
+def _responsive_console_data():
+    students = [{
+        "student_id": "s1",
+        "display_name": "学员甲",
+        "last_severity": "error",
+        "session_count": 1,
+        "analysis_count": 1,
+        "open_attention_count": 1,
+        "highest_attention_priority": "high",
+    }]
+    sessions = {
+        "s1": [{
+            "session_id": "sess1",
+            "session_title": "响应式验收对话",
+            "last_severity": "error",
+            "analysis_count": 1,
+            "alert_count": 1,
+        }],
+    }
+    timeline = {
+        "sess1": [{
+            "type": "analysis",
+            "content": "学员卡在响应式调试",
+            "severity": "error",
+            "suggestion": "先复现最小失败用例",
+            "created_at": 20,
+        }],
+    }
+    attention = [_attention_item(
+        71,
+        student_id="s1",
+        session_id="sess1",
+        suggested_action="请先运行最小失败用例",
+        created_at=10,
+    )]
+    return students, sessions, timeline, attention
+
+
+def _open_responsive_console(page, static_server, width, height, messages):
+    students, sessions, timeline, attention = _responsive_console_data()
+    page.set_viewport_size({"width": width, "height": height})
+    open_console(
+        page,
+        static_server,
+        students=students,
+        sessions_by_student=sessions,
+        timeline_by_session=timeline,
+        attention_items=attention,
+        mentor_messages=messages,
+    )
+    expect(page.locator('.attention-card[data-attention-id="71"]')).to_have_count(1)
+
+
+def _assert_no_page_horizontal_overflow(page):
+    metrics = page.evaluate("""
+      () => ({
+        viewport: document.documentElement.clientWidth,
+        documentScroll: document.documentElement.scrollWidth,
+        bodyClient: document.body.clientWidth,
+        bodyScroll: document.body.scrollWidth,
+      })
+    """)
+    assert metrics["documentScroll"] <= metrics["viewport"], metrics
+    assert metrics["bodyScroll"] <= metrics["bodyClient"], metrics
+
+
+def _box(page, selector):
+    locator = page.locator(selector)
+    expect(locator).to_be_visible()
+    box = locator.bounding_box()
+    assert box is not None, f"{selector} 没有可用布局框"
+    return box
+
+
+def _assert_compose_can_send(page, messages, text):
+    compose = page.locator("#compose-input")
+    expect(compose).to_be_enabled()
+    compose.fill(text)
+    page.locator("#compose-send").click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    assert messages[-1]["text"] == text
+
+
+def test_responsive_desktop_1440_keeps_attention_and_original_three_areas_usable(
+    page,
+    static_server,
+    tmp_path,
+):
+    messages = []
+    _open_responsive_console(page, static_server, 1440, 900, messages)
+
+    _assert_no_page_horizontal_overflow(page)
+    attention = _box(page, ".panel-attention")
+    students = _box(page, ".panel-students")
+    sessions = _box(page, ".panel-sessions")
+    timeline = _box(page, ".panel-timeline")
+    assert attention["x"] < students["x"] < sessions["x"] < timeline["x"]
+
+    page.locator('.attention-card[data-attention-id="71"] [data-action="view"]').click()
+    expect(page.locator("#timeline")).to_contain_text("学员卡在响应式调试")
+    _assert_compose_can_send(page, messages, "桌面端导师提示")
+    page.screenshot(path=tmp_path / "mentor-1440x900.png", full_page=True)
+
+
+def test_responsive_tablet_700_uses_full_width_attention_then_navigation_timeline(
+    page,
+    static_server,
+    tmp_path,
+):
+    messages = []
+    _open_responsive_console(page, static_server, 700, 570, messages)
+
+    _assert_no_page_horizontal_overflow(page)
+    attention = _box(page, ".panel-attention")
+    students = _box(page, ".panel-students")
+    sessions = _box(page, ".panel-sessions")
+    timeline = _box(page, ".panel-timeline")
+
+    # 600–959px：关注队列占据上排全宽；下排是左侧导航栈
+    # （学员 + 对话竖排）和右侧时间线。
+    assert attention["width"] >= 680
+    assert students["y"] >= attention["y"] + attention["height"] - 1
+    assert abs(students["x"] - sessions["x"]) <= 1
+    assert sessions["y"] >= students["y"] + students["height"] - 1
+    assert timeline["x"] >= students["x"] + students["width"] - 1
+    assert abs(timeline["y"] - students["y"]) <= 1
+
+    page.locator('.student-item[data-student-id="s1"]').click()
+    page.locator('.session-item[data-session-id="sess1"]').click()
+    expect(page.locator("#timeline")).to_contain_text("学员卡在响应式调试")
+    _assert_compose_can_send(page, messages, "中屏导师提示")
+    _assert_no_page_horizontal_overflow(page)
+    page.screenshot(path=tmp_path / "mentor-700x570.png", full_page=True)
+
+
+def test_responsive_mobile_390_tabs_show_one_workspace_and_complete_attention_flow(
+    page,
+    static_server,
+    tmp_path,
+):
+    messages = []
+    _open_responsive_console(page, static_server, 390, 844, messages)
+
+    _assert_no_page_horizontal_overflow(page)
+    tablist = page.get_by_role("tablist", name="导师工作区")
+    expect(tablist).to_have_count(1)
+    attention_tab = page.get_by_role("tab", name="关注", exact=True)
+    students_tab = page.get_by_role("tab", name="学员", exact=True)
+    conversation_tab = page.get_by_role("tab", name="对话", exact=True)
+    expect(attention_tab).to_have_attribute("aria-selected", "true")
+    expect(page.locator('[role="tabpanel"]:visible')).to_have_count(1)
+
+    students_tab.click()
+    expect(students_tab).to_have_attribute("aria-selected", "true")
+    expect(page.locator('[role="tabpanel"]:visible')).to_have_count(1)
+    expect(page.locator('.student-item[data-student-id="s1"]')).to_be_visible()
+
+    attention_tab.click()
+    page.locator('.attention-card[data-attention-id="71"] [data-action="view"]').click()
+    expect(conversation_tab).to_have_attribute("aria-selected", "true")
+    expect(page.locator('[role="tabpanel"]:visible')).to_have_count(1)
+    expect(page.locator('.session-item[data-session-id="sess1"]')).to_be_visible()
+    expect(page.locator("#timeline")).to_contain_text("学员卡在响应式调试")
+
+    compose = page.locator("#compose")
+    assert compose.evaluate("el => getComputedStyle(el).position") == "sticky"
+    page.locator("#compose-input").focus()
+    assert page.evaluate("document.activeElement && document.activeElement.id") == "compose-input"
+    compose_box = _box(page, "#compose")
+    assert compose_box["x"] >= 0
+    assert compose_box["x"] + compose_box["width"] <= 390
+    assert compose_box["y"] + compose_box["height"] <= 844
+    _assert_compose_can_send(page, messages, "手机端导师提示")
+    _assert_no_page_horizontal_overflow(page)
+    page.screenshot(path=tmp_path / "mentor-390x844.png", full_page=True)
+
+
+def test_responsive_mobile_tabs_students_and_sessions_support_keyboard(
+    page,
+    static_server,
+):
+    messages = []
+    _open_responsive_console(page, static_server, 390, 844, messages)
+
+    attention_tab = page.get_by_role("tab", name="关注", exact=True)
+    conversation_tab = page.get_by_role("tab", name="对话", exact=True)
+    attention_tab.focus()
+    attention_tab.press("End")
+    expect(conversation_tab).to_have_attribute("aria-selected", "true")
+    conversation_tab.press("Home")
+    expect(attention_tab).to_have_attribute("aria-selected", "true")
+
+    students_tab = page.get_by_role("tab", name="学员", exact=True)
+    attention_tab.press("ArrowRight")
+    expect(students_tab).to_have_attribute("aria-selected", "true")
+
+    student = page.locator('.student-item[data-student-id="s1"]')
+    expect(student).to_have_attribute("role", "button")
+    expect(student).to_have_attribute("tabindex", "0")
+    expect(student).to_have_attribute("aria-pressed", "false")
+    student.focus()
+    student.press("Enter")
+    expect(student).to_have_attribute("aria-pressed", "true")
+    expect(student).to_be_focused()
+    # 选中学员后留在学员页，便于继续挑选；用键盘切到对话页再选会话。
+    students_tab.focus()
+    students_tab.press("ArrowRight")
+    expect(conversation_tab).to_have_attribute("aria-selected", "true")
+    session = page.locator('.session-item[data-session-id="sess1"]')
+    expect(session).to_be_visible()
+    expect(session).to_have_attribute("role", "button")
+    expect(session).to_have_attribute("tabindex", "0")
+    session.focus()
+    session.press("Space")
+    expect(session).to_have_attribute("aria-pressed", "true")
+    expect(conversation_tab).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#timeline")).to_contain_text("学员卡在响应式调试")
+
+
+def test_responsive_tablet_keyboard_selection_and_group_toggle_preserve_focus(
+    page,
+    static_server,
+):
+    messages = []
+    _open_responsive_console(page, static_server, 700, 570, messages)
+    page.locator('.student-item[data-student-id="s1"]').click()
+
+    group = page.locator('.session-group[data-group="task"] .group-header')
+    group.focus()
+    group.press("Enter")
+    expect(group).to_be_focused()
+    group.press("Enter")
+    expect(group).to_be_focused()
+
+    session = page.locator('.session-item[data-session-id="sess1"]')
+    session.focus()
+    session.press("Space")
+    expect(session).to_have_attribute("aria-pressed", "true")
+    expect(session).to_be_focused()
+    expect(page.locator("#timeline")).to_contain_text("学员卡在响应式调试")
+
+
+def test_responsive_breakpoint_changes_keep_keyboard_focus_visible_and_semantics_valid(
+    page,
+    static_server,
+):
+    messages = []
+    _open_responsive_console(page, static_server, 700, 570, messages)
+    page.locator('.student-item[data-student-id="s1"]').click()
+    page.locator('.session-item[data-session-id="sess1"]').click()
+
+    student = page.locator('.student-item[data-student-id="s1"]')
+    student.focus()
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.wait_for_function("() => matchMedia('(max-width: 599px)').matches")
+    page.wait_for_function("""
+      () => {
+        const active = document.activeElement;
+        return !!active && active !== document.body &&
+          active.getClientRects().length > 0 &&
+          !active.closest('[aria-hidden="true"]');
+      }
+    """)
+
+    selected_tab = page.locator('[role="tab"][aria-selected="true"]')
+    expect(selected_tab).to_be_visible()
+    selected_tab.focus()
+    page.set_viewport_size({"width": 700, "height": 570})
+    page.wait_for_function("() => !matchMedia('(max-width: 599px)').matches")
+    page.wait_for_function("""
+      () => {
+        const active = document.activeElement;
+        return !!active && active !== document.body && active.getClientRects().length > 0;
+      }
+    """)
+    expect(page.locator('[role="tabpanel"]')).to_have_count(0)
+
+
+def test_responsive_empty_conversation_keeps_focus_when_leaving_mobile_breakpoint(
+    page,
+    static_server,
+):
+    page.set_viewport_size({"width": 390, "height": 844})
+    open_console(
+        page,
+        static_server,
+        students=[],
+        sessions_by_student={},
+        timeline_by_session={},
+        attention_items=[],
+    )
+    conversation_tab = page.get_by_role("tab", name="对话", exact=True)
+    conversation_tab.click()
+    conversation_tab.focus()
+
+    page.set_viewport_size({"width": 700, "height": 570})
+    page.wait_for_function("() => !matchMedia('(max-width: 599px)').matches")
+    page.wait_for_function("""
+      () => {
+        const active = document.activeElement;
+        return !!active && active !== document.body && active.getClientRects().length > 0;
+      }
+    """, timeout=1000)
+    expect(page.locator('[role="tabpanel"]')).to_have_count(0)
+
+
+def test_responsive_controls_have_accessible_labels_live_regions_and_reduced_motion(
+    page,
+    static_server,
+):
+    messages = []
+    page.emulate_media(reduced_motion="reduce")
+    _open_responsive_console(page, static_server, 390, 844, messages)
+
+    expect(page.locator("#attention-refresh")).to_have_attribute("aria-label", re.compile(r".+"))
+    expect(page.locator("#compose-input")).to_have_attribute("aria-label", re.compile(r".+"))
+    expect(page.locator("#attention-feedback")).to_have_attribute("aria-live", "polite")
+    expect(page.locator("#sync-feedback")).to_have_attribute("aria-live", "polite")
+    expect(page.locator("#ws-status")).to_have_attribute("aria-live", "polite")
+
+    # reduced-motion 下交互控件不应保留动画/过渡。
+    durations = page.locator("button, [role=tab], .attention-card").evaluate_all("""
+      nodes => nodes.map(node => {
+        const style = getComputedStyle(node);
+        return [style.animationDuration, style.transitionDuration];
+      })
+    """)
+    assert all(pair == ["0s", "0s"] for pair in durations), durations

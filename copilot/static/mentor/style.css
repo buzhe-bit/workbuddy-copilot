@@ -1,8 +1,20 @@
-/* 导师观察台样式：简洁三栏布局 */
+/* 导师观察台样式：关注队列 + 原有学员/对话/时间线工作区 */
 * {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 100%;
+}
+
+html {
+  overflow: hidden;
 }
 
 body {
@@ -10,6 +22,11 @@ body {
   font-size: 14px;
   color: #222;
   background: #f5f6f8;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
 }
 
 .topbar {
@@ -19,6 +36,8 @@ body {
   padding: 12px 20px;
   background: #1f2430;
   color: #fff;
+  flex: 0 0 auto;
+  min-width: 0;
 }
 
 .topbar h1 {
@@ -35,16 +54,62 @@ body {
   color: #4ade80;
 }
 
-/* 关注队列 + 原有三栏；窄屏在 Task 7 统一收口 */
+.mobile-navigation {
+  display: none;
+  flex: 0 0 auto;
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.mobile-tablist {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 6px 8px;
+}
+
+.mobile-tablist button {
+  min-width: 0;
+  min-height: 40px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #6b7280;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mobile-tablist button[aria-selected="true"] {
+  background: #ede9fe;
+  color: #4338ca;
+}
+
+/* 大屏：关注队列 + 原有三栏并排。wrapper 仅负责窄屏编组，不复制 DOM。 */
 .layout {
   display: grid;
-  grid-template-columns: 300px 220px 280px minmax(360px, 1fr);
+  grid-template-columns:
+    minmax(220px, 1fr)
+    minmax(150px, .62fr)
+    minmax(190px, .78fr)
+    minmax(300px, 1.6fr);
   gap: 1px;
-  height: calc(100vh - 52px);
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: auto;
   background: #e5e7eb;
+  overflow: hidden;
+}
+
+.content-workspace,
+.conversation-workspace {
+  display: contents;
 }
 
 .panel {
+  min-width: 0;
+  min-height: 0;
   background: #fff;
   overflow-y: auto;
   padding: 12px;
@@ -722,3 +787,170 @@ body {
 .legend > span { display: inline-flex; align-items: center; gap: 5px; }
 /* 浅色系色块在白底图例上易糊，加一道细边使其可辨 */
 .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; border: 1px solid #d1d5db; }
+
+/* 键盘用户始终可见的焦点轮廓，不依赖 hover 状态。 */
+:where(button, input, select, summary, [role="button"], [role="tab"]):focus-visible {
+  outline: 3px solid rgba(79, 70, 229, .42);
+  outline-offset: 2px;
+}
+
+/* 600–959px：关注队列占上排，学员/对话在左下纵向排列，时间线占右下。 */
+@media (min-width: 600px) and (max-width: 959px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(180px, 42%) minmax(0, 1fr);
+  }
+
+  .panel-attention {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .content-workspace {
+    grid-column: 1;
+    grid-row: 2;
+    min-width: 0;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(220px, 35%) minmax(0, 1fr);
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    gap: 1px;
+    overflow: hidden;
+    background: #e5e7eb;
+  }
+
+  .conversation-workspace {
+    display: contents;
+  }
+
+  .panel-students {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .panel-sessions {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .panel-timeline {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
+
+  .attention-filters {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+/* <600px：三个单栏页签只切换工作区，原有业务 DOM 只保留一份。 */
+@media (max-width: 599px) {
+  .topbar {
+    padding: 10px 12px;
+  }
+
+  .topbar h1 {
+    font-size: 16px;
+  }
+
+  .mobile-navigation {
+    display: block;
+  }
+
+  .layout {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .content-workspace {
+    display: contents;
+  }
+
+  [data-mobile-panel] {
+    display: none !important;
+  }
+
+  body[data-mobile-view="attention"] [data-mobile-panel="attention"] {
+    display: flex !important;
+    flex: 1 1 auto;
+  }
+
+  body[data-mobile-view="students"] [data-mobile-panel="students"] {
+    display: block !important;
+    flex: 1 1 auto;
+  }
+
+  body[data-mobile-view="conversation"] [data-mobile-panel="conversation"] {
+    display: flex !important;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    gap: 1px;
+    overflow: hidden;
+    background: #e5e7eb;
+  }
+
+  .panel-attention,
+  .panel-students,
+  .conversation-workspace {
+    width: 100%;
+    height: 100%;
+  }
+
+  .panel-sessions {
+    flex: 0 1 clamp(132px, 28dvh, 210px);
+  }
+
+  .panel-timeline {
+    flex: 1 1 auto;
+  }
+
+  .attention-filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .compose {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    margin-top: 8px;
+    padding: 10px 0 max(2px, env(safe-area-inset-bottom));
+    background: #fff;
+  }
+
+  .compose button {
+    min-height: 40px;
+    padding: 0 16px;
+  }
+
+  .compose input {
+    /* iOS Safari 不因小于 16px 的输入框字体自动缩放页面。 */
+    font-size: 16px;
+  }
+
+  .legend {
+    display: none;
+  }
+
+  .attention-card-actions button,
+  .attention-refresh,
+  .sync-btn,
+  .retry-analysis-btn {
+    min-height: 36px;
+  }
+}
+
+/* 动效降级是系统级契约；用 0s 保证浏览器计算值也是确定的。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-delay: 0s !important;
+    animation-duration: 0s !important;
+    transition-delay: 0s !important;
+    transition-duration: 0s !important;
+  }
+}
