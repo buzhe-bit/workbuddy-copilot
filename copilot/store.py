@@ -910,6 +910,32 @@ class Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_system_status_counts(self) -> dict[str, int]:
+        """Return aggregate operational counts without exposing record content."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM reports
+                        WHERE analysis_status IN ('pending', 'running'))
+                       +
+                       (SELECT COUNT(*) FROM raw_transcripts
+                        WHERE analysis_status IN ('pending', 'running'))
+                         AS pending_analyses,
+                       (SELECT COUNT(*) FROM reports
+                        WHERE analysis_status = 'failed')
+                       +
+                       (SELECT COUNT(*) FROM raw_transcripts
+                        WHERE analysis_status = 'failed')
+                         AS failed_analyses,
+                       (SELECT COUNT(*) FROM attention_items
+                        WHERE status = 'open') AS open_attention"""
+            ).fetchone()
+        return {
+            "pending_analyses": int(row["pending_analyses"]),
+            "failed_analyses": int(row["failed_analyses"]),
+            "open_attention": int(row["open_attention"]),
+        }
+
     def update_attention_status(
         self,
         item_id: int,

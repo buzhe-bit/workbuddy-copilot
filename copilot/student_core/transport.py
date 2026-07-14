@@ -108,8 +108,13 @@ class StudentTransport:
 
     def post_hook(self, event: HookEvent, *, event_id: str = "") -> Accepted:
         payload = event.to_dict()
-        if not payload["student_id"]:
-            payload["student_id"] = self.student_id
+        configured_student_id = str(self.student_id or "")
+        if not configured_student_id:
+            raise PermanentTransportError("student identity is required")
+        # The configured transport identity is authoritative. Old spool rows
+        # may contain a stale id after account rotation; overwrite it instead
+        # of either forwarding an impersonation or poisoning the queue.
+        payload["student_id"] = configured_student_id
         if event_id:
             payload["event_id"] = str(event_id)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -139,8 +144,11 @@ class StudentTransport:
 
     def ack_message(self, message_id: str, *, student_id: str | None = None) -> Accepted:
         """Acknowledge a rendered/received mentor message through the REST API."""
-        resolved_student_id = str(student_id or self.student_id or "")
+        resolved_student_id = str(self.student_id or "")
+        supplied_student_id = str(student_id or "")
         resolved_message_id = str(message_id or "")
+        if supplied_student_id and supplied_student_id != resolved_student_id:
+            raise PermanentTransportError("student identity mismatch")
         if not resolved_student_id or not resolved_message_id:
             raise PermanentTransportError("message receipt rejected")
         body = json.dumps(

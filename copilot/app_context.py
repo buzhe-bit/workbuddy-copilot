@@ -16,7 +16,7 @@ import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from fastapi import Header, HTTPException, Request, status
 
@@ -120,6 +120,14 @@ class AppContext:
     report_recovery_task: Any | None = None
 
 
+@dataclass(frozen=True)
+class StudentPrincipal:
+    """Authenticated student identity used by every student REST/WS route."""
+
+    student_id: str
+    auth_mode: Literal["mapped", "shared"]
+
+
 def build_context(config_path: str | os.PathLike[str] | None = None) -> AppContext:
     """Build all runtime dependencies for the FastAPI app."""
     assert_single_worker()
@@ -210,6 +218,10 @@ def get_session_service(request: Request) -> SessionQueryService:
 
 def get_message_service(request: Request) -> MessageService:
     return get_context(request).message_svc
+
+
+def get_ws_registry(request: Request) -> WSRegistry:
+    return get_context(request).ws_registry
 
 
 def get_upload_service(request: Request) -> UploadRequestService:
@@ -308,24 +320,168 @@ def student_id_for_token(
     return matched_student_id
 
 
+def _student_token_mapping_is_valid(config: dict[str, Any]) -> bool:
+    auth = config.get("auth")
+    if not isinstance(auth, dict):
+        return True
+    student_tokens = auth.get("student_tokens", {})
+    if not isinstance(student_tokens, dict):
+        return False
+    return all(
+        isinstance(student_id, str)
+        and bool(student_id)
+        and isinstance(configured_token, str)
+        and bool(configured_token)
+        for student_id, configured_token in student_tokens.items()
+    )
+
+
+def _has_student_token_mapping(config: dict[str, Any]) -> bool:
+    auth = config.get("auth")
+    if not isinstance(auth, dict):
+        return False
+    student_tokens = auth.get("student_tokens")
+    return isinstance(student_tokens, dict) and bool(student_tokens)
+
+
+def _student_token_mapping_has_duplicates(config: dict[str, Any]) -> bool:
+    auth = config.get("auth")
+    if not isinstance(auth, dict):
+        return False
+    student_tokens = auth.get("student_tokens")
+    if not isinstance(student_tokens, dict):
+        return False
+    values = list(student_tokens.values())
+    return len(values) != len(set(values))
+
+
+def shared_student_token_is_allowed(config: dict[str, Any]) -> bool:
+    """Return the strict mode-aware shared-token policy.
+
+    Local/demo deployments (plus an empty legacy-local mode) retain the shared
+    token behavior unless explicitly disabled. Every other mode rejects it;
+    a per-student mapping is the only supported non-local student boundary.
+    """
+    if _auth_is_public(config):
+        return False
+    auth = config.get("auth")
+    if not isinstance(auth, dict):
+        auth = {}
+    mode = str(auth.get("mode", "") or "").lower()
+    if mode not in {"", "local", "demo"}:
+        return False
+    configured = auth.get("allow_shared_student_token")
+    if configured is not None:
+        return configured is True
+    return True
+
+
+def student_principal_for_token(
+    config: dict[str, Any],
+    supplied_token: str | None,
+) -> StudentPrincipal | None:
+    """Resolve a student token without allowing a mapped token to downgrade."""
+    mapped_student_id = student_id_for_token(config, supplied_token)
+    if mapped_student_id is not None:
+        return StudentPrincipal(student_id=mapped_student_id, auth_mode="mapped")
+
+    if not _student_token_mapping_is_valid(config):
+        return None
+
+    auth = config.get("auth")
+    student_tokens = auth.get("student_tokens", {}) if isinstance(auth, dict) else {}
+    if supplied_token and isinstance(student_tokens, dict):
+        supplied_bytes = supplied_token.encode("utf-8")
+        matching_values = sum(
+            1
+            for configured_token in student_tokens.values()
+            if isinstance(configured_token, str)
+            and configured_token
+            and hmac.compare_digest(
+                supplied_bytes,
+                configured_token.encode("utf-8"),
+            )
+        )
+        if matching_values:
+            # Duplicate mapped tokens are ambiguous and must never become a
+            # lower-assurance shared principal.
+            return None
+
+    if not shared_student_token_is_allowed(config):
+        return None
+
+    expected = _role_token(config, "student")
+    if expected:
+        if not hmac.compare_digest(supplied_token or "", expected):
+            return None
+    elif _has_student_token_mapping(config) or _auth_is_public(config):
+        # A configured mapping must close the historical tokenless local
+        # fallback for unknown callers.
+        return None
+
+    default_student_id = str(config.get("student_id", "") or "")
+    return StudentPrincipal(student_id=default_student_id, auth_mode="shared")
+
+
+def resolve_student_id(
+    principal: StudentPrincipal,
+    supplied_student_id: str | None,
+) -> str:
+    """Return the only student id a route may use for this request."""
+    supplied = str(supplied_student_id or "")
+    if supplied.strip():
+        if principal.auth_mode == "mapped":
+            if supplied != principal.student_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="student_id does not match authenticated student",
+                )
+            return principal.student_id
+        return supplied
+
+    if principal.student_id.strip():
+        return principal.student_id
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="student_id is required",
+    )
+
+
 def validate_auth_config(config: dict[str, Any]) -> None:
     """Fail fast for internet-facing mode without role-specific tokens."""
+    auth = config.get("auth", {}) or {}
+    if not isinstance(auth, dict):
+        raise RuntimeError("auth must be an object")
+    configured_shared_policy = auth.get("allow_shared_student_token")
+    if configured_shared_policy is not None and not isinstance(
+        configured_shared_policy,
+        bool,
+    ):
+        raise RuntimeError("auth.allow_shared_student_token must be a boolean")
+    if not _student_token_mapping_is_valid(config):
+        raise RuntimeError(
+            "auth.student_tokens must map non-empty student ids to non-empty tokens"
+        )
+    if _student_token_mapping_has_duplicates(config):
+        raise RuntimeError("auth.student_tokens contains duplicate mapped tokens")
     if not _auth_is_public(config):
         return
     missing: list[str] = []
-    auth = config.get("auth", {}) or {}
-    if not (os.environ.get("COPILOT_STUDENT_TOKEN") or auth.get("student_token")):
-        missing.append("student_token")
+    if not _has_student_token_mapping(config):
+        missing.append("student_tokens")
     if not (os.environ.get("COPILOT_MENTOR_TOKEN") or auth.get("mentor_token")):
         missing.append("mentor_token")
     if missing:
         raise RuntimeError(
-            "public auth mode requires auth.student_token and auth.mentor_token "
+            "public auth mode requires an auth.student_tokens mapping and "
+            "auth.mentor_token "
             f"(missing: {', '.join(missing)})"
         )
 
 
 def token_is_valid(config: dict[str, Any], supplied: str | None, role: str | None = None) -> bool:
+    if role == "student":
+        return student_principal_for_token(config, supplied) is not None
     expected = _role_token(config, role)
     if _auth_is_public(config) and not expected:
         return False
@@ -376,7 +532,22 @@ async def require_student_token(
     authorization: str | None = Header(default=None),
     x_copilot_token: str | None = Header(default=None),
 ) -> None:
-    await _require_role_token(request, authorization, x_copilot_token, role="student")
+    await require_student_principal(request, authorization, x_copilot_token)
+
+
+async def require_student_principal(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_copilot_token: str | None = Header(default=None),
+) -> StudentPrincipal:
+    supplied = _extract_supplied_token(authorization, x_copilot_token)
+    principal = student_principal_for_token(get_context(request).config, supplied)
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid copilot token",
+        )
+    return principal
 
 
 async def require_mentor_token(

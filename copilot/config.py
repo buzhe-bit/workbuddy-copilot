@@ -63,6 +63,12 @@ def load_config(path: Path | str | None = None) -> dict:
         raw = json.load(f)
     cfg = _resolve_env(_expand(raw))
     cfg.setdefault("llm", {}).setdefault("summary_model", "deepseek-v3-0324")
+    auth_cfg = cfg.setdefault("auth", {})
+    auth_mode = str(auth_cfg.get("mode", "") or "").lower()
+    if auth_mode in {"", "local", "demo"}:
+        auth_cfg.setdefault("allow_shared_student_token", True)
+    else:
+        auth_cfg["allow_shared_student_token"] = False
     service_cfg = cfg.setdefault("service", {})
     configured_concurrency = service_cfg.setdefault("analysis_max_concurrency", 2)
     service_cfg["analysis_max_concurrency"] = _validate_analysis_max_concurrency(

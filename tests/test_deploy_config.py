@@ -177,6 +177,7 @@ def test_example_config_documents_public_auth_shape():
     cfg = json.loads((PROJECT_ROOT / "config.example.json").read_text(encoding="utf-8"))
 
     assert cfg["auth"]["mode"] == "local"
+    assert cfg["auth"]["allow_shared_student_token"] is True
     assert "student_token" in cfg["auth"]
     assert cfg["auth"]["student_tokens"] == {}
     assert "mentor_token" in cfg["auth"]

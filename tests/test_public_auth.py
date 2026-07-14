@@ -39,7 +39,7 @@ def _build_public_app(tmp_path, *, auth: dict | None = None):
         "store": {"db_path": str(tmp_path / "copilot.db")},
         "auth": auth or {
             "mode": "public",
-            "student_token": STUDENT_TOKEN,
+            "student_tokens": {"student-a": STUDENT_TOKEN},
             "mentor_token": MENTOR_TOKEN,
         },
         "llm": {"enable_llm": False},
@@ -129,7 +129,7 @@ def test_student_websocket_accepts_rest_auth_headers_and_keeps_query_compatibili
             ws.send_text("header-authenticated")
 
         with client.websocket_connect(
-            "/ws?student_id=student-b",
+            "/ws?student_id=student-a",
             headers={"X-Copilot-Token": STUDENT_TOKEN},
         ) as ws:
             ws.send_text("x-header-authenticated")
@@ -142,5 +142,5 @@ def test_student_websocket_accepts_rest_auth_headers_and_keeps_query_compatibili
                 pass
         assert denied.value.code == 1008
 
-        with client.websocket_connect(f"/ws?student_id=student-d&token={STUDENT_TOKEN}") as ws:
+        with client.websocket_connect(f"/ws?student_id=student-a&token={STUDENT_TOKEN}") as ws:
             ws.send_text("query-token-compatible")

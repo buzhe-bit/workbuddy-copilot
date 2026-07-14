@@ -130,6 +130,8 @@ def install_api_routes(
     mentor_messages=None,
     mentor_message_statuses=None,
     mentor_status_requests=None,
+    system_status=None,
+    system_status_code=200,
 ):
     """拦截 /api/mentor/* 返回确定性 JSON。"""
     students = students or []
@@ -150,10 +152,24 @@ def install_api_routes(
     mentor_status_requests = (
         mentor_status_requests if mentor_status_requests is not None else []
     )
+    system_status = system_status or {
+        "version": "0.2.0",
+        "pending_analyses": 0,
+        "failed_analyses": 0,
+        "open_attention": 0,
+        "float_connections": 0,
+        "mentor_connections": 1,
+        "windows_rollout_status": "BLOCKED: real-machine evidence missing",
+    }
 
     def handler(route):
         path = urlparse(route.request.url).path
-        if path == "/api/mentor/attention":
+        if path == "/api/mentor/system-status":
+            if system_status_code != 200:
+                route.fulfill(status=system_status_code, json={"detail": "status failed"})
+            else:
+                route.fulfill(json=system_status)
+        elif path == "/api/mentor/attention":
             if attention_status != 200:
                 route.fulfill(status=attention_status, json={"detail": "attention failed"})
             else:
@@ -361,6 +377,29 @@ def test_fe1_students_render(page, static_server):
 
     # meta 内容（分析计数）真实渲染
     expect(items.nth(0).locator(".meta")).to_contain_text("48 分析")
+
+
+def test_system_failures_are_visible_without_exposing_record_content(page, static_server):
+    open_console(
+        page,
+        static_server,
+        system_status={
+            "version": "0.2.0",
+            "pending_analyses": 3,
+            "failed_analyses": 2,
+            "open_attention": 4,
+            "float_connections": 5,
+            "mentor_connections": 1,
+            "windows_rollout_status": "BLOCKED: real-machine evidence missing",
+        },
+    )
+
+    status = page.locator("#system-status")
+    expect(status).to_have_text("待分析 3 · 失败 2 · Windows 待实机")
+    expect(status).to_have_attribute("role", "status")
+    expect(status).to_have_attribute("data-level", "warning")
+    expect(status).not_to_contain_text("prompt")
+    expect(status).not_to_contain_text("provider")
 
 
 # ─────────────────────────────────────────────────────────────

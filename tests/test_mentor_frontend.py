@@ -67,6 +67,18 @@ class TestFrontendStructure:
         assert "mentor_id: currentMentorId()" in js
         assert "首次建连也必须补拉" in js
 
+    def test_system_status_fault_indicator_contract(self):
+        static_dir = Path(__file__).parent.parent / "copilot" / "static" / "mentor"
+        html = (static_dir / "index.html").read_text()
+        js = (static_dir / "app.js").read_text()
+
+        assert 'id="system-status"' in html
+        assert 'role="status"' in html
+        assert "/api/mentor/system-status" in js
+        assert "pending_analyses" in js
+        assert "failed_analyses" in js
+        assert "windows_rollout_status" in js
+
     def test_app_js_has_fetch_and_ws(self):
         js_path = Path(__file__).parent.parent / "copilot" / "static" / "mentor" / "app.js"
         if not js_path.exists():

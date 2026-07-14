@@ -20,6 +20,7 @@
 // ─────────────────────────────────────────────────────────────
 const state = {
   attention: newAttentionState(),
+  systemStatus: null,
   // 响应式界面状态独立于业务数据；移动端一次只展示一个工作区。
   ui: { mobileView: 'attention' },
   students: [],          // [{student_id, display_name, last_severity, session_count, analysis_count, alert_count, ...}]
@@ -102,6 +103,7 @@ const studentListEl = document.getElementById('student-list');
 const sessionListEl = document.getElementById('session-list');
 const timelineEl = document.getElementById('timeline');
 const wsStatusEl = document.getElementById('ws-status');
+const systemStatusEl = document.getElementById('system-status');
 const composeForm = document.getElementById('compose');
 const composeInput = document.getElementById('compose-input');
 const composeSend = document.getElementById('compose-send');
@@ -844,6 +846,41 @@ async function loadStudents() {
     if (generation === studentLoadGeneration) {
       console.error('加载学员列表失败', err);
     }
+  }
+}
+
+function windowsRolloutLabel(status) {
+  const normalized = String(status || '').toLowerCase();
+  if (normalized.includes('rollout_ready')) return 'Windows 可试点';
+  if (normalized.includes('implementation_candidate')) return 'Windows 候选版';
+  return 'Windows 待实机';
+}
+
+function renderSystemStatus() {
+  if (!systemStatusEl || !state.systemStatus) return;
+  const pending = Math.max(0, Number(state.systemStatus.pending_analyses) || 0);
+  const failed = Math.max(0, Number(state.systemStatus.failed_analyses) || 0);
+  const windows = windowsRolloutLabel(state.systemStatus.windows_rollout_status);
+  const parts = [];
+  if (pending) parts.push('待分析 ' + pending);
+  if (failed) parts.push('失败 ' + failed);
+  if (!parts.length) parts.push('系统正常');
+  parts.push(windows);
+  systemStatusEl.textContent = parts.join(' · ');
+  systemStatusEl.dataset.level = pending || failed ? 'warning' : 'normal';
+}
+
+async function loadSystemStatus() {
+  if (!systemStatusEl) return;
+  try {
+    const resp = await authFetch('/api/mentor/system-status');
+    if (!resp.ok) throw new Error('system_status_http_' + resp.status);
+    state.systemStatus = await resp.json();
+    renderSystemStatus();
+  } catch (err) {
+    systemStatusEl.textContent = '系统状态不可用';
+    systemStatusEl.dataset.level = 'error';
+    console.error('加载系统状态失败', err);
   }
 }
 
@@ -2012,6 +2049,6 @@ window.addEventListener('DOMContentLoaded', () => {
   updateComposeEnabled();
   updateSyncEnabled();   // 初始未选中学员 → 同步按钮禁用
   // 先完成一次导师鉴权，再拉关注队列，避免 public 模式并发 401 弹两次 token 输入。
-  loadStudents().then(loadAttention);
+  loadStudents().then(() => Promise.all([loadAttention(), loadSystemStatus()]));
   connectMentorWS();
 });

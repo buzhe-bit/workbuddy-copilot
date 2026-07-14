@@ -44,7 +44,7 @@ def _build_app(tmp_path, *, llm=_fake_llm, enable_llm=False):
         "store": {"db_path": str(tmp_path / "copilot.db")},
         "auth": {
             "mode": "public",
-            "student_token": STUDENT_TOKEN,
+            "student_tokens": {"student-a": STUDENT_TOKEN},
             "mentor_token": MENTOR_TOKEN,
         },
         "analysis": {"enable_llm": enable_llm},
@@ -184,7 +184,7 @@ def test_upload_request_status_rejects_cross_student_update(tmp_path):
             json={"student_id": "student-b", "status": "failed", "error_message": "bad"},
         )
 
-    assert resp.status_code == 404
+    assert resp.status_code == 403
     assert store.get_upload_request(request_id)["status"] == "pending"
 
 

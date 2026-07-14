@@ -4,12 +4,16 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>导师观察台</title>
-  <link rel="stylesheet" href="style.css?v=14" />
+  <link rel="stylesheet" href="style.css?v=15" />
 </head>
 <body data-mobile-view="attention">
   <header class="topbar">
     <h1>导师观察台</h1>
-    <span id="ws-status" class="ws-status" role="status" aria-live="polite">未连接</span>
+    <div class="topbar-status">
+      <span id="system-status" class="system-status" role="status" aria-live="polite"
+            data-level="loading">状态检查中</span>
+      <span id="ws-status" class="ws-status" role="status" aria-live="polite">未连接</span>
+    </div>
   </header>
 
   <nav class="mobile-navigation" aria-label="导师工作区导航">
@@ -122,6 +126,6 @@
     </div>
   </main>
 
-  <script src="app.js?v=14"></script>
+  <script src="app.js?v=15"></script>
 </body>
 </html>

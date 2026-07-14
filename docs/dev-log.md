@@ -2203,3 +2203,28 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 新节点/可见标题的有条件恢复。最终复审为 Critical 0 / Important 0 /
 Minor 0，APPROVE。
 本轮不是 Windows 任务；Task 9–11 仍是后续计划中的一等开发与验收范围。
+
+### Task 8 Plan E1：学员身份强制派生与系统状态 — 2026-07-14
+
+- 新增 `StudentPrincipal(student_id, auth_mode)`，15 类学员 REST 与学员 WS
+  全部从 token 派生权限身份。mapped token 显式冒充其他学员时在任何 Store、LLM、
+  EventBus 或 WS 注册副作用前返回 403；省略 `student_id` 时只派生 token 所属学员。
+- 共享 student token 仅保留空 mode 的旧本地配置、`local` 与 `demo` 兼容；
+  public/prod、pilot/staging 和未知/拼错 mode 即使显式 opt-in 也 fail closed。
+  public 启动要求无空值、无重复的 per-student token mapping 与 mentor token。
+- StudentTransport 上报时以自身配置身份覆盖旧 spool 中可能过期的 ID；导师消息 ack
+  拒绝跨身份覆盖，避免伪造送达且不把旧 spool 变成永久毒任务。
+- 新增 mentor-only `/api/mentor/system-status`，只返回版本、待处理/失败分析、未处理关注、
+  两类 WS 连接数和 Windows rollout 状态，不返回 token、prompt、原文或 provider 响应。
+  导师台显示诊断积压/失败及 `Windows 待实机`，`/health` 响应保持兼容。
+
+| 范围 | 结果 |
+|---|---|
+| 身份 route inventory | 33 passed；覆盖 15 REST、WS、mapped/shared/unknown/duplicate mode 合同。 |
+| Task 8 聚焦 + 相邻 | 246 passed / 2 个既有 warning。 |
+| 鉴权/config/upload 扩展 | 156 passed。 |
+| 非 e2e / 非 PyObjC 诊断 | 800 passed / 3 deselected / 2 个既有 warning。 |
+| 前端验证 | 静态合同与 `node --check` 通过；70 个 Playwright 用例可收集。当前环境缺浏览器内核且沙箱禁止临时端口，真浏览器未复跑。 |
+| 外部门 | Python 3.13、4 个真 loopback Student Agent、Windows W0/W1 仍待可用环境；Windows 状态保持 `BLOCKED: real-machine evidence missing`。 |
+
+详细身份 RED/GREEN 与环境边界见 `.superpowers/sdd/task-8-identity-report.md`。

@@ -229,7 +229,7 @@ class StudentAgentSystem:
             "store": {"db_path": str(self.store.db_path)},
             "auth": {
                 "mode": "public",
-                "student_token": STUDENT_TOKEN,
+                "student_tokens": {STUDENT_ID: STUDENT_TOKEN},
                 "mentor_token": MENTOR_TOKEN,
             },
         }

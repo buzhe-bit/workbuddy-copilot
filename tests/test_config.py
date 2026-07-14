@@ -97,6 +97,65 @@ class TestLoadConfig:
 
         assert load_config(cfg_file)["service"]["analysis_max_concurrency"] == 7
 
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [
+            ("local", True),
+            ("demo", True),
+            ("public", False),
+            ("production", False),
+            ("prod", False),
+            ("pilot", False),
+            ("staging", False),
+            ("publci", False),
+        ],
+    )
+    def test_shared_student_token_default_follows_deployment_mode(
+        self,
+        tmp_path,
+        mode,
+        expected,
+    ):
+        cfg_file = tmp_path / f"{mode}.json"
+        cfg_file.write_text(json.dumps({
+            "student_id": "test",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": "data/test.db"},
+            "auth": {"mode": mode},
+            "llm": {},
+        }))
+
+        assert load_config(cfg_file)["auth"]["allow_shared_student_token"] is expected
+
+    def test_explicit_local_shared_student_token_disable_is_preserved(self, tmp_path):
+        cfg_file = tmp_path / "local-disabled.json"
+        cfg_file.write_text(json.dumps({
+            "student_id": "test",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": "data/test.db"},
+            "auth": {"mode": "local", "allow_shared_student_token": False},
+            "llm": {},
+        }))
+
+        assert load_config(cfg_file)["auth"]["allow_shared_student_token"] is False
+
+    @pytest.mark.parametrize("mode", ["public", "pilot", "staging", "publci"])
+    def test_non_local_shared_student_token_opt_in_is_forced_closed(
+        self,
+        tmp_path,
+        mode,
+    ):
+        cfg_file = tmp_path / f"{mode}-opt-in.json"
+        cfg_file.write_text(json.dumps({
+            "student_id": "test",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": "data/test.db"},
+            "auth": {"mode": mode, "allow_shared_student_token": True},
+            "llm": {},
+        }))
+
+        assert load_config(cfg_file)["auth"]["allow_shared_student_token"] is False
+
     def test_default_config_falls_back_to_example_when_config_json_missing(
         self, tmp_path, monkeypatch, caplog,
     ):

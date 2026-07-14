@@ -45,6 +45,27 @@ body {
   font-weight: 600;
 }
 
+.topbar-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  min-width: 0;
+}
+
+.system-status {
+  font-size: 12px;
+  color: #cbd5e1;
+}
+
+.system-status[data-level="warning"] {
+  color: #fbbf24;
+}
+
+.system-status[data-level="error"] {
+  color: #fca5a5;
+}
+
 .ws-status {
   font-size: 12px;
   color: #aaa;
@@ -847,10 +868,19 @@ body {
 @media (max-width: 599px) {
   .topbar {
     padding: 10px 12px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 6px 12px;
   }
 
   .topbar h1 {
     font-size: 16px;
+  }
+
+  .topbar-status {
+    width: 100%;
+    justify-content: space-between;
+    gap: 8px;
   }
 
   .mobile-navigation {

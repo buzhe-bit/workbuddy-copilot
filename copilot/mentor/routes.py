@@ -12,11 +12,17 @@ import logging
 import re
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from ..app_context import get_attention_service, get_session_service, get_store
+from ..app_context import (
+    get_attention_service,
+    get_session_service,
+    get_store,
+    get_ws_registry,
+)
 from ..attention import AttentionService
+from ..connections import WSRegistry
 from ..services import SessionQueryService
 from ..store import Store
 
@@ -78,6 +84,24 @@ async def list_students(session_svc: SessionQueryService = Depends(get_session_s
     """返回学员列表 + 状态概览。"""
     students = session_svc.list_students()
     return {"items": [s.__dict__ for s in students]}
+
+
+@router.get("/system-status")
+async def get_system_status(
+    request: Request,
+    store: Store = Depends(get_store),
+    ws_registry: WSRegistry = Depends(get_ws_registry),
+):
+    """Return mentor-only operational counts with no learner or provider data."""
+    counts = store.get_system_status_counts()
+    float_connections, mentor_connections = ws_registry.connection_counts()
+    return {
+        "version": request.app.version,
+        **counts,
+        "float_connections": float_connections,
+        "mentor_connections": mentor_connections,
+        "windows_rollout_status": "BLOCKED: real-machine evidence missing",
+    }
 
 
 @router.get("/attention")

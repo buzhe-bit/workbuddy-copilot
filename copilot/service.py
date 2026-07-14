@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from .app_context import (
     _extract_supplied_token,
     AppContext,
+    StudentPrincipal,
     acquire_worker_lock,
     build_context,
     ensure_attention_service,
@@ -27,8 +28,10 @@ from .app_context import (
     get_store,
     get_upload_service,
     require_mentor_token,
-    require_student_token,
+    require_student_principal,
+    resolve_student_id,
     release_worker_lock,
+    student_principal_for_token,
     token_is_valid,
     validate_auth_config,
 )
@@ -116,7 +119,7 @@ class _ClientRequestId(str):
 
 
 class ReportIn(BaseModel):
-    student_id: str
+    student_id: str | None = None
     session_id: str | None = None
     event: str
     event_id: _EventId | None = None
@@ -138,18 +141,18 @@ class MentorMessageStatusIn(BaseModel):
 
 
 class StudentMessageAckIn(BaseModel):
-    student_id: str
+    student_id: str | None = None
     message_id: str
 
 
 class StudentAskIn(BaseModel):
-    student_id: str
+    student_id: str | None = None
     question: str
     session_id: str | None = None
 
 
 class StudentAskFeedbackIn(BaseModel):
-    student_id: str
+    student_id: str | None = None
     feedback: Literal["helpful", "unresolved"]
     note: str | None = None
 
@@ -165,12 +168,12 @@ class SyncSessionIn(BaseModel):
 
 
 class SessionsSyncIn(BaseModel):
-    student_id: str
+    student_id: str | None = None
     sessions: list[SyncSessionIn]
 
 
 class TranscriptUploadIn(BaseModel):
-    student_id: str
+    student_id: str | None = None
     filtered_content: Any
     sha: str
     request_id: str | None = None
@@ -182,7 +185,7 @@ class MentorUploadRequestIn(BaseModel):
 
 
 class UploadRequestStatusIn(BaseModel):
-    student_id: str
+    student_id: str | None = None
     status: Literal["pending", "running", "done", "failed"]
     error_message: str | None = None
     result: dict[str, Any] | None = None
@@ -920,13 +923,14 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     async def report(
         data: ReportIn,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         analysis_svc: AnalysisService = Depends(get_analysis_service),
     ):
+        student_id = resolve_student_id(principal, data.student_id)
         transcript_content = data.transcript_tail or ""
         try:
             accepted = analysis_svc.accept_report(
-                student_id=data.student_id,
+                student_id=student_id,
                 session_id=data.session_id,
                 event=data.event,
                 prompt_text=data.prompt,
@@ -944,7 +948,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         )
         log.info(
             "report accepted student=%s session=%s event=%s msgs=%d tools=%d",
-            data.student_id,
+            student_id,
             (session_id or "?")[:8],
             data.event,
             len(snap.messages),
@@ -959,7 +963,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         }
         if data.event == "UserPromptSubmit":
             body["prompt_id"] = await analysis_svc.handle_user_prompt_submit(
-                data.student_id,
+                student_id,
                 session_id,
                 data.prompt,
                 report_id=report_id,
@@ -971,7 +975,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             background_tasks.add_task(
                 _handle_stop_background,
                 analysis_svc,
-                data.student_id,
+                student_id,
                 session_id,
                 data.prompt,
                 transcript_content,
@@ -984,28 +988,36 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         limit: int = 20,
         student_id: str | None = None,
         session_id: str | None = None,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         store: Store = Depends(get_store),
     ):
-        return {"items": store.recent_analyses(student_id, limit=limit, session_id=session_id)}
+        resolved_student_id = resolve_student_id(principal, student_id)
+        return {
+            "items": store.recent_analyses(
+                resolved_student_id,
+                limit=limit,
+                session_id=session_id,
+            )
+        }
 
     @app.post("/api/sessions/sync")
     async def sync_sessions(
         data: SessionsSyncIn,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         store: Store = Depends(get_store),
     ):
         """Accept student-machine session inventory and upsert it into copilot.db."""
-        store.upsert_student(data.student_id)
+        student_id = resolve_student_id(principal, data.student_id)
+        store.upsert_student(student_id)
         synced = 0
         for session in data.sessions:
             if not session.session_id:
-                log.warning("skip sync session with empty session_id student=%s", data.student_id)
+                log.warning("skip sync session with empty session_id student=%s", student_id)
                 continue
             try:
                 store.upsert_session(
                     session_id=session.session_id,
-                    student_id=data.student_id,
+                    student_id=student_id,
                     work_dir=session.work_dir,
                     title=session.title,
                     created_at=session.created_at,
@@ -1016,7 +1028,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             synced += 1
-        log.info("sessions sync accepted student=%s synced=%d", data.student_id, synced)
+        log.info("sessions sync accepted student=%s synced=%d", student_id, synced)
         return {"ok": True, "synced": synced}
 
     @app.post("/api/student/sessions/{session_id}/transcript")
@@ -1024,16 +1036,14 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         session_id: str,
         data: TranscriptUploadIn,
         background_tasks: BackgroundTasks,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         context: AppContext = Depends(get_context),
         store: Store = Depends(get_store),
         upload_svc: UploadRequestService = Depends(get_upload_service),
     ):
         """Accept one already-filtered session transcript from a student client."""
-        student_id = data.student_id.strip()
+        student_id = resolve_student_id(principal, data.student_id)
         sha = data.sha.strip()
-        if not student_id:
-            raise HTTPException(status_code=400, detail="student_id is required")
         if not sha:
             raise HTTPException(status_code=400, detail="sha is required")
 
@@ -1187,12 +1197,13 @@ def create_app(context: AppContext | None = None) -> FastAPI:
 
     @app.get("/api/transcripts/known")
     async def known_transcript_shas(
-        student_id: str,
+        student_id: str | None = None,
         manifest_version: int = 1,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         store: Store = Depends(get_store),
     ):
-        manifest = store.get_known_session_shas(student_id)
+        resolved_student_id = resolve_student_id(principal, student_id)
+        manifest = store.get_known_session_shas(resolved_student_id)
         if manifest_version >= 2:
             return manifest
         return {session_id: entry["sha"] for session_id, entry in manifest.items()}
@@ -1288,30 +1299,35 @@ def create_app(context: AppContext | None = None) -> FastAPI:
 
     @app.get("/api/student/upload-requests")
     async def list_student_upload_requests(
-        student_id: str,
+        student_id: str | None = None,
         status: Literal["pending", "running", "done", "failed", "all"] = "pending",
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         upload_svc: UploadRequestService = Depends(get_upload_service),
     ):
+        resolved_student_id = resolve_student_id(principal, student_id)
         status_value = None if status == "all" else status
         return {"items": [
             _upload_request_to_response(row)
-            for row in upload_svc.list(student_id=student_id, status=status_value)
+            for row in upload_svc.list(
+                student_id=resolved_student_id,
+                status=status_value,
+            )
         ]}
 
     @app.post("/api/student/upload-requests/{request_id}/status")
     async def update_student_upload_request_status(
         request_id: str,
         data: UploadRequestStatusIn,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         context: AppContext = Depends(get_context),
         upload_svc: UploadRequestService = Depends(get_upload_service),
     ):
+        student_id = resolve_student_id(principal, data.student_id)
         transfer_status = "stored" if data.status == "done" else data.status
         try:
             row = upload_svc.mark_transfer(
                 request_id,
-                data.student_id,
+                student_id,
                 transfer_status,
                 error=data.error_message,
                 result=data.result,
@@ -1328,7 +1344,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                 request_id,
             )
         await _publish_upload_request_status(context, row)
-        parent_rows = upload_svc.refresh_parent_analysis(request_id, data.student_id)
+        parent_rows = upload_svc.refresh_parent_analysis(request_id, student_id)
         if any(
             str(parent.get("analysis_status") or "") == "failed"
             for parent in parent_rows
@@ -1347,11 +1363,10 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     async def list_sessions(
         student_id: str | None = None,
         limit: int = 10,
-        _: None = Depends(require_student_token),
-        context: AppContext = Depends(get_context),
+        principal: StudentPrincipal = Depends(require_student_principal),
         session_svc: SessionQueryService = Depends(get_session_service),
     ):
-        sid = student_id or context.config.get("student_id", "student-1")
+        sid = resolve_student_id(principal, student_id)
         conversations = session_svc.list_sessions(sid, limit=limit)
         return {"items": [c.__dict__ for c in conversations]}
 
@@ -1359,11 +1374,10 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     async def current_session(
         work_dir: str | None = None,
         student_id: str | None = None,
-        _: None = Depends(require_student_token),
-        context: AppContext = Depends(get_context),
+        principal: StudentPrincipal = Depends(require_student_principal),
         session_svc: SessionQueryService = Depends(get_session_service),
     ):
-        sid = student_id or context.config.get("student_id", "student-1")
+        sid = resolve_student_id(principal, student_id)
         active = session_svc.get_active_session(work_dir, student_id=sid)
         if not active:
             return {"session_id": None, "items": []}
@@ -1386,10 +1400,11 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     async def unread_alerts(
         since: float = 0.0,
         student_id: str | None = None,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         store: Store = Depends(get_store),
     ):
-        return {"items": store.unread_alerts(since, student_id)}
+        resolved_student_id = resolve_student_id(principal, student_id)
+        return {"items": store.unread_alerts(since, resolved_student_id)}
 
     @app.post("/api/mentor/message")
     async def send_mentor_message(
@@ -1426,25 +1441,33 @@ def create_app(context: AppContext | None = None) -> FastAPI:
 
     @app.get("/api/student/messages")
     async def get_student_messages(
-        student_id: str,
+        student_id: str | None = None,
         since: int = 0,
         limit: int | None = None,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         message_svc: MessageService = Depends(get_message_service),
     ):
-        return {"items": message_svc.get_catchup(student_id, since, limit=limit)}
+        resolved_student_id = resolve_student_id(principal, student_id)
+        return {
+            "items": message_svc.get_catchup(
+                resolved_student_id,
+                since,
+                limit=limit,
+            )
+        }
 
     @app.get("/api/student/messages/pending-receipts")
     async def get_pending_student_message_receipts(
-        student_id: str,
+        student_id: str | None = None,
         limit: int = 64,
         after_id: int = 0,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         message_svc: MessageService = Depends(get_message_service),
     ):
+        resolved_student_id = resolve_student_id(principal, student_id)
         return {
             "items": message_svc.get_pending_receipts(
-                student_id,
+                resolved_student_id,
                 limit=limit,
                 after_id=after_id,
             )
@@ -1453,10 +1476,11 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     @app.post("/api/student/messages/ack")
     async def ack_student_message(
         data: StudentMessageAckIn,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         message_svc: MessageService = Depends(get_message_service),
     ):
-        result = message_svc.ack(data.message_id, data.student_id)
+        student_id = resolve_student_id(principal, data.student_id)
+        result = message_svc.ack(data.message_id, student_id)
         ok = await result if inspect.isawaitable(result) else result
         if not ok:
             raise HTTPException(status_code=404, detail="message not found")
@@ -1465,15 +1489,13 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     @app.post("/api/student/ask")
     async def ask_copilot(
         data: StudentAskIn,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         context: AppContext = Depends(get_context),
         store: Store = Depends(get_store),
     ):
-        student_id = data.student_id.strip()
+        student_id = resolve_student_id(principal, data.student_id)
         question = data.question.strip()
         session_id = (data.session_id or "").strip() or None
-        if not student_id:
-            raise HTTPException(status_code=400, detail="student_id is required")
         if not question:
             raise HTTPException(status_code=400, detail="question is required")
         if session_id:
@@ -1551,13 +1573,11 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     async def record_student_ask_feedback(
         ask_id: int,
         data: StudentAskFeedbackIn,
-        _: None = Depends(require_student_token),
+        principal: StudentPrincipal = Depends(require_student_principal),
         context: AppContext = Depends(get_context),
         store: Store = Depends(get_store),
     ):
-        student_id = data.student_id.strip()
-        if not student_id:
-            raise HTTPException(status_code=400, detail="student_id is required")
+        student_id = resolve_student_id(principal, data.student_id)
         note = (data.note or "").strip()
         if len(note) > 500:
             raise HTTPException(status_code=422, detail="feedback note is too long")
@@ -1599,12 +1619,18 @@ def create_app(context: AppContext | None = None) -> FastAPI:
     async def websocket_endpoint(ws: WebSocket):
         context: AppContext = ws.app.state.context
         registry = context.ws_registry
-        student_id = ws.query_params.get("student_id") or ""
+        supplied_student_id = ws.query_params.get("student_id")
         token = _extract_supplied_token(
             ws.headers.get("authorization"),
             ws.headers.get("x-copilot-token"),
         ) or ws.query_params.get("token")
-        if not student_id or not token_is_valid(context.config, token, role="student"):
+        principal = student_principal_for_token(context.config, token)
+        if principal is None:
+            await ws.close(code=1008)
+            return
+        try:
+            student_id = resolve_student_id(principal, supplied_student_id)
+        except HTTPException:
             await ws.close(code=1008)
             return
         await ws.accept()

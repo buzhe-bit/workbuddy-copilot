@@ -499,10 +499,16 @@ class TestMentorWS:
         finally:
             monkeypatch.delenv("COPILOT_TOKEN", raising=False)
 
-    def test_float_ws_requires_student_id(self, client):
-        with pytest.raises(WebSocketDisconnect):
-            with client.websocket_connect("/ws"):
-                pass
+    def test_local_open_float_ws_derives_configured_student_when_id_is_omitted(self, client):
+        registry = app.state.context.ws_registry
+        student_id = str(app.state.context.config.get("student_id") or "")
+        before = len(registry.floats.get(student_id, set()))
+
+        with client.websocket_connect("/ws") as ws:
+            assert len(registry.floats.get(student_id, set())) == before + 1
+            ws.send_text("derived local identity")
+
+        assert len(registry.floats.get(student_id, set())) == before
 
     def test_mentor_ws_pool_separate_from_floating(self):
         """验证导师 WS 客户端池与浮标独立。"""

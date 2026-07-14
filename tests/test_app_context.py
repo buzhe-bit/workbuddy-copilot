@@ -177,7 +177,7 @@ def test_student_token_mapping_rejects_duplicate_token_ambiguity():
     assert app_context.student_id_for_token(config, "duplicate-token") is None
 
 
-def test_student_token_mapping_does_not_change_shared_student_token_behavior():
+def test_student_token_mapping_authenticates_mapped_and_local_shared_tokens():
     config = {
         "auth": {
             "student_token": "shared-token",
@@ -186,8 +186,23 @@ def test_student_token_mapping_does_not_change_shared_student_token_behavior():
     }
 
     assert token_is_valid(config, "shared-token", role="student") is True
-    assert token_is_valid(config, "student-a-token", role="student") is False
+    assert token_is_valid(config, "student-a-token", role="student") is True
     assert app_context.student_id_for_token(config, "shared-token") is None
+
+
+def test_configured_student_mapping_closes_tokenless_local_fallback():
+    config = {
+        "student_id": "server-default",
+        "auth": {
+            "mode": "local",
+            "student_tokens": {"student-a": "student-a-token"},
+        },
+    }
+
+    assert token_is_valid(config, None, role="student") is False
+    assert token_is_valid(config, "unknown", role="student") is False
+    principal = app_context.student_principal_for_token(config, "student-a-token")
+    assert principal == app_context.StudentPrincipal("student-a", "mapped")
 
 
 def test_lifespan_rejects_second_process_for_same_db(tmp_path, monkeypatch):

@@ -12,6 +12,7 @@
   },
   "auth": {
     "mode": "local",
+    "allow_shared_student_token": true,
     "student_token": "",
     "student_tokens": {},
     "mentor_token": "",

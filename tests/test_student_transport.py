@@ -89,6 +89,27 @@ def test_post_hook_includes_spool_event_id_when_supplied() -> None:
     assert captured["body"] == {**event().to_dict(), "event_id": "spool-event-1"}
 
 
+def test_post_hook_overrides_stale_event_student_with_transport_identity() -> None:
+    captured: dict[str, object] = {}
+
+    def opener(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return Response(202, b'{"status":"accepted"}')
+
+    transport = StudentTransport(
+        "https://copilot.example",
+        student_id="student-a",
+        opener=opener,
+    )
+    mismatched = HookEvent(event="Stop", student_id="student-b")
+
+    result = transport.post_hook(mismatched)
+
+    assert result.status_code == 202
+    assert captured["body"]["student_id"] == "student-a"
+    assert "student-b" not in json.dumps(captured["body"])
+
+
 @pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
 def test_post_hook_classifies_retryable_http_failures(status: int) -> None:
     def opener(request, timeout):
@@ -145,6 +166,20 @@ def test_ack_message_posts_to_existing_student_ack_api_with_rest_auth() -> None:
     headers = {str(k).lower(): str(v) for k, v in captured["headers"].items()}
     assert headers["authorization"] == "Bearer secret-token"
     assert headers["x-copilot-token"] == "secret-token"
+
+
+def test_ack_message_rejects_student_override_before_network() -> None:
+    def opener(request, timeout):
+        raise AssertionError("a mismatched student receipt must not reach the network")
+
+    transport = StudentTransport(
+        "https://copilot.example",
+        student_id="student-a",
+        opener=opener,
+    )
+
+    with pytest.raises(PermanentTransportError, match="student identity"):
+        transport.ack_message("message-b", student_id="student-b")
 
 
 def test_get_pending_messages_uses_authenticated_student_backlog_contract() -> None:

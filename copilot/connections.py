@@ -45,6 +45,10 @@ class WSRegistry:
         self.mentors.discard(ws)
         log.info("mentor WS disconnected count=%d", len(self.mentors))
 
+    def connection_counts(self) -> tuple[int, int]:
+        """Return a safe point-in-time count of student and mentor sockets."""
+        return sum(len(pool) for pool in self.floats.values()), len(self.mentors)
+
     async def handle_event(self, payload: dict[str, Any]) -> None:
         event_type = payload.get("type")
         if event_type in FORWARD_EVENT_TYPES:
