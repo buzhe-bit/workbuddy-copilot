@@ -220,6 +220,7 @@ class UploadRequestService:
         self,
         error: str = "analysis interrupted; retry",
     ) -> list[dict[str, Any]]:
+        self.store.recover_interrupted_raw_transcript_analyses(error)
         for child in self.store.list_active_upload_request_sessions():
             self.store.compare_and_set_upload_request_session(
                 str(child["request_id"]),
@@ -232,13 +233,25 @@ class UploadRequestService:
             )
         recovered: list[dict[str, Any]] = []
         for row in self.store.list_active_upload_request_analyses():
+            request_id = str(row["request_id"])
+            student_id = str(row["student_id"])
+            children = self.store.list_upload_request_sessions(request_id)
             try:
-                recovered.append(self.mark_analysis(
-                    str(row["request_id"]),
-                    str(row["student_id"]),
-                    "failed",
-                    error=error,
-                ))
+                if any(
+                    str(child.get("analysis_status") or "not_requested")
+                    != "not_requested"
+                    for child in children
+                ):
+                    recovered.extend(
+                        self.refresh_parent_analysis(request_id, student_id)
+                    )
+                else:
+                    recovered.append(self.mark_analysis(
+                        request_id,
+                        student_id,
+                        "failed",
+                        error=error,
+                    ))
             except InvalidStateTransition:
                 continue
         return recovered

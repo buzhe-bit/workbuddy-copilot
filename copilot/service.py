@@ -352,14 +352,10 @@ async def _analyze_uploaded_session_background(
     started_at = monotonic()
     prompt_hash = ""
     analysis_model = ""
-    attempt_claimed = False
+    claim: dict[str, Any] | None = None
     latency_ms = 0
     latency_measured = False
     try:
-        if request_id:
-            await _mark_upload_child_and_publish(
-                context, request_id, student_id, session_id, "running", sha=sha
-            )
         snap = _snapshot_from_turns(turns)
         latest_prompt = _latest_user_prompt(turns)
         llm_config = (
@@ -368,27 +364,27 @@ async def _analyze_uploaded_session_background(
             else context.config
         )
         prompt_hash = analysis_prompt_hash(llm_config)
-        claimed = context.store.set_raw_transcript_analysis_status(
-            session_id,
-            student_id,
-            status="running",
+        claim = context.store.claim_raw_transcript_analysis(
+            student_id=student_id,
+            session_id=session_id,
             content_sha256=sha,
             prompt_hash=prompt_hash,
-            increment_attempt=True,
         )
-        if claimed != 1:
-            if request_id:
-                await _mark_upload_child_and_publish(
-                    context,
-                    request_id,
-                    student_id,
-                    session_id,
-                    "failed",
-                    error="analysis stale transcript",
-                    sha=sha,
-                )
+        await _refresh_upload_parent_projections(
+            context,
+            student_id,
+            claim.get("request_ids", []),
+        )
+        claim_state = str(claim.get("state") or "")
+        if claim_state == "stale":
             return False, "analysis stale transcript"
-        attempt_claimed = True
+        if claim_state == "running":
+            return False, "analysis already running"
+        if claim_state == "done":
+            return True, ""
+        if claim_state != "claimed":
+            return False, "analysis not pending"
+
         async with context.analysis_svc.analysis_semaphore:
             raw_outcome = await context.analysis_svc.llm(
                 llm_config,
@@ -399,7 +395,7 @@ async def _analyze_uploaded_session_background(
         latency_ms = max(0, int(round((monotonic() - started_at) * 1000)))
         latency_measured = True
         outcome = coerce_analysis_outcome(raw_outcome)
-        analysis_model = str(outcome.model or "")[:200]
+        analysis_model = str(outcome.model or "").strip()[:200]
         if not outcome.ok:
             raise RuntimeError(outcome.error or "LLM provider analysis failed")
         traced_value = dict(outcome.value)
@@ -410,37 +406,36 @@ async def _analyze_uploaded_session_background(
         })
         result = AnalysisResult.from_dict(traced_value)
         session_title = context.store.get_session_title(session_id)
-        report_id = context.store.commit_bulk_analysis_if_current(
+        committed = context.store.commit_bulk_analysis_if_current(
             student_id=student_id,
             session_id=session_id,
             content_sha256=sha,
+            raw_id=int(claim["raw_id"]),
+            generation=int(claim["generation"]),
             result=result.to_dict(),
             session_title=session_title,
             msg_count=len(snap.messages),
         )
-        if report_id is None:
-            context.store.set_raw_transcript_analysis_status(
-                session_id,
-                student_id,
-                status="failed",
-                error_message="analysis stale transcript",
+        if committed is None:
+            request_ids = context.store.fail_stale_upload_request_sessions(
+                student_id=student_id,
+                session_id=session_id,
                 content_sha256=sha,
-                analysis_model=analysis_model or None,
-                prompt_hash=prompt_hash or None,
-                latency_ms=latency_ms,
             )
+            await _refresh_upload_parent_projections(context, student_id, request_ids)
             log.info(
                 "bulk analysis discarded stale_sha student=%s session=%s sha=%s",
                 student_id,
                 session_id[:8],
                 sha[:12],
             )
-            if request_id:
-                await _mark_upload_child_and_publish(
-                    context, request_id, student_id, session_id, "failed",
-                    error="analysis stale transcript", sha=sha,
-                )
             return False, "analysis stale transcript"
+        report_id = int(committed["report_id"])
+        await _refresh_upload_parent_projections(
+            context,
+            student_id,
+            committed.get("request_ids", []),
+        )
         await context.bus.publish({
             "type": "analysis",
             "student_id": student_id,
@@ -458,26 +453,38 @@ async def _analyze_uploaded_session_background(
             session_id[:8],
             report_id,
         )
-        if request_id:
-            await _mark_upload_child_and_publish(
-                context, request_id, student_id, session_id, "done", sha=sha
-            )
         return True, ""
     except Exception as exc:
         error_code = _stable_background_analysis_error(exc)
         if not latency_measured:
             latency_ms = max(0, int(round((monotonic() - started_at) * 1000)))
-        context.store.set_raw_transcript_analysis_status(
-            session_id,
-            student_id,
-            status="failed",
-            error_message=error_code,
-            content_sha256=sha,
-            analysis_model=analysis_model or None,
-            prompt_hash=prompt_hash or None,
-            latency_ms=latency_ms,
-            increment_attempt=not attempt_claimed,
-        )
+        failure = None
+        if claim is not None and claim.get("state") == "claimed":
+            failure = context.store.fail_raw_transcript_analysis(
+                student_id=student_id,
+                session_id=session_id,
+                content_sha256=sha,
+                raw_id=int(claim["raw_id"]),
+                generation=int(claim["generation"]),
+                error_message=error_code,
+                analysis_model=analysis_model,
+                prompt_hash=prompt_hash,
+                latency_ms=latency_ms,
+            )
+        if failure is None and claim is not None and claim.get("state") == "claimed":
+            request_ids = context.store.fail_stale_upload_request_sessions(
+                student_id=student_id,
+                session_id=session_id,
+                content_sha256=sha,
+            )
+            await _refresh_upload_parent_projections(context, student_id, request_ids)
+            return False, "analysis stale transcript"
+        if failure is not None:
+            await _refresh_upload_parent_projections(
+                context,
+                student_id,
+                failure.get("request_ids", []),
+            )
         log.error(
             "bulk upload analysis failed student=%s session=%s error=%s type=%s",
             student_id,
@@ -485,11 +492,6 @@ async def _analyze_uploaded_session_background(
             error_code,
             type(exc).__name__,
         )
-        if request_id:
-            await _mark_upload_child_and_publish(
-                context, request_id, student_id, session_id, "failed",
-                error=error_code, sha=sha,
-            )
         return False, error_code
 
 
@@ -530,25 +532,24 @@ async def _publish_upload_parent_rows(
         await _publish_upload_request_status(context, row)
 
 
-async def _mark_upload_child_and_publish(
+async def _refresh_upload_parent_projections(
     context: AppContext,
-    request_id: str,
     student_id: str,
-    session_id: str,
-    status: str,
-    *,
-    error: str = "",
-    sha: str | None = None,
+    request_ids: list[Any],
 ) -> None:
-    _child, rows = context.upload_svc.mark_session_analysis(
-        request_id,
-        student_id,
-        session_id,
-        status,
-        error=error,
-        sha=sha,
-    )
-    await _publish_upload_parent_rows(context, rows)
+    """Refresh parents after a raw transaction fans out child analysis state."""
+    upload_svc = context.upload_svc or UploadRequestService(context.store)
+    for request_id in dict.fromkeys(str(item) for item in request_ids if item):
+        try:
+            rows = upload_svc.refresh_parent_analysis(request_id, student_id)
+        except (InvalidStateTransition, UploadRequestNotFound) as exc:
+            log.warning(
+                "upload parent projection changed request_id=%s error=%s",
+                request_id,
+                exc,
+            )
+            continue
+        await _publish_upload_parent_rows(context, rows)
 
 
 def _sanitize_upload_event_result(value: Any) -> Any:
@@ -573,45 +574,15 @@ async def _retry_upload_request_analysis_background(
 ) -> None:
     """Analyze the already-persisted raw transcript and mirror request status."""
     try:
-        children = context.store.list_upload_request_sessions(request_id)
-        has_child = any(child.get("session_id") == session_id for child in children)
-        if has_child:
-            await _mark_upload_child_and_publish(
-                context, request_id, student_id, session_id, "running", sha=sha
-            )
-        else:
-            running = context.upload_svc.mark_analysis(
-                request_id, student_id, "running", error=""
-            )
-            await _publish_upload_request_status(context, running)
         turns = parse_turns(parse_text(raw).messages)
-        ok, error = await _analyze_uploaded_session_background(
+        await _analyze_uploaded_session_background(
             context,
             student_id,
             session_id,
             turns,
             sha,
+            request_id=request_id,
         )
-        if has_child:
-            await _mark_upload_child_and_publish(
-                context,
-                request_id,
-                student_id,
-                session_id,
-                "done" if ok else "failed",
-                error="" if ok else error,
-                sha=sha,
-            )
-        elif ok:
-            final = context.upload_svc.mark_analysis(
-                request_id, student_id, "done", error=""
-            )
-        else:
-            final = context.upload_svc.mark_analysis(
-                request_id, student_id, "failed", error=error
-            )
-        if not has_child:
-            await _publish_upload_request_status(context, final)
     except (InvalidStateTransition, UploadRequestNotFound) as exc:
         log.warning(
             "upload request retry state changed request_id=%s error=%s",
@@ -939,6 +910,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         raw_row = store.get_raw_transcript_for_student_session_sha(
             student_id, session_id, sha
         )
+        registered_child_status: str | None = None
         if request_id:
             raw_status = str((raw_row or {}).get("analysis_status") or "")
             if not analysis_scheduled:
@@ -946,7 +918,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             else:
                 child_status = "done" if raw_status == "done" else "pending"
             try:
-                _child, parent_rows = upload_svc.register_session(
+                child, parent_rows = upload_svc.register_session(
                     request_id,
                     student_id,
                     session_id,
@@ -957,23 +929,33 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="upload request not found") from exc
             except InvalidStateTransition as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            registered_child_status = str(child.get("analysis_status") or "pending")
             await _publish_upload_parent_rows(context, parent_rows)
+            known = store.get_known_session_shas(student_id)
+            known_entry = known.get(session_id) or {}
+            raw_row = store.get_raw_transcript_for_student_session_sha(
+                student_id, session_id, sha
+            )
         if known_entry.get("sha") == sha:
+            raw_status = str((raw_row or {}).get("analysis_status") or "")
             retry_analysis = (
                 bool(raw_row)
-                and raw_row.get("analysis_status") != "done"
                 and analysis_scheduled
+                and (
+                    registered_child_status == "pending"
+                    if registered_child_status is not None
+                    else raw_status not in {"done", "running"}
+                )
             )
             if retry_analysis:
                 raw = str((raw_row or {}).get("content") or "")
                 turns = parse_turns(parse_text(raw).messages)
-                store.set_raw_transcript_analysis_status(
-                    session_id,
-                    student_id,
-                    status="pending",
-                    error_message="",
-                    content_sha256=sha,
-                )
+                if raw_status in {"", "skipped"}:
+                    store.queue_raw_transcript_analysis(
+                        student_id=student_id,
+                        session_id=session_id,
+                        content_sha256=sha,
+                    )
                 background_tasks.add_task(
                     _analyze_uploaded_session_background,
                     context,
@@ -984,7 +966,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                     request_id,
                 )
                 log.info(
-                    "bulk transcript unchanged; retrying failed analysis student=%s session=%s sha=%s",
+                    "bulk transcript unchanged; scheduling retryable analysis student=%s session=%s sha=%s",
                     student_id,
                     session_id[:8],
                     sha[:12],
@@ -1027,14 +1009,12 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        store.set_raw_transcript_analysis_status(
-            session_id,
-            student_id,
-            status="pending" if analysis_scheduled else "skipped",
-            error_message="",
-            content_sha256=sha,
-        )
         if analysis_scheduled:
+            store.queue_raw_transcript_analysis(
+                student_id=student_id,
+                session_id=session_id,
+                content_sha256=sha,
+            )
             background_tasks.add_task(
                 _analyze_uploaded_session_background,
                 context,
@@ -1043,6 +1023,14 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                 turns,
                 sha,
                 request_id,
+            )
+        else:
+            store.set_raw_transcript_analysis_status(
+                session_id,
+                student_id,
+                status="skipped",
+                error_message="",
+                content_sha256=sha,
             )
         log.info(
             "bulk transcript accepted student=%s session=%s messages=%d sha=%s llm=%s",

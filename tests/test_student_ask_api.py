@@ -311,21 +311,31 @@ def test_student_ask_claims_unknown_session_before_another_student_can_bind_it(t
     assert store.list_student_asks("stu-a", "sess-new")[0]["id"] == ask_id
 
 
-def test_session_owner_change_during_llm_returns_conflict_without_ask_or_event(
+def test_first_ask_binds_unknown_session_before_llm_and_rejects_late_owner(
     tmp_path,
     monkeypatch,
 ):
     app, store, events = _build_app(tmp_path)
     llm_calls = 0
+    late_owner_claims: list[bool] = []
 
-    async def owner_changes_before_answer(config, question, context_messages):
+    async def late_owner_attempts_claim(config, question, context_messages):
         nonlocal llm_calls
         llm_calls += 1
         store.upsert_student("stu-b")
-        store.upsert_session("sess-race", "stu-b", "", "B")
-        return "迟到的回答"
+        try:
+            store.upsert_session("sess-race", "stu-b", "", "B")
+        except ValueError:
+            late_owner_claims.append(False)
+        else:
+            late_owner_claims.append(True)
+        return "先到的回答"
 
-    monkeypatch.setattr(service_module, "llm_answer_question", owner_changes_before_answer)
+    monkeypatch.setattr(
+        service_module,
+        "llm_answer_question",
+        late_owner_attempts_claim,
+    )
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.post(
             "/api/student/ask",
@@ -337,10 +347,21 @@ def test_session_owner_change_during_llm_returns_conflict_without_ask_or_event(
             },
         )
 
-    assert response.status_code == 409
+    assert response.status_code == 200
+    assert response.json()["answer"] == "先到的回答"
+    assert response.json()["status"] == "answered"
     assert llm_calls == 1
-    assert store.list_student_asks("stu-a") == []
-    assert events == []
+    assert late_owner_claims == [False]
+    with store._conn() as conn:
+        owner = conn.execute(
+            "SELECT student_id FROM sessions WHERE session_id = ?",
+            ("sess-race",),
+        ).fetchone()[0]
+    assert owner == "stu-a"
+    asks = store.list_student_asks("stu-a", "sess-race")
+    assert len(asks) == 1
+    assert asks[0]["answer"] == "先到的回答"
+    assert [event.get("type") for event in events] == ["student_ask"]
 
 
 def test_legacy_student_asks_migrate_status_and_feedback_defaults(tmp_path):

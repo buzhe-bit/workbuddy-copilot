@@ -139,6 +139,7 @@ CREATE TABLE IF NOT EXISTS raw_transcripts (
     analysis_prompt_hash TEXT NOT NULL DEFAULT '',
     analysis_latency_ms INTEGER NOT NULL DEFAULT 0,
     analysis_attempts INTEGER NOT NULL DEFAULT 0,
+    analysis_generation INTEGER NOT NULL DEFAULT 0,
     created_at REAL
 );
 
@@ -244,6 +245,7 @@ _MIGRATIONS = [
     ("raw_transcripts", "analysis_prompt_hash", "TEXT NOT NULL DEFAULT ''"),
     ("raw_transcripts", "analysis_latency_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("raw_transcripts", "analysis_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("raw_transcripts", "analysis_generation", "INTEGER NOT NULL DEFAULT 0"),
     ("messages", "summary", "TEXT"),
     ("upload_requests", "error_message", "TEXT DEFAULT ''"),
     ("upload_requests", "result_json", "TEXT"),
@@ -742,10 +744,19 @@ class Store:
             )
 
     def ensure_session_owner(self, session_id: str, student_id: str) -> None:
-        """Reject a known session owned by another student."""
+        """Atomically bind an unknown session or reject another student's session."""
+        now = time.time()
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
-            self._ensure_session_owner_with_conn(c, session_id, student_id)
+            self._upsert_session_with_conn(
+                c,
+                session_id=session_id,
+                student_id=student_id,
+                work_dir="",
+                title="",
+                created_at=now,
+                last_activity_at=now,
+            )
 
     def get_sessions_by_student_from_table(self, student_id: str, limit: int = 1000) -> list[dict]:
         """Read a student's sessions from the new copilot.db sessions table."""
@@ -1090,6 +1101,21 @@ class Store:
                     END""",
                 (session_id, student_id, now, now),
             )
+            current_bulk = c.execute(
+                """SELECT content_sha256
+                   FROM raw_transcripts
+                   WHERE session_id = ? AND student_id = ?
+                     AND content_sha256 IS NOT NULL AND content_sha256 != ''
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (session_id, student_id),
+            ).fetchone()
+            if current_bulk is not None and str(current_bulk["content_sha256"]) == sha:
+                return int(c.execute(
+                    """SELECT COUNT(*) FROM messages
+                       WHERE session_id = ? AND source = 'bulk'""",
+                    (session_id,),
+                ).fetchone()[0])
             preserved_summaries: dict[tuple[int, str], str] = {}
             if sha:
                 rows = c.execute(
@@ -1229,6 +1255,308 @@ class Store:
             )
             return cur.rowcount
 
+    @staticmethod
+    def _upload_request_ids_for_transcript_with_conn(
+        c: sqlite3.Connection,
+        student_id: str,
+        session_id: str,
+        sha: str,
+        statuses: tuple[str, ...],
+    ) -> list[str]:
+        placeholders = ", ".join("?" for _ in statuses)
+        rows = c.execute(
+            f"""SELECT DISTINCT request_id
+                FROM upload_request_sessions
+                WHERE student_id = ? AND session_id = ? AND sha = ?
+                  AND analysis_status IN ({placeholders})
+                ORDER BY request_id""",
+            (student_id, session_id, sha, *statuses),
+        ).fetchall()
+        return [str(row["request_id"]) for row in rows]
+
+    def queue_raw_transcript_analysis(
+        self,
+        *,
+        student_id: str,
+        session_id: str,
+        content_sha256: str,
+    ) -> int:
+        """Queue only an unqueued current SHA; never reopen running or done work."""
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            raw_row = c.execute(
+                """SELECT id, content_sha256
+                   FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?
+                     AND content_sha256 IS NOT NULL AND content_sha256 != ''
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (student_id, session_id),
+            ).fetchone()
+            if raw_row is None or str(raw_row["content_sha256"]) != content_sha256:
+                return 0
+            return c.execute(
+                """UPDATE raw_transcripts
+                   SET analysis_status = 'pending', analysis_error = ''
+                   WHERE id = ? AND student_id = ? AND session_id = ?
+                     AND content_sha256 = ?
+                     AND analysis_status IN ('', 'skipped')""",
+                (
+                    raw_row["id"],
+                    student_id,
+                    session_id,
+                    content_sha256,
+                ),
+            ).rowcount
+
+    def claim_raw_transcript_analysis(
+        self,
+        *,
+        student_id: str,
+        session_id: str,
+        content_sha256: str,
+        prompt_hash: str,
+    ) -> dict[str, Any]:
+        """Claim exactly one current raw transcript generation for analysis."""
+        now = time.time()
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            raw_row = c.execute(
+                """SELECT id, content_sha256, analysis_status,
+                          analysis_attempts, analysis_generation
+                   FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?
+                     AND content_sha256 IS NOT NULL AND content_sha256 != ''
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (student_id, session_id),
+            ).fetchone()
+            if raw_row is None or str(raw_row["content_sha256"]) != content_sha256:
+                request_ids = self._upload_request_ids_for_transcript_with_conn(
+                    c,
+                    student_id,
+                    session_id,
+                    content_sha256,
+                    ("pending", "running"),
+                )
+                c.execute(
+                    """UPDATE upload_request_sessions
+                       SET analysis_status = 'failed',
+                           analysis_error = 'analysis stale transcript',
+                           updated_at = ?
+                       WHERE student_id = ? AND session_id = ? AND sha = ?
+                         AND analysis_status IN ('pending', 'running')""",
+                    (now, student_id, session_id, content_sha256),
+                )
+                return {"state": "stale", "request_ids": request_ids}
+
+            status = str(raw_row["analysis_status"] or "")
+            if status == "running":
+                request_ids = self._upload_request_ids_for_transcript_with_conn(
+                    c,
+                    student_id,
+                    session_id,
+                    content_sha256,
+                    ("pending",),
+                )
+                c.execute(
+                    """UPDATE upload_request_sessions
+                       SET analysis_status = 'running', analysis_error = '', updated_at = ?
+                       WHERE student_id = ? AND session_id = ? AND sha = ?
+                         AND analysis_status = 'pending'""",
+                    (now, student_id, session_id, content_sha256),
+                )
+                return {"state": "running", "request_ids": request_ids}
+            if status == "done":
+                request_ids = self._upload_request_ids_for_transcript_with_conn(
+                    c,
+                    student_id,
+                    session_id,
+                    content_sha256,
+                    ("pending", "running"),
+                )
+                c.execute(
+                    """UPDATE upload_request_sessions
+                       SET analysis_status = 'done', analysis_error = '', updated_at = ?
+                       WHERE student_id = ? AND session_id = ? AND sha = ?
+                         AND analysis_status IN ('pending', 'running')""",
+                    (now, student_id, session_id, content_sha256),
+                )
+                return {"state": "done", "request_ids": request_ids}
+            if status not in {"pending", "failed"}:
+                return {"state": "not_ready", "request_ids": []}
+
+            old_generation = max(0, int(raw_row["analysis_generation"] or 0))
+            updated = c.execute(
+                """UPDATE raw_transcripts
+                   SET analysis_status = 'running', analysis_error = '',
+                       analysis_prompt_hash = ?,
+                       analysis_attempts = analysis_attempts + 1,
+                       analysis_generation = analysis_generation + 1
+                   WHERE id = ? AND student_id = ? AND session_id = ?
+                     AND content_sha256 = ?
+                     AND analysis_status IN ('pending', 'failed')
+                     AND analysis_generation = ?""",
+                (
+                    str(prompt_hash)[:128],
+                    raw_row["id"],
+                    student_id,
+                    session_id,
+                    content_sha256,
+                    old_generation,
+                ),
+            ).rowcount
+            if updated != 1:
+                return {"state": "running", "request_ids": []}
+
+            request_ids = self._upload_request_ids_for_transcript_with_conn(
+                c,
+                student_id,
+                session_id,
+                content_sha256,
+                ("pending",),
+            )
+            c.execute(
+                """UPDATE upload_request_sessions
+                   SET analysis_status = 'running', analysis_error = '', updated_at = ?
+                   WHERE student_id = ? AND session_id = ? AND sha = ?
+                     AND analysis_status = 'pending'""",
+                (now, student_id, session_id, content_sha256),
+            )
+            return {
+                "state": "claimed",
+                "raw_id": int(raw_row["id"]),
+                "generation": old_generation + 1,
+                "attempt": max(0, int(raw_row["analysis_attempts"] or 0)) + 1,
+                "request_ids": request_ids,
+            }
+
+    def fail_raw_transcript_analysis(
+        self,
+        *,
+        student_id: str,
+        session_id: str,
+        content_sha256: str,
+        raw_id: int,
+        generation: int,
+        error_message: str,
+        analysis_model: str,
+        prompt_hash: str,
+        latency_ms: int,
+    ) -> dict[str, Any] | None:
+        """Fail only the worker that still owns the current raw generation."""
+        now = time.time()
+        normalized_latency = max(0, int(latency_ms))
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            current = c.execute(
+                """SELECT id, content_sha256, analysis_status, analysis_generation
+                   FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?
+                     AND content_sha256 IS NOT NULL AND content_sha256 != ''
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (student_id, session_id),
+            ).fetchone()
+            if (
+                current is None
+                or int(current["id"]) != int(raw_id)
+                or str(current["content_sha256"]) != content_sha256
+                or str(current["analysis_status"] or "") != "running"
+                or int(current["analysis_generation"] or 0) != int(generation)
+            ):
+                return None
+            request_ids = self._upload_request_ids_for_transcript_with_conn(
+                c,
+                student_id,
+                session_id,
+                content_sha256,
+                ("pending", "running"),
+            )
+            updated = c.execute(
+                """UPDATE raw_transcripts
+                   SET analysis_status = 'failed', analysis_error = ?,
+                       analysis_model = ?, analysis_prompt_hash = ?,
+                       analysis_latency_ms = analysis_latency_ms + ?
+                   WHERE id = ? AND student_id = ? AND session_id = ?
+                     AND content_sha256 = ? AND analysis_status = 'running'
+                     AND analysis_generation = ?""",
+                (
+                    str(error_message),
+                    str(analysis_model).strip()[:200],
+                    str(prompt_hash)[:128],
+                    normalized_latency,
+                    raw_id,
+                    student_id,
+                    session_id,
+                    content_sha256,
+                    generation,
+                ),
+            ).rowcount
+            if updated != 1:
+                return None
+            c.execute(
+                """UPDATE upload_request_sessions
+                   SET analysis_status = 'failed', analysis_error = ?, updated_at = ?
+                   WHERE student_id = ? AND session_id = ? AND sha = ?
+                     AND analysis_status IN ('pending', 'running')""",
+                (str(error_message), now, student_id, session_id, content_sha256),
+            )
+            return {"request_ids": request_ids}
+
+    def recover_interrupted_raw_transcript_analyses(
+        self,
+        error: str = "analysis interrupted; retry",
+    ) -> int:
+        """Move crash-left raw claims to retryable failure without changing trace."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE raw_transcripts
+                   SET analysis_status = 'failed', analysis_error = ?
+                   WHERE analysis_status = 'running'""",
+                (str(error),),
+            )
+            return cur.rowcount
+
+    def fail_stale_upload_request_sessions(
+        self,
+        *,
+        student_id: str,
+        session_id: str,
+        content_sha256: str,
+        error: str = "analysis stale transcript",
+    ) -> list[str]:
+        """Fail old-SHA children only when that SHA is no longer current."""
+        now = time.time()
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            current = c.execute(
+                """SELECT content_sha256
+                   FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?
+                     AND content_sha256 IS NOT NULL AND content_sha256 != ''
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (student_id, session_id),
+            ).fetchone()
+            if current is not None and str(current["content_sha256"]) == content_sha256:
+                return []
+            request_ids = self._upload_request_ids_for_transcript_with_conn(
+                c,
+                student_id,
+                session_id,
+                content_sha256,
+                ("pending", "running"),
+            )
+            c.execute(
+                """UPDATE upload_request_sessions
+                   SET analysis_status = 'failed', analysis_error = ?, updated_at = ?
+                   WHERE student_id = ? AND session_id = ? AND sha = ?
+                     AND analysis_status IN ('pending', 'running')""",
+                (str(error), now, student_id, session_id, content_sha256),
+            )
+            return request_ids
+
     def get_known_session_shas(self, student_id: str) -> dict[str, dict[str, str]]:
         """Return latest sha and analysis status per session for one student."""
         with self._conn() as c:
@@ -1330,22 +1658,78 @@ class Store:
         analysis_status: str = "pending",
         analysis_error: str = "",
     ) -> dict:
+        """Register a child and atomically project the current raw analysis state."""
         now = time.time()
         with self._conn() as c:
-            c.execute(
-                """INSERT INTO upload_request_sessions
-                   (request_id, student_id, session_id, sha, analysis_status,
-                    analysis_error, updated_at, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(request_id, session_id) DO UPDATE SET
-                     sha = excluded.sha,
-                     analysis_status = excluded.analysis_status,
-                     analysis_error = '',
-                     updated_at = excluded.updated_at
-                   WHERE upload_request_sessions.sha != excluded.sha""",
-                (request_id, student_id, session_id, sha, analysis_status,
-                 analysis_error, now, now),
-            )
+            c.execute("BEGIN IMMEDIATE")
+            current_raw = c.execute(
+                """SELECT content_sha256, analysis_status
+                   FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?
+                     AND content_sha256 IS NOT NULL AND content_sha256 != ''
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (student_id, session_id),
+            ).fetchone()
+            if analysis_status == "not_requested":
+                projected_status = "not_requested"
+            elif current_raw is not None and str(current_raw["content_sha256"]) == sha:
+                raw_status = str(current_raw["analysis_status"] or "")
+                projected_status = raw_status if raw_status in {"running", "done"} else "pending"
+            else:
+                projected_status = "pending"
+
+            existing = c.execute(
+                """SELECT * FROM upload_request_sessions
+                   WHERE request_id = ? AND session_id = ?""",
+                (request_id, session_id),
+            ).fetchone()
+            if existing is None:
+                c.execute(
+                    """INSERT INTO upload_request_sessions
+                       (request_id, student_id, session_id, sha, analysis_status,
+                        analysis_error, updated_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        request_id,
+                        student_id,
+                        session_id,
+                        sha,
+                        projected_status,
+                        analysis_error if projected_status == "failed" else "",
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                old_sha = str(existing["sha"] or "")
+                old_status = str(existing["analysis_status"] or "pending")
+                desired_status: str | None = None
+                if old_sha != sha:
+                    desired_status = projected_status
+                elif old_status == "failed" and projected_status == "pending":
+                    desired_status = "pending"
+                elif old_status == "pending" and projected_status == "running":
+                    desired_status = "running"
+                elif old_status in {"pending", "running"} and projected_status == "done":
+                    desired_status = "done"
+                if desired_status is not None and (
+                    old_sha != sha or desired_status != old_status
+                ):
+                    c.execute(
+                        """UPDATE upload_request_sessions
+                           SET student_id = ?, sha = ?, analysis_status = ?,
+                               analysis_error = '', updated_at = ?
+                           WHERE request_id = ? AND session_id = ?""",
+                        (
+                            student_id,
+                            sha,
+                            desired_status,
+                            now,
+                            request_id,
+                            session_id,
+                        ),
+                    )
             row = c.execute(
                 """SELECT * FROM upload_request_sessions
                    WHERE request_id = ? AND session_id = ?""",
@@ -1504,6 +1888,11 @@ class Store:
                     raise UploadRetryClaimConflict(
                         f"analysis retry raw missing for session: {child_session}"
                     )
+                raw_status = str(raw_row["analysis_status"] or "")
+                if raw_status not in {"", "pending", "failed"}:
+                    raise UploadRetryClaimConflict(
+                        f"analysis retry raw is not retryable: {child_session}"
+                    )
                 work_items.append({
                     "session_id": child_session,
                     "sha": child_sha,
@@ -1554,6 +1943,25 @@ class Store:
                 if updated != 1:
                     raise UploadRetryClaimConflict(
                         f"analysis retry child already claimed: {child['session_id']}"
+                    )
+            for item in work_items:
+                raw_row = item["raw"]
+                updated = c.execute(
+                    """UPDATE raw_transcripts
+                       SET analysis_status = 'pending', analysis_error = ''
+                       WHERE id = ? AND student_id = ? AND session_id = ?
+                         AND content_sha256 = ?
+                         AND analysis_status IN ('', 'pending', 'failed')""",
+                    (
+                        raw_row["id"],
+                        student_id,
+                        str(item["session_id"]),
+                        str(item["sha"]),
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise UploadRetryClaimConflict(
+                        f"analysis retry raw already claimed: {item['session_id']}"
                     )
             claimed_parent = c.execute(
                 "SELECT * FROM upload_requests WHERE request_id = ?",
@@ -2284,15 +2692,19 @@ class Store:
         student_id: str,
         session_id: str,
         content_sha256: str,
+        raw_id: int,
+        generation: int,
         result: dict[str, Any],
         session_title: str,
         msg_count: int,
-    ) -> int | None:
-        """Atomically persist analysis only if this is still the latest bulk SHA."""
+    ) -> dict[str, Any] | None:
+        """Commit only the worker that still owns the current raw generation."""
+        now = time.time()
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
             raw_row = c.execute(
-                """SELECT id, content_sha256, analysis_latency_ms, analysis_attempts
+                """SELECT id, content_sha256, analysis_status,
+                          analysis_latency_ms, analysis_attempts, analysis_generation
                    FROM raw_transcripts
                    WHERE student_id = ? AND session_id = ?
                      AND content_sha256 IS NOT NULL AND content_sha256 != ''
@@ -2300,7 +2712,13 @@ class Store:
                    LIMIT 1""",
                 (student_id, session_id),
             ).fetchone()
-            if not raw_row or str(raw_row["content_sha256"]) != content_sha256:
+            if (
+                raw_row is None
+                or int(raw_row["id"]) != int(raw_id)
+                or str(raw_row["content_sha256"]) != content_sha256
+                or str(raw_row["analysis_status"] or "") != "running"
+                or int(raw_row["analysis_generation"] or 0) != int(generation)
+            ):
                 return None
 
             attempt_latency_ms = max(0, int(result.get("latency_ms") or 0))
@@ -2308,6 +2726,13 @@ class Store:
             cumulative_latency_ms = (
                 max(0, int(raw_row["analysis_latency_ms"] or 0))
                 + attempt_latency_ms
+            )
+            request_ids = self._upload_request_ids_for_transcript_with_conn(
+                c,
+                student_id,
+                session_id,
+                content_sha256,
+                ("pending", "running"),
             )
 
             report_id = self._add_report_with_conn(
@@ -2338,7 +2763,7 @@ class Store:
                    WHERE id = ?""",
                 (
                     attempt_count,
-                    str(result.get("model") or "")[:200],
+                    str(result.get("model") or "").strip()[:200],
                     str(result.get("prompt_hash") or "")[:128],
                     cumulative_latency_ms,
                     report_id,
@@ -2352,19 +2777,31 @@ class Store:
                        analysis_prompt_hash = ?,
                        analysis_latency_ms = ?,
                        analysis_attempts = ?
-                   WHERE id = ? AND content_sha256 = ?""",
+                   WHERE id = ? AND student_id = ? AND session_id = ?
+                     AND content_sha256 = ? AND analysis_status = 'running'
+                     AND analysis_generation = ?""",
                 (
-                    str(result.get("model") or "")[:200],
+                    str(result.get("model") or "").strip()[:200],
                     str(result.get("prompt_hash") or "")[:128],
                     cumulative_latency_ms,
                     attempt_count,
-                    raw_row["id"],
+                    raw_id,
+                    student_id,
+                    session_id,
                     content_sha256,
+                    generation,
                 ),
             ).rowcount
             if updated != 1:
                 raise sqlite3.IntegrityError("bulk transcript changed during analysis commit")
-            return report_id
+            c.execute(
+                """UPDATE upload_request_sessions
+                   SET analysis_status = 'done', analysis_error = '', updated_at = ?
+                   WHERE student_id = ? AND session_id = ? AND sha = ?
+                     AND analysis_status IN ('pending', 'running')""",
+                (now, student_id, session_id, content_sha256),
+            )
+            return {"report_id": report_id, "request_ids": request_ids}
 
     def recent_analyses(
         self,

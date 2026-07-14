@@ -651,6 +651,13 @@ def test_lifespan_marks_interrupted_parent_and_child_failed_for_retry(tmp_path):
         [{"seq": 1, "role": "user", "text": "recover me"}],
         "raw recover", "sha-recover",
     )
+    store.set_raw_transcript_analysis_status(
+        "sess-crash",
+        "student-a",
+        status="running",
+        content_sha256="sha-recover",
+        increment_attempt=True,
+    )
     service.mark_transfer(request_id, "student-a", "running")
     service.register_session(request_id, "student-a", "sess-crash", "sha-recover")
     service.mark_session_analysis(
@@ -670,6 +677,12 @@ def test_lifespan_marks_interrupted_parent_and_child_failed_for_retry(tmp_path):
     assert parent["analysis_error"] == "analysis interrupted; retry"
     assert child["analysis_status"] == "failed"
     assert child["analysis_error"] == "analysis interrupted; retry"
+    interrupted_raw = rebuilt_store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-crash", "sha-recover"
+    )
+    assert interrupted_raw is not None
+    assert interrupted_raw["analysis_status"] == "failed"
+    assert interrupted_raw["analysis_error"] == "analysis interrupted; retry"
 
     with TestClient(rebuilt_app) as client:
         retried = client.post(
@@ -679,6 +692,74 @@ def test_lifespan_marks_interrupted_parent_and_child_failed_for_retry(tmp_path):
     assert retried.status_code == 202
     assert rebuilt_store.get_upload_request(request_id)["analysis_status"] == "done"
     assert rebuilt_store.list_upload_request_sessions(request_id)[0]["analysis_status"] == "done"
+    retried_raw = rebuilt_store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-crash", "sha-recover"
+    )
+    assert retried_raw is not None
+    assert retried_raw["analysis_status"] == "done"
+    assert retried_raw["analysis_attempts"] == 2
+
+
+def test_lifespan_projects_committed_child_done_instead_of_failing_parent(tmp_path):
+    app, store = _build_app(tmp_path, enable_llm=True)
+    service = app.state.context.upload_svc
+    request_id = service.create("mentor-1", "student-a", session_id="sess-committed")
+    store.replace_session_messages(
+        "sess-committed",
+        "student-a",
+        [{"seq": 1, "role": "user", "text": "committed before crash"}],
+        "raw committed",
+        "sha-committed",
+    )
+    store.queue_raw_transcript_analysis(
+        student_id="student-a",
+        session_id="sess-committed",
+        content_sha256="sha-committed",
+    )
+    service.register_session(
+        request_id, "student-a", "sess-committed", "sha-committed"
+    )
+    service.mark_transfer(request_id, "student-a", "running")
+    service.mark_transfer(request_id, "student-a", "stored")
+    claim = store.claim_raw_transcript_analysis(
+        student_id="student-a",
+        session_id="sess-committed",
+        content_sha256="sha-committed",
+        prompt_hash="prompt-hash",
+    )
+    assert claim["state"] == "claimed"
+    service.refresh_parent_analysis(request_id, "student-a")
+    committed = store.commit_bulk_analysis_if_current(
+        student_id="student-a",
+        session_id="sess-committed",
+        content_sha256="sha-committed",
+        raw_id=claim["raw_id"],
+        generation=claim["generation"],
+        result={
+            "topic": "committed",
+            "understanding": "medium",
+            "severity": "info",
+            "diagnosis": "committed before parent refresh",
+            "model": "provider-model",
+            "prompt_hash": "prompt-hash",
+            "latency_ms": 1,
+        },
+        session_title="",
+        msg_count=1,
+    )
+    assert committed is not None
+    assert store.list_upload_request_sessions(request_id)[0]["analysis_status"] == "done"
+    assert store.get_upload_request(request_id)["analysis_status"] == "running"
+
+    rebuilt_app, rebuilt_store = _build_app(tmp_path, enable_llm=True)
+    with TestClient(rebuilt_app):
+        pass
+
+    parent = rebuilt_store.get_upload_request(request_id)
+    child = rebuilt_store.list_upload_request_sessions(request_id)[0]
+    assert child["analysis_status"] == "done"
+    assert parent["analysis_status"] == "done"
+    assert parent["analysis_error"] == ""
 
 
 def _add_request_child(service, store, request_id, session_id, sha, final_status):

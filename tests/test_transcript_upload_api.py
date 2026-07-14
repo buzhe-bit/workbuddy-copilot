@@ -5,6 +5,7 @@ import json
 import sqlite3
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from copilot import service as service_module
@@ -19,6 +20,7 @@ from copilot.service import (
 )
 from copilot.services import AnalysisService, MessageService, SessionQueryService
 from copilot.store import Store
+from copilot.upload_service import UploadRequestService
 
 
 TOKEN = "upload-token"
@@ -421,6 +423,66 @@ def test_post_transcript_same_sha_skips_parse_store_and_llm(tmp_path):
             "SELECT COUNT(*) FROM messages WHERE session_id = ?",
             ("sess-upload",),
         ).fetchone()[0] == 2
+
+
+def test_same_sha_route_uses_post_registration_raw_state_for_retry(
+    tmp_path,
+    monkeypatch,
+):
+    app, store, _registry, llm_calls = _build_upload_app(tmp_path)
+    upload_svc = app.state.context.upload_svc
+    request_id = upload_svc.create("mentor", "student-a", request_id="request-race")
+    real_register = upload_svc.register_session
+
+    with TestClient(app) as client:
+        store.replace_session_messages(
+            "sess-register-race",
+            "student-a",
+            [{"seq": 0, "role": "user", "text": "retry me", "ts": 1.0}],
+            _transcript(),
+            "sha-register-race",
+        )
+        store.set_raw_transcript_analysis_status(
+            "sess-register-race",
+            "student-a",
+            status="running",
+            content_sha256="sha-register-race",
+            increment_attempt=True,
+        )
+
+        def fail_worker_before_register(*args, **kwargs):
+            store.set_raw_transcript_analysis_status(
+                "sess-register-race",
+                "student-a",
+                status="failed",
+                error_message="analysis RuntimeError",
+                content_sha256="sha-register-race",
+            )
+            return real_register(*args, **kwargs)
+
+        monkeypatch.setattr(upload_svc, "register_session", fail_worker_before_register)
+        response = client.post(
+            "/api/student/sessions/sess-register-race/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": "must use persisted raw",
+                "sha": "sha-register-race",
+                "request_id": request_id,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["analysis_scheduled"] is True
+    assert response.json()["retry_analysis"] is True
+    assert len(llm_calls) == 1
+    raw = store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-register-race", "sha-register-race"
+    )
+    assert raw is not None
+    assert raw["analysis_status"] == "done"
+    child = store.list_upload_request_sessions(request_id)[0]
+    assert child["analysis_status"] == "done"
 
 
 def test_get_known_defaults_to_legacy_manifest_and_v2_is_explicit(tmp_path):
@@ -950,7 +1012,7 @@ def test_stale_bulk_analysis_result_is_discarded_after_new_sha_replaces_it(tmp_p
             started.set()
             await release.wait()
             return {
-                "topic": "stale A",
+                "topic": "fresh B" if latest_prompt == "B prompt" else "stale A",
                 "understanding": "medium",
                 "severity": "info",
                 "diagnosis": "must be discarded",
@@ -1009,6 +1071,162 @@ def test_stale_bulk_analysis_result_is_discarded_after_new_sha_replaces_it(tmp_p
         assert current["analysis_attempts"] == 0
         assert [event for event in events if event.get("type") == "analysis"] == []
 
+        fresh_result = await _analyze_uploaded_session_background(
+            context, "student-a", "sess-race", turns_b, "sha-b"
+        )
+        assert fresh_result == (True, "")
+        refreshed = store.get_raw_transcript_for_student_session_sha(
+            "student-a", "sess-race", "sha-b"
+        )
+        assert refreshed is not None
+        assert refreshed["analysis_status"] == "done"
+        assert refreshed["analysis_attempts"] == 1
+        assert refreshed["analysis_generation"] == 2
+        analyses = store.recent_analyses(
+            "student-a", limit=10, session_id="sess-race"
+        )
+        assert [analysis["topic"] for analysis in analyses] == ["fresh B"]
+        assert len([event for event in events if event.get("type") == "analysis"]) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("same_request_id", [True, False])
+def test_concurrent_same_sha_analysis_has_one_claim_and_fans_out_request_terminal_state(
+    tmp_path,
+    same_request_id,
+):
+    async def scenario():
+        store = Store(tmp_path / "copilot.db")
+        bus = EventBus()
+        events: list[dict[str, Any]] = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+        llm_calls = 0
+
+        async def collect(payload):
+            events.append(payload)
+
+        async def blocked_llm(config, snap, event, latest_prompt):
+            nonlocal llm_calls
+            llm_calls += 1
+            started.set()
+            await release.wait()
+            return AnalysisOutcome(
+                ok=True,
+                value={
+                    "topic": "single claim",
+                    "understanding": "medium",
+                    "off_topic": False,
+                    "stuck_at": "",
+                    "is_technical": True,
+                    "severity": "info",
+                    "diagnosis": "one worker owns this transcript generation",
+                    "suggestion": "continue",
+                    "progress": "ok",
+                    "guidance": "ok",
+                    "alert": "",
+                    "ai_reply_summary": "single claim",
+                },
+                model="provider-resolved-model",
+            )
+
+        bus.subscribe(collect)
+        config = {"service": {"analysis_max_concurrency": 4}, "llm": {}}
+        upload_svc = UploadRequestService(store)
+        context = AppContext(
+            config=config,
+            store=store,
+            analysis_svc=AnalysisService(store, blocked_llm, config, bus),
+            session_svc=SessionQueryService(store, config),
+            message_svc=MessageService(store, bus),
+            bus=bus,
+            ws_registry=WSRegistry(send_timeout=0.05),
+            upload_svc=upload_svc,
+        )
+        student_id = "student-a"
+        session_id = "sess-claim"
+        sha = "sha-claim"
+        turns = [{"seq": 0, "role": "user", "text": "claim prompt", "ts": 1.0}]
+        store.replace_session_messages(
+            session_id, student_id, turns, "full transcript", sha
+        )
+        store.set_raw_transcript_analysis_status(
+            session_id,
+            student_id,
+            status="pending",
+            content_sha256=sha,
+        )
+
+        request_ids = [
+            upload_svc.create("mentor", student_id, request_id="request-one"),
+        ]
+        if same_request_id:
+            request_ids.append(request_ids[0])
+        else:
+            request_ids.append(
+                upload_svc.create("mentor", student_id, request_id="request-two")
+            )
+        for request_id in dict.fromkeys(request_ids):
+            upload_svc.register_session(
+                request_id, student_id, session_id, sha, analysis_status="pending"
+            )
+            upload_svc.mark_transfer(request_id, student_id, "running")
+            upload_svc.mark_transfer(request_id, student_id, "stored")
+        context.upload_svc = None
+
+        first = asyncio.create_task(_analyze_uploaded_session_background(
+            context,
+            student_id,
+            session_id,
+            turns,
+            sha,
+            request_id=request_ids[0],
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        second = asyncio.create_task(_analyze_uploaded_session_background(
+            context,
+            student_id,
+            session_id,
+            turns,
+            sha,
+            request_id=request_ids[1],
+        ))
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if second.done() or llm_calls > 1:
+                break
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+
+        assert llm_calls == 1
+        raw = store.get_raw_transcript_for_student_session_sha(
+            student_id, session_id, sha
+        )
+        assert raw is not None
+        assert raw["analysis_status"] == "done"
+        assert raw["analysis_attempts"] == 1
+        assert raw["analysis_generation"] == 1
+        analyses = store.recent_analyses(student_id, limit=10, session_id=session_id)
+        assert len(analyses) == 1
+        assert analyses[0]["topic"] == "single claim"
+        with store._conn() as conn:
+            report_count = conn.execute(
+                "SELECT COUNT(*) FROM reports WHERE session_id = ? AND event = 'BulkUpload'",
+                (session_id,),
+            ).fetchone()[0]
+        assert report_count == 1
+        assert len([
+            event for event in events
+            if event.get("type") == "analysis" and event.get("event") == "BulkUpload"
+        ]) == 1
+        for request_id in dict.fromkeys(request_ids):
+            child = store.list_upload_request_sessions(request_id)[0]
+            parent = store.get_upload_request(request_id)
+            assert child["analysis_status"] == "done"
+            assert parent is not None
+            assert parent["analysis_status"] == "done"
+
     asyncio.run(scenario())
 
 
@@ -1062,6 +1280,158 @@ def test_missing_target_sha_is_rejected_before_bulk_llm_call(tmp_path):
         assert current["analysis_prompt_hash"] == ""
 
     asyncio.run(scenario())
+
+
+def test_bulk_generation_rejects_old_worker_after_a_b_a_replacement(tmp_path):
+    store = Store(tmp_path / "copilot.db")
+    student_id = "student-a"
+    session_id = "sess-aba"
+
+    def replace(sha, prompt):
+        turns = [{"seq": 0, "role": "user", "text": prompt, "ts": 1.0}]
+        store.replace_session_messages(
+            session_id, student_id, turns, f"raw {prompt}", sha
+        )
+        store.set_raw_transcript_analysis_status(
+            session_id,
+            student_id,
+            status="pending",
+            content_sha256=sha,
+        )
+
+    def result(topic):
+        return {
+            "topic": topic,
+            "understanding": "medium",
+            "off_topic": False,
+            "stuck_at": "",
+            "is_technical": True,
+            "severity": "info",
+            "diagnosis": topic,
+            "suggestion": "",
+            "progress": "",
+            "guidance": "",
+            "alert": "",
+            "confidence": 0.8,
+            "evidence": [],
+            "model": "provider-model",
+            "prompt_hash": "prompt-hash",
+            "latency_ms": 1,
+        }
+
+    replace("sha-a", "old A")
+    old_claim = store.claim_raw_transcript_analysis(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256="sha-a",
+        prompt_hash="old-hash",
+    )
+    assert old_claim["state"] == "claimed"
+    assert old_claim["generation"] == 1
+
+    replace("sha-b", "B")
+    replace("sha-a", "new A")
+    new_claim = store.claim_raw_transcript_analysis(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256="sha-a",
+        prompt_hash="new-hash",
+    )
+    assert new_claim["state"] == "claimed"
+    assert new_claim["generation"] == 2
+
+    stale_commit = store.commit_bulk_analysis_if_current(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256="sha-a",
+        raw_id=old_claim["raw_id"],
+        generation=old_claim["generation"],
+        result=result("old A must not persist"),
+        session_title="",
+        msg_count=1,
+    )
+    assert stale_commit is None
+    assert store.recent_analyses(student_id, limit=10, session_id=session_id) == []
+
+    committed = store.commit_bulk_analysis_if_current(
+        student_id=student_id,
+        session_id=session_id,
+        content_sha256="sha-a",
+        raw_id=new_claim["raw_id"],
+        generation=new_claim["generation"],
+        result=result("new A persists"),
+        session_title="",
+        msg_count=1,
+    )
+    assert committed is not None
+    raw = store.get_raw_transcript_for_student_session_sha(
+        student_id, session_id, "sha-a"
+    )
+    assert raw is not None
+    assert raw["analysis_status"] == "done"
+    assert raw["analysis_attempts"] == 1
+    assert raw["analysis_generation"] == 2
+    assert [analysis["topic"] for analysis in store.recent_analyses(
+        student_id, limit=10, session_id=session_id
+    )] == ["new A persists"]
+
+
+def test_same_sha_replacement_and_queue_cannot_reopen_running_claim(tmp_path):
+    store = Store(tmp_path / "copilot.db")
+    original_turns = [
+        {"seq": 0, "role": "user", "text": "original prompt", "ts": 1.0}
+    ]
+    store.replace_session_messages(
+        "sess-route-race",
+        "student-a",
+        original_turns,
+        "original raw",
+        "sha-route-race",
+    )
+    store.set_raw_transcript_analysis_status(
+        "sess-route-race",
+        "student-a",
+        status="pending",
+        content_sha256="sha-route-race",
+    )
+    claim = store.claim_raw_transcript_analysis(
+        student_id="student-a",
+        session_id="sess-route-race",
+        content_sha256="sha-route-race",
+        prompt_hash="prompt-hash",
+    )
+    assert claim["state"] == "claimed"
+
+    stored = store.replace_session_messages(
+        "sess-route-race",
+        "student-a",
+        [{"seq": 0, "role": "user", "text": "duplicate must not replace", "ts": 2.0}],
+        "duplicate raw",
+        "sha-route-race",
+    )
+    queued = store.queue_raw_transcript_analysis(
+        student_id="student-a",
+        session_id="sess-route-race",
+        content_sha256="sha-route-race",
+    )
+
+    assert stored == 1
+    assert queued == 0
+    raw = store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-route-race", "sha-route-race"
+    )
+    assert raw is not None
+    assert raw["content"] == "original raw"
+    assert raw["analysis_status"] == "running"
+    assert raw["analysis_attempts"] == 1
+    assert raw["analysis_generation"] == 1
+    with store._conn() as conn:
+        messages = conn.execute(
+            """SELECT text FROM messages
+               WHERE session_id = ? AND source = 'bulk' ORDER BY id""",
+            ("sess-route-race",),
+        ).fetchall()
+    assert [row["text"] for row in messages] == ["original prompt"]
 
 
 def test_stop_and_bulk_analysis_share_configured_concurrency_gate(tmp_path):

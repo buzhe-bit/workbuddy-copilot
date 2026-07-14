@@ -301,7 +301,7 @@ class TestAnalyze:
         assert result.ok is False
         assert result.value["topic"] == "网络失败"
         assert result.error == "LLM provider TimeoutError"
-        assert result.model == "model"
+        assert result.model == ""
         assert len(result.prompt_hash) == 64
         assert result.latency_ms >= 0
         assert "provider timed out" not in caplog.text
@@ -346,6 +346,7 @@ class TestAnalyze:
 
         assert result.ok is False
         assert result.error == "LLM provider HTTP 503"
+        assert result.model == ""
         assert "secret provider response" not in (result.error or "")
 
     @pytest.mark.asyncio
@@ -355,7 +356,10 @@ class TestAnalyze:
                 return None
 
             def json(self):
-                return {"choices": [{"message": {"content": "not-json"}}]}
+                return {
+                    "model": "provider-json-model",
+                    "choices": [{"message": {"content": "not-json"}}],
+                }
 
         class FakeClient:
             def __init__(self, timeout):
@@ -385,6 +389,59 @@ class TestAnalyze:
         assert result.ok is False
         assert result.value["topic"] == "解析失败"
         assert "JSON" in (result.error or "")
+        assert result.model == "provider-json-model"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("response_model", "expected_model"),
+        [
+            (
+                "  provider-resolved-" + ("x" * 300) + "  ",
+                ("provider-resolved-" + ("x" * 300))[:200],
+            ),
+            (" \t\n ", ""),
+        ],
+    )
+    async def test_provider_success_uses_bounded_response_model_not_requested_alias(
+        self, monkeypatch, response_model, expected_model
+    ):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "model": response_model,
+                    "choices": [{"message": {"content": '{"topic":"valid"}'}}],
+                }
+
+        class FakeClient:
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json, headers):
+                assert json["model"] == "requested-alias"
+                return FakeResponse()
+
+        monkeypatch.setattr("copilot.llm.httpx.AsyncClient", FakeClient)
+        result = await analyze({
+            "llm": {
+                "enable_llm": True,
+                "api_key": "sk-test",
+                "model": "requested-alias",
+                "api_base": "https://llm.example/v1",
+            }
+        }, TranscriptSnapshot(), "Stop", "hi")
+
+        assert result.ok is True
+        assert result.model == expected_model
+        assert len(result.model) <= 200
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -436,7 +493,7 @@ class TestAnalyze:
         assert result.value["topic"] == expected_topic
         assert result.value["diagnosis"] == "kept"
         assert result.error is None
-        assert result.model == "model"
+        assert result.model == ""
         assert len(result.prompt_hash) == 64
 
 

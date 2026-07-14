@@ -380,9 +380,9 @@ async def analyze(
         )
 
     user_prompt = build_user_prompt(snap, event, latest_prompt)
-    model = str(llm_cfg["model"])
+    requested_model = str(llm_cfg["model"])
     payload = {
-        "model": model,
+        "model": requested_model,
         "messages": [
             {"role": "system", "content": build_system_prompt(cfg)},
             {"role": "user", "content": user_prompt},
@@ -402,6 +402,10 @@ async def analyze(
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+            response_model = data.get("model") if isinstance(data, dict) else None
+            provider_model = (
+                response_model.strip()[:200] if isinstance(response_model, str) else ""
+            )
             content = data["choices"][0]["message"]["content"]
             value = _parse_json_content(content)
             try:
@@ -413,7 +417,7 @@ async def analyze(
                     ok=False,
                     value=value,
                     error=error,
-                    model=model,
+                    model=provider_model,
                     prompt_hash=prompt_hash,
                     latency_ms=_elapsed_ms(started_at),
                 )
@@ -421,7 +425,7 @@ async def analyze(
             return AnalysisOutcome(
                 ok=True,
                 value=value,
-                model=model,
+                model=provider_model,
                 prompt_hash=prompt_hash,
                 latency_ms=_elapsed_ms(started_at),
             )
@@ -435,7 +439,7 @@ async def analyze(
         ok=False,
         value=_fallback(snap, event),
         error=error,
-        model=model,
+        model="",
         prompt_hash=prompt_hash,
         latency_ms=_elapsed_ms(started_at),
     )

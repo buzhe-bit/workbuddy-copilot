@@ -2044,3 +2044,27 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | 修正 fixture 后独立非 e2e 复跑 | 628 passed / 2 个已登记失败；无 Task 3 新失败。 |
 | 完整 3.14 沙箱诊断 | 627 passed / 3 failed / 29 errors；29 error 均为 loopback bind 权限；其中旧 Store fixture 已按 owner 新合同修正并在 177 项中转绿。剩余两项为已登记的 3.14 `fcntl` 探针与端口型 single-worker 门。 |
 | 详细行为/RED-GREEN | 见 `.superpowers/sdd/task-3-report.md`。 |
+
+### Task 3 独立 Review 修复：claim、provenance 与 ask-first — 2026-07-14
+
+- Bulk 改为 `raw_id + SHA + analysis_generation` 专用 SQLite claim/commit/fail；
+  attempts 仍按当前 SHA 统计，generation 不清零以防 A→B→A ABA。同一 raw 的终态在
+  事务内 fanout 到同/异 request_id child，启动恢复同步释放 raw running。
+- 关闭同 SHA TOCTOU：retry 不再用通用 setter 重置 pending；queue 只做
+  `''/skipped -> pending` CAS；duplicate bulk replace 在事务内识别当前同 SHA 并 no-op。
+- `AnalysisOutcome.model` 只采信 provider JSON 中 trim 后的 200 字符内字符串；
+  缺失、空白、HTTP/网络失败均为空。
+- 未知 session 在 ask 调用 LLM 前用 `BEGIN IMMEDIATE` ensure-or-create owner；后到绑定者
+  失败，先到 ask 成功落库。已知异 owner 仍为 LLM 前 409。
+
+| 阶段 | 结果 |
+|---|---|
+| RED | 三文件 9 failed / 75 passed；同/异 request_id 并发均 LLM=2，model 误写 alias，首问 A 被 B 抢占后 409 |
+| I2/I3 聚焦 GREEN | 52 passed；随后 whitespace provider model 边界也纳入回归 |
+| I1 边界 GREEN | 并发单 claim、跨 request fanout、A→B→A、stale 后新 SHA、duplicate replace/queue、重启 retry-done 全部通过 |
+| 崩溃/注册窗口复核 | 新增 raw/child done 但 parent running 的启动聚合回归，以及旧 running 快照后注册为 pending 的路由调度回归；均先 RED 后 GREEN |
+| Task 3 七文件 | 184 passed / 1 个既有 warning |
+| Task 2 相邻四文件 + 新恢复回归 | 123 passed / 1 个既有 warning |
+| 非 e2e 全量（3.14 诊断） | 636 passed / 2 个已登记基线 failed / 1 warning；沙箱外复跑端口用例仍复现多 worker 短暂 `/health` |
+| 修复后独立再审 | Critical 0 / Important 0；相关四文件 111 passed |
+| 详细合同 | 见 `.superpowers/sdd/task-3-report.md` 的“独立审查修复附录” |
