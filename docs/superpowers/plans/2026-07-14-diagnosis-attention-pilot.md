@@ -6,7 +6,7 @@
 
 **Architecture:** 服务端继续以 FastAPI 路由调用 Service，Service 通过 Store 持久化并经 EventBus/WSRegistry 推送。Hook 仍 stdlib-only，Student Core 仍负责 spool/HTTP/WS/回执。新增 attention 是已持久化 analysis/student_ask/system 结果的可重建投影，不引入 broker、Redis、多 worker 或前端框架。
 
-**Tech Stack:** Python 3.13, FastAPI, SQLite, asyncio/websockets, stdlib Hook, PyObjC macOS adapter, static HTML/CSS/JS, pytest, pytest-asyncio, Playwright, GitHub Actions.
+**Tech Stack:** Python 3.13, FastAPI, SQLite, asyncio/websockets, stdlib Hook, PyObjC macOS adapter, tkinter/ctypes Windows adapter, PowerShell, static HTML/CSS/JS, pytest, pytest-asyncio, Playwright, GitHub Actions.
 
 ## Global Constraints
 
@@ -18,7 +18,8 @@
 - 消息“已送达”只能由学员端成功渲染并持久化后的 REST ack 产生，不得以 WebSocket 写入成功代替。
 - 业务行为变更必须 TDD：先运行新测试见到预期 RED，再实现 GREEN；Service 集成使用真临时 Store + 固定 fake LLM，不 mock 被测 Service。
 - 自动测试默认断网，使用独立临时 HOME/USERPROFILE/APPDATA/SQLite/spool/config；真 DeepSeek 只用于发布冒烟。
-- Windows W0/W1 没有真机证据时必须保持 `BLOCKED: real-machine evidence missing`，不得宣称可 rollout。
+- Windows 是一等交付端，不再只做 contract 骨架：必须实现 WorkBuddy 读取、Hook/spool、常驻 runtime、导师消息、问答反馈、历史上传、浮标 UI、安装升级卸载、登录自启和 Windows CI。W0/W1 没有真机证据只阻断 rollout 声明，不阻断可由合成 fixture 和 `windows-latest` 证明的开发。
+- Windows 浮标使用独立窄适配器，复用 Student Core 的状态与协议，不改写已经稳定的 macOS PyObjC NSPanel；Windows 合成 fixture 必须明确标为 synthetic，不得冒充真实 WorkBuddy 证据。
 - 导师建议只能填入输入框，不自动发送，保留人的判断。
 - AI 优先尝试解决学员问题；只有降级、未解决、连续低效或高置信风险才进入导师关注，不能把正常学习噪声推给导师。
 - 诊断、问答和导师干预必须能追溯到有界但充分的会话上下文、历史摘要和证据；不得为降成本丢掉判断所需上下文。
@@ -179,7 +180,7 @@
 - `auth.allow_shared_student_token` 在 local/demo 默认 true，public/prod 默认 false；映射 token 存在时请求中 student_id 必须一致。
 - `GET /api/mentor/system-status` 返回 `version, pending_analyses, failed_analyses, open_attention, float_connections, mentor_connections, windows_rollout_status`。
 
-- [ ] 先写学员 A token 访问/确认/上传/连接学员 B 的 HTTP/WS RED，每条必须 401/403 且不改数据。
+- [ ] 先建立 student route inventory 参数化 RED：学员 A token 不得通过显式或省略 student_id 读取/确认/同步/known SHA/upload status/ask/feedback/session/current/alerts/analysis catch-up/WS 等任何 B 数据；每条必须 401/403 且零副作用，省略 student_id 只能派生 A。
 - [ ] 实现 principal 依赖并接入所有 student REST/WS；保留 local/demo 共享 token 兼容。
 - [ ] 学员端始终传自己 student_id，服务端在 mapped 模式校验而不相信客户端作为权限源。
 - [ ] 先写 system-status 真 Store/WSRegistry 集成 RED，再实现受 mentor token 保护的状态接口和导师台故障提示。
@@ -187,7 +188,62 @@
 - [ ] 运行鉴权/多学员/真 WS 回归、P0/P1、全量回归和 `git diff --check`；追加 dev-log。
 - [ ] 提交 `feat: enforce student identity in pilot mode`。
 
-### Task 9: Plan E2 — 发布门、试点运行手册与最终核验
+### Task 9: Plan E2 — Windows runtime、WorkBuddy 数据与耐久链路
+
+**Files:**
+- Create: `copilot/student_core/process_liveness.py`, `copilot/student_core/transcript_jobs.py`, `copilot/student_platform/windows_runtime.py`
+- Create: `tests/fixtures/workbuddy/windows_synthetic/`, `tests/test_windows_runtime.py`, `tests/test_windows_liveness.py`, `tests/test_windows_workbuddy_integration.py`, `tests/component/test_windows_student_runtime.py`
+- Modify: `copilot/student_platform/workbuddy.py`, `copilot/student_platform/windows.py`, `copilot/student_core/spool.py`, `copilot/student_core/coordinator.py`, `copilot/student_core/transport.py`, `copilot/hook.py`, `copilot/wb_upload.py`, `copilot/models.py`, `copilot/store.py`, `copilot/service.py`, `start_student_agent.py`, `requirements-windows.txt`, `.github/workflows/quality.yml`
+
+**Interfaces:**
+- `ProcessIdentity(pid, started_at, owner_token)` 与 `ProcessLiveness.probe(identity) -> Literal["alive","dead","unknown","reused"]`；claim 持久化稳定 identity，只有 dead/reused 可自动回收，unknown fail closed 并进入健康状态。`--repair-claim <id> --expected-owner-token ... --reason ...` 只能在排他锁与匹配 identity 下写审计后修复，安装器不得静默清理。EventSpool 和 command claim 可注入，Windows 实现不调用 POSIX `os.kill(pid, 0)`。
+- `WindowsWorkBuddyProfile` 只接受显式 W0 manifest/profile；生产环境缺真实 profile 时 transcript 能力 fail closed。`TranscriptScanner.read/index(...)` 保留现有 POSIX descriptor scanner，Windows scanner 显式处理 reparse point、Unicode/UNC/长路径、sharing violation 和目录逃逸。
+- `TranscriptUploadQueue.enqueue(event_id, report_id, student_id, session_id)` 使用本地 SQLite/文件队列持久化 Stop 后全文补传；严格顺序为 `/report` 2xx → job durable commit → hook spool ack，全文 `/transcript` 2xx 后才删除 job，同 event_id/SHA 重放幂等。
+- 自动 Stop 全文补传的权威语义固定为 `analysis_mode=store_only`：客户端携带 source event/report，服务端只在其能关联同 student/session 的 Stop report 且无 mentor request 时接受；全文只补上下文，不再触发 BulkUpload 分析/attention。Stop 尾部诊断仍是唯一即时分析，导师主动 upload request 才显式分析全文。
+- `UploadOutcome(matched, attempted, accepted, skipped, failed, error_code)`；指定 session 必须恰好匹配且每个尝试都获服务端确认，不能把 `matched=0, failed=0` 当成功，只有 `complete=True` 才能写 command completion。
+- `AnalysisEnvelope(type, student_id, session_id, report_id, event, result, timestamp)` 作为 WS 与 catch-up 的同一 wire shape；新增 `GET /api/student/analyses?after_report_id=&limit=` 按 report_id ASC 分页，返回 next cursor/has_more。StudentCoordinator 增加可选 `analysis_handler`，WindowsMessageStore 只在持久化/渲染成功后推进 cursor。
+- analysis 恢复顺序固定为先建立 WS 并缓冲，再从本地 cursor 分页补拉至耗尽，再按 report_id 去重排空缓冲并进入实时；handler/store 失败不得推进 cursor。无 UI message_handler 的 headless runtime 不消费、不标 rendered、不 ack 导师消息，绝不伪造送达。
+- `WindowsStudentRuntime` 统一构建 WindowsWorkBuddyData、uploader、StudentTransport、StudentCoordinator、StudentAgent、Stop transcript job drain 和有界 session/analysis sync；`start_student_agent.py` 只负责参数与平台选择。
+- StudentTransport 保留同步兼容方法，新增 `post_hook_async/ack_message_async/get_pending_messages_async/get_recent_analyses_async`；Coordinator 必须优先调用 async 方法，旧同步 adapter 统一经 `asyncio.to_thread`，不得卡住唯一 WS 循环。
+
+- [ ] 先写 Windows liveness RED，覆盖 alive/dead/unknown/PID reused、陈旧 claim、多 Agent 抢占、unknown health/审计修复，并证明 Windows 路径不触发 `os.kill`、安装器不自动删 ambiguous claim。
+- [ ] 用明确标注 synthetic 的 Windows-shaped fixture 写 schema/JSONL/Unicode/mapping 解析 RED；sharing violation、reparse/junction 和长路径必须在 `windows-latest` 动态创建真实 Windows OS 对象验证，不能由静态 fixture 冒充。真实 UNC/SMB 与 WorkBuddy mapping 进入 W1；生产 mapping 只能来自 W0 manifest/profile，缺失时必须 typed blocked。
+- [ ] 先写 Windows runtime RED：uploader 不得为 None；导师上传命令、指定 session、部分失败不落 completion、重启续传、session sync、analysis 实时/补拉和 WS 重连均走共享 Student Core。
+- [ ] 写 Stop 全文耐久边界 RED：分别在 report 2xx 后、job commit 前后、spool ack 前后、全文发送响应丢失和进程重启时终止；最终 report/job/transcript 各一份，只有 Stop analysis/attention/模型调用各一份，自动全文补传不得产生第二份 BulkUpload 分析。
+- [ ] 写 analysis catch-up RED：断线期间产生超过两页、WS 建连与分页并发产生新分析、重启、重复实时/补拉、handler/store 失败与跨学员参数；最终按 report_id 无漏无重，失败不推进 cursor。
+- [ ] 写 headless handler RED：message_handler 缺失或失败时导师消息保持未 ack；接上真实耐久 inbox/UI handler 后才允许现有 REST ack。
+- [ ] 修正 Hook 尾读失败语义：transcript 暂时被锁时仍写入空 tail 事件并在 2 秒内 exit 0，不静默丢 Stop。
+- [ ] 将 Student Core 的同步 HTTP 移出 event loop；用阻塞 opener 证明 spool flush 不阻断 WS 收包、导师消息或 stop。
+- [ ] 在 `windows-latest` 安装 core + windows + server + dev requirements，只收集 `windows and not real_machine`，跑 Windows adapter/install、Hook 真子进程、spool、transport、coordinator、agent、SQLite 和真 uvicorn loopback HTTP/WS，不再只跑 import contract；critical 用例不得 skip。W1 使用独立 runner/marker，缺证据输出 BLOCKED artifact 而非 hosted skip。
+- [ ] 运行 Windows 聚焦、Linux/macOS 相邻回归、P0/P1、全量回归和 `git diff --check`；追加 dev-log。
+- [ ] 提交 `feat: add durable Windows student runtime`。
+
+### Task 10: Plan E3 — Windows 浮标、安装生命周期与一等 CI
+
+**Files:**
+- Create: `copilot/floating_windows.py`, `start_windows_client.py`, `uninstall_windows.ps1`, `run_windows_w1.ps1`, `scripts/validate_windows_evidence.py`
+- Create: `tests/test_floating_windows.py`, `tests/test_windows_runtime_config.py`, `tests/test_windows_installer_lifecycle.py`, `tests/test_windows_evidence.py`, `tests/test_student_ask_idempotency.py`, `tests/component/test_windows_client_runtime.py`
+- Create: `tests/fixtures/workbuddy/windows/evidence.schema.json`, `docs/windows-evidence-template.json`
+- Modify: `copilot/student_core/transport.py`, `copilot/models.py`, `copilot/store.py`, `copilot/service.py`, `copilot/app_context.py`, `install_windows.ps1`, `register_hook.py`, `probe_windows_workbuddy.ps1`, `config.example.json`, `requirements-windows.txt`, `.github/workflows/quality.yml`, `README.md`, `docs/test-plan-v3.md`
+
+**Interfaces:**
+- `WindowsStudentView` 使用 tkinter/Windows API 的独立窄适配器：置顶可拖拽浮标、未读角标、消息/诊断面板、可靠当前会话或人工 session selector、提问、answered/degraded/failed、helpful/unresolved；不得 import 或修改 macOS PyObjC UI，无法可靠判断 active session 时不得把最近会话冒充当前。
+- `WindowsMessageStore` 分别保留最多 300 条终态导师消息与 300 条终态诊断；pending/unrendered/ack-pending 永不因容量裁剪，终态按稳定时间/id 淘汰。mentor message 按 message_id、analysis 按 report_id 去重。UI 先幂等 upsert+render，成功返回后 Core ReceiptLedger 才记录 rendered 并调用现有单一 REST ack；两个 SQLite 写入之间崩溃时重放只补状态、不重复展示，不新增虚构的两阶段服务端回执。
+- 学员提问增加可选向后兼容 `client_request_id`，服务端以 `(student_id, client_request_id)` 非空唯一；重复 POST 返回同一 pending/terminal ask 且不重复调用模型，并提供按 client_request_id 查询恢复。Windows 本地先持久 pending request，响应丢失后查询恢复再决定是否重试。
+- `start_windows_client.py --config ... [--health-check]` 以 named mutex/稳定 lock 强制 single instance，Tk 在主线程，StudentAgent 在专用 non-daemon 线程和独立 asyncio loop；UI bridge 使用有界 Future/timeout，关闭/登出/关机时 bounded `agent.stop()` + join。UI pump 与 Agent loop 分别写 heartbeat 和滚动日志。
+- 安装器固定 Python 3.13，使用显式 configDir/student/state/log 路径；token 只允许无回显交互输入或预置 `-TokenFile`，先校验来源 ACL，再写入已关闭权限继承且仅当前用户可读的 state 目录。原子 merge WorkBuddy settings，注册“仅用户登录且交互式”任务并配置失败重启；重复安装/升级幂等。卸载只按 owned-entry 标识移除 Copilot hook/task/venv；整份备份仅在 hash 未变化时恢复，绝不覆盖安装后新增的用户 hooks。
+- `windows_rollout_status` 只能由 evidence validator 计算：artifact 必须通过 schema、hash 且匹配当前 commit/build；否则保持 `implementation_candidate` 或 blocked，普通配置布尔值不能宣称 rollout_ready。
+
+- [ ] 先写纯 view-model/Tk adapter RED，覆盖浮标展开、未读、导师消息、实时/重启诊断、可靠/未知/手选 session、提问三态、反馈重试、键盘焦点、125%/150% DPI 和多屏边界。
+- [ ] 写真 Student Core + 假 UI 线程桥接 RED：响应丢失、断网、重启、300+ pending/terminal 历史、WS/REST 重复到达和 MessageStore→ReceiptLedger 两写之间崩溃均只展示一次；非终态不得被裁剪，handler 失败不得 ack，渲染并持久化后才调用现有 REST ack。
+- [ ] 增加 ask/feedback 的 StudentTransport 接口并接入 Windows UI；先写 client_request_id 重复 POST、响应丢失、进程重启和查询恢复 RED，确保只调用一次模型。token 派生身份必须沿用 Task 8，不允许 UI 覆盖其他 student_id。
+- [ ] 先写 PowerShell 生命周期 RED：3.13 preflight、无回显/ACL 校验 TokenFile 输入、原子临时文件与 owned-entry merge、当前用户 ACL 保护 token/config/message DB/log/backup 且 token 不进命令行、Task action、日志或 PowerShell history，幂等安装/升级、交互式 Task Scheduler 自启/重启、single-instance、健康检查、hash-safe 回滚和卸载。
+- [ ] 在 `windows-latest` 跑 headless UI presenter、runtime、PowerShell parser/contract 和真 loopback component test；任何 critical skip 失败。DPI/多屏 hosted 用例只证明计算/调用合同，实际截图、焦点、拖动、置顶、WorkBuddy/Git Bash Hook、杀软、中文用户目录、休眠唤醒和自启动必须由 W1 真机证明。
+- [ ] 扩展 W0 probe、实现 evidence schema/validator 与 W1 runner，并把匹配当前 commit/build 的验证结果接回受鉴权 system-status；无真机证据时状态保持 `BLOCKED: real-machine evidence missing`，但不得再把 Windows 功能实现标成“后置”。
+- [ ] 运行 Windows 聚焦、Linux/macOS 相邻回归、P0/P1、全量回归和 `git diff --check`；追加 dev-log。
+- [ ] 提交 `feat: deliver first-class Windows student client`。
+
+### Task 11: Plan E4 — 双平台发布门、试点运行手册与最终核验
 
 **Files:**
 - Create: `docs/pilot-runbook.md`, `docs/quality-baseline.md`
@@ -195,16 +251,17 @@
 
 **Interfaces:**
 - 试点规模固定 3–5 名学员、1–2 名导师、7 天。
-- 发布记录必须含 commit SHA、Python/WorkBuddy/macOS 版本、测试数、critical skip、诊断指标、真机结果和回滚命令。
+- 发布记录必须含 commit SHA、Python/WorkBuddy/macOS/Windows 版本与 build、Windows CPU 架构、测试数、critical skip、诊断指标、evidence artifact hash、installer state manifest、真机结果和回滚命令。
+- Windows 状态分为 `implementation_candidate`（hosted CI 通过）和 `rollout_ready`（W0/W1 真机通过）；缺 W0/W1 时可以完成代码候选，但 Task 11 不得标成双平台试点发布成功。
 
-- [ ] 编写 Mac 安装、Hook、休眠唤醒、断网恢复、原生浮标、删除试点数据和回滚的可执行清单。
-- [ ] 记录本地环境无 Python 3.13、人工双标注未完成、7 天试点未运行等外部门为 blocked，不伪造通过。
-- [ ] 在可用环境运行 Python 3.13 全量、Linux/macOS/Windows contract lane、真 Playwright 三 viewport、数据库迁移重开和 `git diff --check`。
-- [ ] 核对总需求：event_id 10 次去重、202 后重启恢复、消息不重渲染、同 SHA 仅重试诊断、身份隔离、attention mentor-only、60 条评测和三 viewport。
+- [ ] 分别编写 Mac 与 Windows 的安装、Hook、休眠唤醒、断网恢复、原生浮标、删除试点数据和回滚可执行清单。
+- [ ] 记录本地环境无 Python 3.13、人工双标注未完成、Windows W0/W1 或 7 天试点未运行等外部门为 blocked，不伪造通过。
+- [ ] 在可用环境运行 Python 3.13 全量、Linux server、macOS client/browser、Windows client/system lane、真 Playwright 三 viewport、数据库迁移重开和 `git diff --check`。
+- [ ] 核对总需求：event_id 10 次去重、202 后重启恢复、Stop 全文补传不丢、消息/诊断不重渲染、同 SHA 仅重试诊断、身份隔离、attention mentor-only、60 条评测、三 viewport，以及 Windows transcript 精确读取、导师消息一次展示、ask/feedback、安装升级卸载无设置丢失、重启/休眠、DPI/多屏、登录自启和完整身份隔离。
 - [ ] 触发最终全分支 code review，修复所有 Critical/Important 发现并重验。
 - [ ] 提交 `docs: add pilot release gates and runbook`。
 
-### Task 10: Plan F — 百人级容量、故障与浸泡验证
+### Task 12: Plan F — 百人级容量、故障与浸泡验证
 
 **Files:**
 - Create: `copilot/scale_validation.py`, `scripts/run_scale_validation.py`
@@ -227,7 +284,7 @@
 - [ ] 运行聚焦、P0/P1、全量回归和 `git diff --check`；追加 dev-log。
 - [ ] 提交 `test: add multi-student scale and failure gates`。
 
-### Task 11: Plan G — 成本优化实验控制器与不少于 25 组实测
+### Task 13: Plan G — 成本优化实验控制器与不少于 25 组实测
 
 **Files:**
 - Create: `copilot/cost_experiments.py`, `scripts/run_cost_experiments.py`
