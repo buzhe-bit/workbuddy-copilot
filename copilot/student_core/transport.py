@@ -21,6 +21,10 @@ class PermanentTransportError(RuntimeError):
     """The request was rejected and should not be retried unchanged."""
 
 
+class StudentAskNotFound(PermanentTransportError):
+    """No server reservation exists, so the same keyed POST may be retried."""
+
+
 DEFAULT_PENDING_MESSAGE_LIMIT = 64
 
 
@@ -396,6 +400,10 @@ class StudentTransport:
                 status = int(status_value)
                 raw = response.read()
         except urllib.error.HTTPError as exc:
+            if int(exc.code) == 404:
+                raise StudentAskNotFound(
+                    "student ask recovery row is missing"
+                ) from exc
             self._raise_http_error(exc)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise TemporaryNetworkError("student ask recovery unavailable") from exc

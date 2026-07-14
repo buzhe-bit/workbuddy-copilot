@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import sqlite3
+import urllib.error
 
 import httpx
 import pytest
@@ -16,7 +17,12 @@ from copilot.eventbus import EventBus
 from copilot.service import create_app
 from copilot.services import AnalysisService, MessageService, SessionQueryService
 from copilot.store import Store
-from copilot.student_core.transport import Accepted, StudentTransport
+from copilot.student_core.transport import (
+    Accepted,
+    PermanentTransportError,
+    StudentAskNotFound,
+    StudentTransport,
+)
 
 
 async def _unused_analysis(config, snap, event, latest_prompt):
@@ -440,3 +446,42 @@ def test_student_transport_ask_query_feedback_and_async_wrappers_use_own_identit
     for request in captured:
         headers = {str(key).lower(): str(value) for key, value in request["headers"].items()}
         assert headers["authorization"] == "Bearer secret-token"
+
+
+def test_student_transport_distinguishes_missing_recovery_row_from_auth_rejection():
+    def missing(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            404,
+            "missing",
+            {},
+            io.BytesIO(b'{"detail":"student ask not found"}'),
+        )
+
+    transport = StudentTransport(
+        "https://copilot.example",
+        student_id="student-a",
+        token="secret-token",
+        opener=missing,
+    )
+    with pytest.raises(StudentAskNotFound):
+        transport.get_ask_by_client_request("request-missing")
+
+    def unauthorized(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            401,
+            "denied",
+            {},
+            io.BytesIO(b'{"detail":"invalid token"}'),
+        )
+
+    denied = StudentTransport(
+        "https://copilot.example",
+        student_id="student-a",
+        token="wrong-token",
+        opener=unauthorized,
+    )
+    with pytest.raises(PermanentTransportError) as exc_info:
+        denied.get_ask_by_client_request("request-private")
+    assert not isinstance(exc_info.value, StudentAskNotFound)
