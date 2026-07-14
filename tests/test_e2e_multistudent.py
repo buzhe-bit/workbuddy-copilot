@@ -232,6 +232,7 @@ def test_report_flow_keeps_students_sessions_and_delete_cascade_isolated(tmp_pat
         )
         assert deleted.status_code == 200
         assert deleted.json()["deleted"] == {
+            "attention_items": 1,
             "analyses": 1,
             "ai_summaries": 1,
             "prompts": 2,
@@ -243,6 +244,8 @@ def test_report_flow_keeps_students_sessions_and_delete_cascade_isolated(tmp_pat
         }
 
         for table in [
+            "attention_items",
+            "system_failure_occurrences",
             "analyses",
             "ai_summaries",
             "prompts",

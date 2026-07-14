@@ -57,6 +57,8 @@ class WSRegistry:
             await self._fanout(self.mentors, payload)
         elif event_type == "upload_request_status":
             await self._fanout(self.mentors, payload)
+        elif event_type == "attention_updated":
+            await self._fanout(self.mentors, payload)
 
     async def _route_forward(self, payload: dict[str, Any]) -> None:
         student_id = str(payload.get("student_id") or "")

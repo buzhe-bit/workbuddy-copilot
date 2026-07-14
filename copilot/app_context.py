@@ -20,6 +20,7 @@ from typing import Any, Sequence
 
 from fastapi import Header, HTTPException, Request, status
 
+from .attention import AttentionService
 from .config import load_config
 from .connections import WSRegistry
 from .eventbus import EventBus
@@ -112,6 +113,7 @@ class AppContext:
     message_svc: MessageService
     bus: EventBus
     ws_registry: WSRegistry
+    attention_svc: AttentionService | None = None
     upload_svc: UploadRequestService | None = None
     worker_lock_file: Any | None = None
     report_recovery_prepared: bool = False
@@ -127,11 +129,13 @@ def build_context(config_path: str | os.PathLike[str] | None = None) -> AppConte
     event_bus = EventBus()
     ws_registry = WSRegistry()
     event_bus.subscribe(ws_registry.handle_event)
+    attention_svc = AttentionService(store=store, event_bus=event_bus)
     analysis_svc = AnalysisService(
         copilot_repo=store,
         llm_analyzer=llm_analyze,
         config=config,
         event_bus=event_bus,
+        attention_service=attention_svc,
     )
     session_svc = SessionQueryService(copilot_repo=store, config=config)
     message_svc = MessageService(copilot_repo=store, event_bus=event_bus)
@@ -144,6 +148,7 @@ def build_context(config_path: str | os.PathLike[str] | None = None) -> AppConte
         message_svc=message_svc,
         bus=event_bus,
         ws_registry=ws_registry,
+        attention_svc=attention_svc,
         upload_svc=upload_svc,
     )
 
@@ -212,6 +217,32 @@ def get_upload_service(request: Request) -> UploadRequestService:
     if context.upload_svc is None:
         context.upload_svc = UploadRequestService(context.store)
     return context.upload_svc
+
+
+def ensure_attention_service(context: AppContext) -> AttentionService:
+    """Return one canonical projection service and repair split app wiring."""
+    attention_svc = context.attention_svc
+    if attention_svc is not None and (
+        getattr(attention_svc, "store", None) is not context.store
+        or getattr(attention_svc, "event_bus", None) is not context.bus
+    ):
+        log.error(
+            "replacing attention service bound to a different store or event bus"
+        )
+        attention_svc = None
+    if attention_svc is None:
+        attention_svc = AttentionService(
+            store=context.store,
+            event_bus=context.bus,
+        )
+        context.attention_svc = attention_svc
+    if context.analysis_svc.attention_service is not attention_svc:
+        context.analysis_svc.attention_service = attention_svc
+    return attention_svc
+
+
+def get_attention_service(request: Request) -> AttentionService:
+    return ensure_attention_service(get_context(request))
 
 
 def _legacy_token(config: dict[str, Any]) -> str:

@@ -99,6 +99,7 @@ class AnalysisService:
         config: dict,
         event_bus: EventBus,
         notifier: Any | None = None,
+        attention_service: Any | None = None,
     ):
         """
         Args:
@@ -113,11 +114,42 @@ class AnalysisService:
         self.config = config
         self.bus = event_bus
         self.notifier = notifier
+        self.attention_service = attention_service
         configured_concurrency = (
             config.get("service", {}).get("analysis_max_concurrency", 2)
         )
         max_concurrency = _validate_analysis_max_concurrency(configured_concurrency)
         self.analysis_semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def _project_attention_safely(
+        self,
+        method_name: str,
+        *args: Any,
+    ) -> None:
+        """Keep a post-commit projection failure outside source semantics."""
+        if self.attention_service is None:
+            return
+        try:
+            method = getattr(self.attention_service, method_name)
+            await method(*args)
+        except Exception:
+            log.exception(
+                "attention projection failed after durable source commit method=%s",
+                method_name,
+            )
+
+    async def _publish_after_commit_safely(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Do not let transient fanout rewrite an already committed result."""
+        try:
+            await self.bus.publish(payload)
+        except Exception:
+            log.exception(
+                "event fanout failed after durable commit type=%s",
+                str(payload.get("type") or "unknown"),
+            )
 
     def _config_with_prompt_overrides(self) -> dict:
         """Return analysis config with server-stored prompt overrides applied."""
@@ -240,7 +272,7 @@ class AnalysisService:
             )
 
         if created:
-            await self.bus.publish({
+            await self._publish_after_commit_safely({
                 "type": "prompt",
                 "student_id": student_id,
                 "session_id": session_id,
@@ -277,7 +309,7 @@ class AnalysisService:
         if prompt_row and prompt_created:
             # The committed prompt row is authoritative. This EventBus signal is
             # transient; clients that miss it catch up through persisted queries.
-            await self.bus.publish({
+            await self._publish_after_commit_safely({
                 "type": "prompt",
                 "student_id": student_id,
                 "session_id": session_id,
@@ -347,7 +379,7 @@ class AnalysisService:
         session_title = self.copilot.get_session_title(session_id) or snap.ai_title or ""
 
         # 存储
-        _, analysis_created = self.copilot.complete_report_analysis(
+        analysis_id, analysis_created = self.copilot.complete_report_analysis(
             report_id=report_id,
             prompt_id=prompt_id,
             session_id=session_id,
@@ -364,9 +396,11 @@ class AnalysisService:
         if not analysis_created:
             return result
 
+        await self._project_attention_safely("project_analysis", analysis_id)
+
         # 发布 AI 摘要事件
         if result.ai_reply_summary:
-            await self.bus.publish({
+            await self._publish_after_commit_safely({
                 "type": "ai_summary",
                 "student_id": student_id,
                 "session_id": session_id,
@@ -375,7 +409,7 @@ class AnalysisService:
             })
 
         # 发布分析事件
-        await self.bus.publish({
+        await self._publish_after_commit_safely({
             "type": "analysis",
             "student_id": student_id,
             "session_id": session_id,
@@ -446,6 +480,11 @@ class AnalysisService:
                     prompt_hash=str(getattr(exc, "prompt_hash", "") or "")[:128],
                     latency_ms=max(0, int(getattr(exc, "latency_ms", 0) or 0)),
                 )
+                await self._project_attention_safely(
+                    "project_system_failure",
+                    "stop",
+                    str(report_id),
+                )
                 raise
             except Exception as exc:
                 error_code = stable_analysis_error_code(exc)
@@ -467,6 +506,11 @@ class AnalysisService:
                     prompt_hash=str(getattr(exc, "prompt_hash", "") or "")[:128],
                     latency_ms=max(0, int(getattr(exc, "latency_ms", 0) or 0)),
                 )
+                await self._project_attention_safely(
+                    "project_system_failure",
+                    "stop",
+                    str(report_id),
+                )
                 if attempt >= max_attempts:
                     raise AnalysisRetriesExhausted(error_code) from None
 
@@ -480,8 +524,13 @@ class AnalysisService:
         report = self.copilot.get_report(report_id)
         if not report or report.get("event") != "Stop":
             return False
+        analysis_status = str(report.get("analysis_status") or "")
         return (
-            str(report.get("analysis_status") or "") in {"pending", "failed"}
+            analysis_status in {"pending", "failed"}
+            and not (
+                analysis_status == "failed"
+                and report.get("analysis_next_retry_at") is None
+            )
             and int(report.get("analysis_attempts") or 0) < max_attempts
         )
 
@@ -524,6 +573,9 @@ class SessionQueryService:
                 last_severity=r.get("last_severity", "info"),
                 alert_count=r.get("alert_count", 0),
                 last_diagnosis=r.get("last_diagnosis", ""),
+                open_attention_count=r.get("open_attention_count", 0),
+                highest_attention_priority=r.get("highest_attention_priority", ""),
+                last_attention_at=r.get("last_attention_at", 0),
             ))
         return students
 

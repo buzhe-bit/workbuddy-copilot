@@ -19,6 +19,7 @@ from .app_context import (
     AppContext,
     acquire_worker_lock,
     build_context,
+    ensure_attention_service,
     get_analysis_service,
     get_context,
     get_message_service,
@@ -238,6 +239,66 @@ async def _handle_stop_background(
         log.exception("background Stop analysis failed report_id=%s: %s", report_id, exc)
 
 
+async def _project_attention_safely(
+    context: AppContext,
+    method_name: str,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Run one post-commit projection without changing source success/failure."""
+    try:
+        attention_svc = ensure_attention_service(context)
+        method = getattr(attention_svc, method_name)
+        await method(*args, **kwargs)
+    except Exception:
+        log.exception(
+            "attention projection failed after durable source commit method=%s",
+            method_name,
+        )
+
+
+async def _publish_event_safely(
+    context: AppContext,
+    payload: dict[str, Any],
+) -> None:
+    """Best-effort fanout after the authoritative state is already durable."""
+    try:
+        await context.bus.publish(payload)
+    except Exception:
+        log.exception(
+            "event fanout failed after durable commit type=%s",
+            str(payload.get("type") or "unknown"),
+        )
+
+
+async def _project_committed_analysis_safely(
+    context: AppContext,
+    committed: dict[str, Any],
+) -> None:
+    """Keep missing/corrupt projection metadata outside bulk source semantics."""
+    try:
+        analysis_id = int(committed["analysis_id"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        log.error(
+            "attention projection metadata missing after durable bulk commit"
+        )
+        return
+    await _project_attention_safely(
+        context,
+        "project_analysis",
+        analysis_id,
+    )
+
+
+def _committed_report_id_safely(committed: dict[str, Any]) -> int | None:
+    """Read optional event metadata without changing a committed source result."""
+    try:
+        return int(committed["report_id"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        log.error("report event metadata missing after durable bulk commit")
+        return None
+
+
 def _filtered_content_to_raw(filtered_content: Any) -> str:
     """Normalize already-filtered uploaded message content into JSONL text."""
     if filtered_content is None:
@@ -430,28 +491,43 @@ async def _analyze_uploaded_session_background(
                 sha[:12],
             )
             return False, "analysis stale transcript"
-        report_id = int(committed["report_id"])
-        await _refresh_upload_parent_projections(
-            context,
-            student_id,
-            committed.get("request_ids", []),
-        )
-        await context.bus.publish({
-            "type": "analysis",
-            "student_id": student_id,
-            "session_id": session_id,
-            "session_title": session_title,
-            "report_id": report_id,
-            "event": "BulkUpload",
-            "prompt": latest_prompt[:120],
-            "result": result.to_dict(),
-            "timestamp": time.time(),
-        })
+        committed_metadata = committed if isinstance(committed, dict) else {}
+        report_id: int | None = None
+        try:
+            report_id = _committed_report_id_safely(committed_metadata)
+            await _project_committed_analysis_safely(context, committed_metadata)
+            request_ids = committed_metadata.get("request_ids", [])
+            if not isinstance(request_ids, (list, tuple)):
+                log.error("upload parent metadata invalid after durable bulk commit")
+                request_ids = []
+            await _refresh_upload_parent_projections(
+                context,
+                student_id,
+                list(request_ids),
+            )
+            if report_id is not None:
+                await _publish_event_safely(context, {
+                    "type": "analysis",
+                    "student_id": student_id,
+                    "session_id": session_id,
+                    "session_title": session_title,
+                    "report_id": report_id,
+                    "event": "BulkUpload",
+                    "prompt": latest_prompt[:120],
+                    "result": result.to_dict(),
+                    "timestamp": time.time(),
+                })
+        except Exception:
+            log.exception(
+                "bulk post-commit projection/fanout failed student=%s session=%s",
+                student_id,
+                session_id[:8],
+            )
         log.info(
             "bulk upload analysis complete student=%s session=%s report_id=%s",
             student_id,
             session_id[:8],
-            report_id,
+            report_id if report_id is not None else "unknown",
         )
         return True, ""
     except Exception as exc:
@@ -480,6 +556,12 @@ async def _analyze_uploaded_session_background(
             await _refresh_upload_parent_projections(context, student_id, request_ids)
             return False, "analysis stale transcript"
         if failure is not None:
+            await _project_attention_safely(
+                context,
+                "project_system_failure",
+                "bulk_analysis",
+                f"{int(claim['raw_id'])}:{int(claim['generation'])}",
+            )
             await _refresh_upload_parent_projections(
                 context,
                 student_id,
@@ -517,7 +599,7 @@ async def _publish_upload_request_status(
     """Publish a persisted request snapshot to mentor sockets only."""
     snapshot = _upload_request_to_response(row)
     snapshot["result"] = _sanitize_upload_event_result(snapshot.get("result"))
-    await context.bus.publish({
+    await _publish_event_safely(context, {
         "type": "upload_request_status",
         **snapshot,
         "timestamp": time.time(),
@@ -549,6 +631,13 @@ async def _refresh_upload_parent_projections(
                 exc,
             )
             continue
+        if any(str(row.get("analysis_status") or "") == "failed" for row in rows):
+            await _project_attention_safely(
+                context,
+                "project_system_failure",
+                "upload_analysis",
+                request_id,
+            )
         await _publish_upload_parent_rows(context, rows)
 
 
@@ -656,6 +745,12 @@ async def _recover_pending_reports(
                 report_id,
                 max_attempts=3,
             )
+            await _project_attention_safely(
+                ctx,
+                "project_system_failure",
+                "stop",
+                str(report_id),
+            )
             log.error(
                 "legacy Stop analysis input unavailable report_id=%s",
                 report_id,
@@ -722,6 +817,7 @@ def _start_report_recovery(
 
 def create_app(context: AppContext | None = None) -> FastAPI:
     ctx = context or build_context()
+    ensure_attention_service(ctx)
     startup_upload_svc = ctx.upload_svc or UploadRequestService(ctx.store)
     if ctx.upload_svc is None:
         ctx.upload_svc = startup_upload_svc
@@ -739,6 +835,13 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                     len(recovered_uploads),
                 )
             report_ids = _prepare_report_recovery(ctx)
+            await _project_attention_safely(
+                ctx,
+                "backfill_missing",
+                publish=False,
+                page_size=100,
+                max_sources=1000,
+            )
             _start_report_recovery(ctx, report_ids)
             yield
         finally:
@@ -1087,7 +1190,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             "mentor_id": mentor_id,
             "timestamp": time.time(),
         }
-        await context.bus.publish(payload)
+        await _publish_event_safely(context, payload)
         log.info(
             "upload requested mentor=%s student=%s session=%s request_id=%s",
             mentor_id,
@@ -1185,8 +1288,25 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="upload request not found")
         except InvalidStateTransition as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if transfer_status == "failed":
+            await _project_attention_safely(
+                context,
+                "project_system_failure",
+                "upload_transfer",
+                request_id,
+            )
         await _publish_upload_request_status(context, row)
         parent_rows = upload_svc.refresh_parent_analysis(request_id, data.student_id)
+        if any(
+            str(parent.get("analysis_status") or "") == "failed"
+            for parent in parent_rows
+        ):
+            await _project_attention_safely(
+                context,
+                "project_system_failure",
+                "upload_analysis",
+                request_id,
+            )
         await _publish_upload_parent_rows(context, parent_rows)
         latest = parent_rows[-1] if parent_rows else row
         return _upload_request_to_response(latest)
@@ -1351,7 +1471,12 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                 status_code=409,
                 detail="session belongs to another student",
             )
-        await context.bus.publish({
+        await _project_attention_safely(
+            context,
+            "project_student_ask",
+            ask_id,
+        )
+        await _publish_event_safely(context, {
             "type": "student_ask",
             "student_id": student_id,
             "session_id": session_id or "",
@@ -1374,6 +1499,7 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         ask_id: int,
         data: StudentAskFeedbackIn,
         _: None = Depends(require_student_token),
+        context: AppContext = Depends(get_context),
         store: Store = Depends(get_store),
     ):
         student_id = data.student_id.strip()
@@ -1395,6 +1521,11 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             raise HTTPException(status_code=403, detail="student ask owner mismatch")
         except ValueError:
             raise HTTPException(status_code=409, detail="student ask feedback conflict")
+        await _project_attention_safely(
+            context,
+            "project_student_ask",
+            ask_id,
+        )
         return {
             "ask_id": ask_id,
             "feedback": row["feedback"],

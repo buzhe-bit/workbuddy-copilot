@@ -121,7 +121,7 @@
 
 **Interfaces:**
 - `attention_items` 字段：`id, source_type, source_id, category, student_id, session_id, priority, reason_code, reason, evidence_json, suggested_action, confidence, status, handled_by, resolution_note, handled_at, created_at, updated_at`；`(source_type,source_id,reason_code)` 唯一。
-- `AttentionService.project_analysis(analysis_id, result)`, `project_student_ask(ask_id)`, `project_system_failure(source_type, source_id, ...)`, `backfill_missing()`。
+- `AttentionService.project_analysis(analysis_id)`, `project_student_ask(ask_id)`, `project_system_failure(source_type, source_id)`, `backfill_missing()`；投影只接收耐久 ID/key 并回读 Store。
 - `GET /api/mentor/attention?status=&priority=&category=&student_id=&limit=`。
 - `PATCH /api/mentor/attention/{id}` body `{status, mentor_id, note}`，状态仅 `open|in_progress|resolved|dismissed`。
 

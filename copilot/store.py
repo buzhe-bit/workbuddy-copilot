@@ -7,19 +7,44 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .models import normalize_event_id
+from .models import (
+    AttentionDecision,
+    normalize_confidence,
+    normalize_event_id,
+    normalize_evidence,
+)
 
 log = logging.getLogger("copilot.store")
 
 LEGACY_PROMPT_BACKFILL_WINDOW_SECONDS = 5.0
 LEGACY_RAW_MATCH_WINDOW_SECONDS = 5.0
 EXPLICIT_RAW_TRANSCRIPT_MARKER = "copilot:explicit-raw-transcript"
+
+SYSTEM_FAILURE_REASON_CODES = {
+    "stop_input_unavailable": "system_stop_input_unavailable",
+    "stop_retries_exhausted": "system_stop_retries_exhausted",
+    "bulk_analysis": "system_bulk_analysis_failed",
+    "upload_transfer": "system_upload_transfer_failed",
+    "upload_analysis": "system_upload_analysis_failed",
+}
+
+ATTENTION_BACKFILL_SOURCE_KINDS = frozenset({
+    "analysis",
+    "student_ask",
+    "stop",
+    "bulk_analysis",
+    "upload_transfer",
+    "upload_analysis",
+})
 
 
 SCHEMA = """
@@ -103,6 +128,60 @@ CREATE TABLE IF NOT EXISTS students (
     created_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS attention_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL CHECK(source_type IN ('analysis', 'student_ask', 'system')),
+    source_id TEXT NOT NULL,
+    category TEXT NOT NULL CHECK(category IN ('learning', 'system')),
+    student_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    priority TEXT NOT NULL CHECK(priority IN ('high', 'medium')),
+    reason_code TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    suggested_action TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.5,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK(status IN ('open', 'in_progress', 'resolved', 'dismissed')),
+    handled_by TEXT NOT NULL DEFAULT '',
+    resolution_note TEXT NOT NULL DEFAULT '',
+    handled_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(source_type, source_id, reason_code),
+    FOREIGN KEY (student_id) REFERENCES students(student_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_attention_queue
+    ON attention_items(status, priority, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_attention_student_status
+    ON attention_items(student_id, status);
+
+CREATE TABLE IF NOT EXISTS system_failure_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK(kind IN (
+        'stop', 'bulk_analysis', 'upload_transfer', 'upload_analysis'
+    )),
+    logical_key TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 1),
+    student_id TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    reason_code TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(kind, logical_key, generation, reason_code),
+    FOREIGN KEY (student_id) REFERENCES students(student_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_failure_occurrence_kind_id
+    ON system_failure_occurrences(kind, id);
+
+CREATE TABLE IF NOT EXISTS attention_backfill_cursors (
+    source_kind TEXT PRIMARY KEY,
+    last_id INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     student_id TEXT,
@@ -168,6 +247,8 @@ CREATE TABLE IF NOT EXISTS upload_requests (
     error_message TEXT DEFAULT '',
     transfer_error TEXT DEFAULT '',
     analysis_error TEXT DEFAULT '',
+    transfer_failure_generation INTEGER NOT NULL DEFAULT 0,
+    analysis_failure_generation INTEGER NOT NULL DEFAULT 0,
     result_json TEXT,
     updated_at REAL,
     created_at REAL NOT NULL
@@ -254,6 +335,21 @@ _MIGRATIONS = [
     ("upload_requests", "analysis_status", "TEXT NOT NULL DEFAULT 'not_requested'"),
     ("upload_requests", "transfer_error", "TEXT DEFAULT ''"),
     ("upload_requests", "analysis_error", "TEXT DEFAULT ''"),
+    (
+        "upload_requests",
+        "transfer_failure_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "upload_requests",
+        "analysis_failure_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "attention_backfill_cursors",
+        "version",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
     ("student_asks", "answer_status", "TEXT NOT NULL DEFAULT 'answered'"),
     ("student_asks", "error_code", "TEXT NOT NULL DEFAULT ''"),
     ("student_asks", "feedback", "TEXT NOT NULL DEFAULT ''"),
@@ -332,6 +428,553 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
+    @staticmethod
+    def _failure_generation(value: object) -> int:
+        try:
+            generation = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            generation = 0
+        return max(1, generation)
+
+    @staticmethod
+    def _failure_reason_allowed(kind: str, reason_code: str) -> bool:
+        allowed = {
+            "stop": {
+                SYSTEM_FAILURE_REASON_CODES["stop_input_unavailable"],
+                SYSTEM_FAILURE_REASON_CODES["stop_retries_exhausted"],
+            },
+            "bulk_analysis": {SYSTEM_FAILURE_REASON_CODES["bulk_analysis"]},
+            "upload_transfer": {SYSTEM_FAILURE_REASON_CODES["upload_transfer"]},
+            "upload_analysis": {SYSTEM_FAILURE_REASON_CODES["upload_analysis"]},
+        }
+        return reason_code in allowed.get(kind, set())
+
+    def _insert_system_failure_occurrence_with_conn(
+        self,
+        c: sqlite3.Connection,
+        *,
+        kind: str,
+        logical_key: object,
+        generation: object,
+        student_id: object,
+        session_id: object,
+        reason_code: str,
+        created_at: float | None = None,
+    ) -> int | None:
+        """Insert one privacy-bounded immutable failure occurrence."""
+        normalized_key = str(logical_key or "")
+        normalized_student = str(student_id or "")
+        normalized_session = str(session_id or "")
+        if not normalized_key.strip():
+            raise ValueError("failure occurrence logical key is required")
+        if not normalized_student.strip():
+            raise ValueError("failure occurrence student id is required")
+        if not self._failure_reason_allowed(kind, reason_code):
+            raise ValueError("invalid failure occurrence reason")
+        occurred_at = self._attention_timestamp(created_at, default=time.time())
+        c.execute(
+            """INSERT INTO students
+               (student_id, display_name, token_hash, created_at)
+               VALUES (?, '', NULL, ?)
+               ON CONFLICT(student_id) DO NOTHING""",
+            (normalized_student, occurred_at),
+        )
+        cur = c.execute(
+            """INSERT INTO system_failure_occurrences
+               (kind, logical_key, generation, student_id, session_id,
+                reason_code, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(kind, logical_key, generation, reason_code) DO NOTHING""",
+            (
+                kind,
+                normalized_key,
+                self._failure_generation(generation),
+                normalized_student,
+                normalized_session,
+                reason_code,
+                occurred_at,
+            ),
+        )
+        if cur.rowcount == 1:
+            return int(cur.lastrowid)
+        existing = c.execute(
+            """SELECT student_id, session_id FROM system_failure_occurrences
+               WHERE kind = ? AND logical_key = ? AND generation = ?
+                 AND reason_code = ?""",
+            (
+                kind,
+                normalized_key,
+                self._failure_generation(generation),
+                reason_code,
+            ),
+        ).fetchone()
+        if existing is None or (
+            str(existing["student_id"]) != normalized_student
+            or str(existing["session_id"] or "") != normalized_session
+        ):
+            raise ValueError("failure occurrence identity conflict")
+        return None
+
+    def seed_legacy_system_failure_occurrences(self) -> int:
+        """Idempotently capture only legacy failures still visible today."""
+        before = 0
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            before = int(c.execute(
+                "SELECT COUNT(*) FROM system_failure_occurrences",
+            ).fetchone()[0])
+            c.execute(
+                """UPDATE reports
+                   SET analysis_attempts = 1
+                   WHERE event = 'Stop' AND analysis_status = 'failed'
+                     AND analysis_attempts < 1
+                     AND (
+                       analysis_error = 'analysis_input_unavailable'
+                       OR analysis_next_retry_at IS NULL
+                     )"""
+            )
+            c.execute(
+                """UPDATE raw_transcripts
+                   SET analysis_generation = 1
+                   WHERE analysis_status = 'failed' AND analysis_generation < 1"""
+            )
+            c.execute(
+                """UPDATE upload_requests
+                   SET transfer_failure_generation = 1
+                   WHERE transfer_status = 'failed'
+                     AND transfer_failure_generation < 1"""
+            )
+            c.execute(
+                """UPDATE upload_requests
+                   SET analysis_failure_generation = 1
+                   WHERE analysis_status = 'failed'
+                     AND analysis_failure_generation < 1"""
+            )
+
+            rows = c.execute(
+                """SELECT id, student_id, session_id, analysis_attempts,
+                          analysis_error, created_at
+                   FROM reports
+                   WHERE event = 'Stop' AND analysis_status = 'failed'
+                     AND (
+                       analysis_error = 'analysis_input_unavailable'
+                       OR (
+                         analysis_next_retry_at IS NULL
+                         AND analysis_attempts > 0
+                       )
+                     )"""
+            ).fetchall()
+            for row in rows:
+                reason_code = (
+                    SYSTEM_FAILURE_REASON_CODES["stop_input_unavailable"]
+                    if row["analysis_error"] == "analysis_input_unavailable"
+                    else SYSTEM_FAILURE_REASON_CODES["stop_retries_exhausted"]
+                )
+                self._insert_system_failure_occurrence_with_conn(
+                    c,
+                    kind="stop",
+                    logical_key=row["id"],
+                    generation=row["analysis_attempts"],
+                    student_id=row["student_id"],
+                    session_id=row["session_id"],
+                    reason_code=reason_code,
+                    created_at=row["created_at"],
+                )
+
+            rows = c.execute(
+                """SELECT id, student_id, session_id, analysis_generation, created_at
+                   FROM raw_transcripts WHERE analysis_status = 'failed'"""
+            ).fetchall()
+            for row in rows:
+                self._insert_system_failure_occurrence_with_conn(
+                    c,
+                    kind="bulk_analysis",
+                    logical_key=row["id"],
+                    generation=row["analysis_generation"],
+                    student_id=row["student_id"],
+                    session_id=row["session_id"],
+                    reason_code=SYSTEM_FAILURE_REASON_CODES["bulk_analysis"],
+                    created_at=row["created_at"],
+                )
+
+            rows = c.execute(
+                """SELECT request_id, student_id, session_id,
+                          transfer_status, analysis_status,
+                          transfer_failure_generation,
+                          analysis_failure_generation,
+                          COALESCE(updated_at, created_at) AS failure_at
+                   FROM upload_requests
+                   WHERE transfer_status = 'failed' OR analysis_status = 'failed'"""
+            ).fetchall()
+            for row in rows:
+                if row["transfer_status"] == "failed":
+                    self._insert_system_failure_occurrence_with_conn(
+                        c,
+                        kind="upload_transfer",
+                        logical_key=row["request_id"],
+                        generation=row["transfer_failure_generation"],
+                        student_id=row["student_id"],
+                        session_id=row["session_id"],
+                        reason_code=SYSTEM_FAILURE_REASON_CODES["upload_transfer"],
+                        created_at=row["failure_at"],
+                    )
+                if row["analysis_status"] == "failed":
+                    self._insert_system_failure_occurrence_with_conn(
+                        c,
+                        kind="upload_analysis",
+                        logical_key=row["request_id"],
+                        generation=row["analysis_failure_generation"],
+                        student_id=row["student_id"],
+                        session_id=row["session_id"],
+                        reason_code=SYSTEM_FAILURE_REASON_CODES["upload_analysis"],
+                        created_at=row["failure_at"],
+                    )
+            after = int(c.execute(
+                "SELECT COUNT(*) FROM system_failure_occurrences",
+            ).fetchone()[0])
+        return after - before
+
+    def get_system_failure_occurrence(
+        self,
+        occurrence_id: int,
+    ) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM system_failure_occurrences WHERE id = ?",
+                (occurrence_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_latest_system_failure_occurrence(
+        self,
+        *,
+        kind: str,
+        logical_key: str,
+        generation: int | None = None,
+    ) -> dict[str, Any] | None:
+        if kind not in {
+            "stop", "bulk_analysis", "upload_transfer", "upload_analysis",
+        }:
+            raise ValueError("invalid system failure occurrence kind")
+        generation_clause = " AND generation = ?" if generation is not None else ""
+        params: list[Any] = [kind, str(logical_key)]
+        if generation is not None:
+            params.append(self._failure_generation(generation))
+        with self._conn() as c:
+            row = c.execute(
+                f"""SELECT * FROM system_failure_occurrences
+                    WHERE kind = ? AND logical_key = ?{generation_clause}
+                    ORDER BY generation DESC, id DESC LIMIT 1""",
+                params,
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_system_failure_occurrences(
+        self,
+        *,
+        kind: str,
+        logical_key: str | None = None,
+        generation: int | None = None,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if kind not in {
+            "stop", "bulk_analysis", "upload_transfer", "upload_analysis",
+        }:
+            raise ValueError("invalid system failure occurrence kind")
+        clauses = ["kind = ?", "id > ?"]
+        params: list[Any] = [kind, max(0, int(after_id))]
+        if logical_key is not None:
+            clauses.append("logical_key = ?")
+            params.append(str(logical_key))
+        if generation is not None:
+            clauses.append("generation = ?")
+            params.append(self._failure_generation(generation))
+        params.append(min(max(1, int(limit)), 200))
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT * FROM system_failure_occurrences
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY id ASC LIMIT ?""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    def _attention_text(value: object, *, limit: int) -> str:
+        return str(value or "").strip()[:limit]
+
+    @staticmethod
+    def _attention_timestamp(value: object, *, default: float) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return default
+        return timestamp if math.isfinite(timestamp) else default
+
+    @classmethod
+    def _normalize_attention_decision(
+        cls,
+        decision: Mapping[str, Any] | AttentionDecision,
+    ) -> dict[str, Any]:
+        values: Mapping[str, Any]
+        if isinstance(decision, AttentionDecision):
+            values = asdict(decision)
+        elif isinstance(decision, Mapping):
+            values = decision
+        else:
+            raise TypeError("attention decision must be a mapping")
+
+        source_type = cls._attention_text(values.get("source_type"), limit=40)
+        category = cls._attention_text(values.get("category"), limit=40)
+        priority = cls._attention_text(values.get("priority"), limit=40)
+        if source_type not in {"analysis", "student_ask", "system"}:
+            raise ValueError("invalid attention source type")
+        if category not in {"learning", "system"}:
+            raise ValueError("invalid attention category")
+        if priority not in {"high", "medium"}:
+            raise ValueError("invalid attention priority")
+
+        source_id = str(values.get("source_id") or "")
+        student_id = str(values.get("student_id") or "")
+        session_id = str(values.get("session_id") or "")
+        reason_code = str(values.get("reason_code") or "").strip()
+        if not source_id.strip():
+            raise ValueError("attention source id is required")
+        if not student_id.strip():
+            raise ValueError("attention student id is required")
+        if not reason_code:
+            raise ValueError("attention reason code is required")
+
+        evidence_value: object
+        if "evidence" in values:
+            evidence_value = values.get("evidence")
+        else:
+            evidence_value = values.get("evidence_json", "[]")
+            if isinstance(evidence_value, str):
+                try:
+                    evidence_value = json.loads(evidence_value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    evidence_value = []
+        if isinstance(evidence_value, tuple):
+            evidence_value = list(evidence_value)
+        evidence_json = json.dumps(
+            normalize_evidence(evidence_value),
+            ensure_ascii=False,
+        )
+        now = time.time()
+        return {
+            "source_type": source_type,
+            "source_id": source_id,
+            "category": category,
+            "student_id": student_id,
+            "session_id": session_id,
+            "priority": priority,
+            "reason_code": reason_code,
+            "reason": cls._attention_text(values.get("reason"), limit=500),
+            "evidence_json": evidence_json,
+            "suggested_action": cls._attention_text(
+                values.get("suggested_action"),
+                limit=500,
+            ),
+            "confidence": normalize_confidence(values.get("confidence")),
+            "created_at": cls._attention_timestamp(
+                values.get("created_at"),
+                default=now,
+            ),
+            "updated_at": now,
+        }
+
+    def insert_attention_decisions(
+        self,
+        decisions: Iterable[Mapping[str, Any] | AttentionDecision],
+    ) -> list[dict[str, Any]]:
+        """Insert only genuinely new source/reason projections atomically."""
+        records = [self._normalize_attention_decision(item) for item in decisions]
+        if not records:
+            return []
+
+        created: list[dict[str, Any]] = []
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            for record in records:
+                c.execute(
+                    """INSERT INTO students
+                       (student_id, display_name, token_hash, created_at)
+                       VALUES (?, NULL, NULL, ?)
+                       ON CONFLICT(student_id) DO NOTHING""",
+                    (record["student_id"], record["created_at"]),
+                )
+                cur = c.execute(
+                    """INSERT INTO attention_items
+                       (source_type, source_id, category, student_id, session_id,
+                        priority, reason_code, reason, evidence_json,
+                        suggested_action, confidence, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(source_type, source_id, reason_code) DO NOTHING""",
+                    (
+                        record["source_type"],
+                        record["source_id"],
+                        record["category"],
+                        record["student_id"],
+                        record["session_id"],
+                        record["priority"],
+                        record["reason_code"],
+                        record["reason"],
+                        record["evidence_json"],
+                        record["suggested_action"],
+                        record["confidence"],
+                        record["created_at"],
+                        record["updated_at"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    existing = c.execute(
+                        """SELECT student_id, session_id FROM attention_items
+                           WHERE source_type = ? AND source_id = ?
+                             AND reason_code = ?""",
+                        (
+                            record["source_type"],
+                            record["source_id"],
+                            record["reason_code"],
+                        ),
+                    ).fetchone()
+                    if existing is None or (
+                        str(existing["student_id"]) != record["student_id"]
+                        or str(existing["session_id"] or "")
+                        != record["session_id"]
+                    ):
+                        raise ValueError("attention source identity conflict")
+                    continue
+                row = c.execute(
+                    "SELECT * FROM attention_items WHERE id = ?",
+                    (cur.lastrowid,),
+                ).fetchone()
+                if row is not None:
+                    created.append(dict(row))
+        return created
+
+    def get_attention(self, item_id: int) -> dict[str, Any] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM attention_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_attention(
+        self,
+        *,
+        status: str | None = None,
+        priority: str | None = None,
+        category: str | None = None,
+        student_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return the mentor queue: high first, then oldest within priority."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            raise ValueError("invalid attention limit")
+        filters = {
+            "status": ({"open", "in_progress", "resolved", "dismissed"}, status),
+            "priority": ({"high", "medium"}, priority),
+            "category": ({"learning", "system"}, category),
+        }
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, (allowed, value) in filters.items():
+            if value is None:
+                continue
+            if value not in allowed:
+                raise ValueError(f"invalid attention {column}")
+            clauses.append(f"{column} = ?")
+            params.append(value)
+        if student_id is not None:
+            clauses.append("student_id = ?")
+            params.append(student_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT * FROM attention_items{where}
+                    ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END,
+                             created_at ASC, id ASC
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_attention_status(
+        self,
+        item_id: int,
+        *,
+        status: str,
+        mentor_id: str,
+        note: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Apply the queue state machine with exact-payload replay semantics."""
+        if status not in {"in_progress", "resolved", "dismissed"}:
+            raise ValueError("invalid attention status")
+        normalized_mentor = self._attention_text(mentor_id, limit=200)
+        normalized_note = str(note or "").strip()
+        if not normalized_mentor:
+            raise ValueError("attention mentor id is required")
+        if len(normalized_note) > 500:
+            raise ValueError("attention resolution note is too long")
+
+        allowed_transitions = {
+            "open": {"in_progress", "resolved", "dismissed"},
+            "in_progress": {"resolved", "dismissed"},
+            "resolved": set(),
+            "dismissed": set(),
+        }
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            current = c.execute(
+                "SELECT * FROM attention_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            if current is None:
+                raise LookupError("attention item not found")
+
+            current_status = str(current["status"] or "")
+            current_mentor = str(current["handled_by"] or "")
+            current_note = str(current["resolution_note"] or "")
+            if (
+                current_status == status
+                and current_mentor == normalized_mentor
+                and current_note == normalized_note
+            ):
+                return dict(current), False
+            if status not in allowed_transitions.get(current_status, set()):
+                raise ValueError("attention status conflict")
+
+            now = time.time()
+            handled_at = now if status in {"resolved", "dismissed"} else None
+            changed = c.execute(
+                """UPDATE attention_items
+                   SET status = ?, handled_by = ?, resolution_note = ?,
+                       handled_at = ?, updated_at = ?
+                   WHERE id = ? AND status = ?""",
+                (
+                    status,
+                    normalized_mentor,
+                    normalized_note,
+                    handled_at,
+                    now,
+                    item_id,
+                    current_status,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("attention status conflict")
+            updated = c.execute(
+                "SELECT * FROM attention_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+            return dict(updated), True
+
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA foreign_keys=ON")
@@ -349,6 +992,10 @@ class Store:
         with self._conn() as c:
             for sql in _POST_MIGRATION_SQL:
                 c.execute(sql)
+        # Seed only after legacy rows have reached their canonical source state.
+        # Otherwise a report already owning an analysis can briefly look failed
+        # and create a permanent false system occurrence.
+        self.seed_legacy_system_failure_occurrences()
 
     def _migrate(self) -> None:
         with self._conn() as c:
@@ -1211,7 +1858,9 @@ class Store:
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
             row = c.execute(
-                f"""SELECT id FROM raw_transcripts
+                f"""SELECT id, session_id, student_id, analysis_status,
+                           analysis_generation
+                    FROM raw_transcripts
                     WHERE {where}
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1""",
@@ -1243,7 +1892,10 @@ class Store:
                        analysis_prompt_hash = CASE
                          WHEN ? IS NULL THEN analysis_prompt_hash ELSE ? END,
                        analysis_latency_ms = analysis_latency_ms + ?,
-                       analysis_attempts = analysis_attempts + ?
+                       analysis_attempts = analysis_attempts + ?,
+                       analysis_generation = CASE
+                         WHEN ? = 'failed' AND analysis_generation < 1 THEN 1
+                         ELSE analysis_generation END
                    WHERE {update_where}""",
                 (
                     status,
@@ -1254,9 +1906,24 @@ class Store:
                     normalized_hash,
                     normalized_latency,
                     1 if increment_attempt else 0,
+                    status,
                     *update_params,
                 ),
             )
+            if (
+                cur.rowcount == 1
+                and status == "failed"
+                and str(row["analysis_status"] or "") != "failed"
+            ):
+                self._insert_system_failure_occurrence_with_conn(
+                    c,
+                    kind="bulk_analysis",
+                    logical_key=row["id"],
+                    generation=self._failure_generation(row["analysis_generation"]),
+                    student_id=row["student_id"],
+                    session_id=row["session_id"],
+                    reason_code=SYSTEM_FAILURE_REASON_CODES["bulk_analysis"],
+                )
             return cur.rowcount
 
     @staticmethod
@@ -1499,6 +2166,16 @@ class Store:
             ).rowcount
             if updated != 1:
                 return None
+            self._insert_system_failure_occurrence_with_conn(
+                c,
+                kind="bulk_analysis",
+                logical_key=raw_id,
+                generation=generation,
+                student_id=student_id,
+                session_id=session_id,
+                reason_code=SYSTEM_FAILURE_REASON_CODES["bulk_analysis"],
+                created_at=now,
+            )
             c.execute(
                 """UPDATE upload_request_sessions
                    SET analysis_status = 'failed', analysis_error = ?, updated_at = ?
@@ -1514,12 +2191,31 @@ class Store:
     ) -> int:
         """Move crash-left raw claims to retryable failure without changing trace."""
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            interrupted = c.execute(
+                """SELECT id, student_id, session_id, analysis_generation
+                   FROM raw_transcripts WHERE analysis_status = 'running'
+                   ORDER BY id"""
+            ).fetchall()
             cur = c.execute(
                 """UPDATE raw_transcripts
-                   SET analysis_status = 'failed', analysis_error = ?
+                   SET analysis_status = 'failed', analysis_error = ?,
+                       analysis_generation = CASE
+                         WHEN analysis_generation < 1 THEN 1
+                         ELSE analysis_generation END
                    WHERE analysis_status = 'running'""",
                 (str(error),),
             )
+            for row in interrupted:
+                self._insert_system_failure_occurrence_with_conn(
+                    c,
+                    kind="bulk_analysis",
+                    logical_key=row["id"],
+                    generation=row["analysis_generation"],
+                    student_id=row["student_id"],
+                    session_id=row["session_id"],
+                    reason_code=SYSTEM_FAILURE_REASON_CODES["bulk_analysis"],
+                )
             return cur.rowcount
 
     def fail_stale_upload_request_sessions(
@@ -2016,7 +2712,16 @@ class Store:
         """Update one upload request only if it belongs to the reporting student."""
         result_json = json.dumps(result, ensure_ascii=False) if result is not None else None
         transfer_status = {"done": "stored"}.get(status, status)
+        now = time.time()
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            current = c.execute(
+                """SELECT transfer_status, transfer_failure_generation,
+                          session_id
+                   FROM upload_requests
+                   WHERE request_id = ? AND student_id = ?""",
+                (request_id, student_id),
+            ).fetchone()
             cur = c.execute(
                 """UPDATE upload_requests
                    SET status = ?,
@@ -2024,6 +2729,10 @@ class Store:
                        error_message = ?,
                        transfer_error = ?,
                        result_json = ?,
+                       transfer_failure_generation = CASE
+                         WHEN ? = 'failed' AND transfer_status != 'failed'
+                         THEN transfer_failure_generation + 1
+                         ELSE transfer_failure_generation END,
                        updated_at = ?
                    WHERE request_id = ? AND student_id = ?""",
                 (
@@ -2032,11 +2741,29 @@ class Store:
                     error_message or "",
                     error_message or "",
                     result_json,
-                    time.time(),
+                    transfer_status,
+                    now,
                     request_id,
                     student_id,
                 ),
             )
+            if (
+                cur.rowcount == 1
+                and current is not None
+                and transfer_status == "failed"
+                and str(current["transfer_status"] or "") != "failed"
+            ):
+                generation = int(current["transfer_failure_generation"] or 0) + 1
+                self._insert_system_failure_occurrence_with_conn(
+                    c,
+                    kind="upload_transfer",
+                    logical_key=request_id,
+                    generation=generation,
+                    student_id=student_id,
+                    session_id=current["session_id"],
+                    reason_code=SYSTEM_FAILURE_REASON_CODES["upload_transfer"],
+                    created_at=now,
+                )
             return cur.rowcount
 
     def compare_and_set_upload_request_axis(
@@ -2056,9 +2783,15 @@ class Store:
         now = time.time()
         if axis == "transfer":
             legacy_status = {"stored": "done"}.get(new_status, new_status)
-            sql = """UPDATE upload_requests
+            generation_sql = (
+                "transfer_failure_generation = transfer_failure_generation + 1,"
+                if new_status == "failed" and expected != "failed"
+                else ""
+            )
+            sql = f"""UPDATE upload_requests
                      SET transfer_status = ?, transfer_error = ?,
-                         status = ?, error_message = ?, result_json = ?, updated_at = ?
+                         status = ?, error_message = ?, result_json = ?,
+                         {generation_sql} updated_at = ?
                      WHERE request_id = ? AND student_id = ?
                        AND transfer_status = ?"""
             params: tuple[Any, ...] = (
@@ -2094,8 +2827,14 @@ class Store:
                            )
                          )
                        )"""
+            generation_sql = (
+                "analysis_failure_generation = analysis_failure_generation + 1,"
+                if new_status == "failed" and expected != "failed"
+                else ""
+            )
             sql = f"""UPDATE upload_requests
-                      SET analysis_status = ?, analysis_error = ?, updated_at = ?
+                      SET analysis_status = ?, analysis_error = ?,
+                          {generation_sql} updated_at = ?
                       WHERE request_id = ? AND student_id = ?
                         AND analysis_status = ?{child_guard}"""
             params = (
@@ -2107,7 +2846,33 @@ class Store:
                 expected,
             )
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             cur = c.execute(sql, params)
+            if cur.rowcount == 1 and new_status == "failed" and expected != "failed":
+                row = c.execute(
+                    """SELECT request_id, student_id, session_id,
+                              transfer_failure_generation,
+                              analysis_failure_generation
+                       FROM upload_requests WHERE request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is not None:
+                    if axis == "transfer":
+                        kind = "upload_transfer"
+                        generation = row["transfer_failure_generation"]
+                    else:
+                        kind = "upload_analysis"
+                        generation = row["analysis_failure_generation"]
+                    self._insert_system_failure_occurrence_with_conn(
+                        c,
+                        kind=kind,
+                        logical_key=request_id,
+                        generation=generation,
+                        student_id=row["student_id"],
+                        session_id=row["session_id"],
+                        reason_code=SYSTEM_FAILURE_REASON_CODES[kind],
+                        created_at=now,
+                    )
             return cur.rowcount
 
     def get_raw_transcript(self, session_id: str) -> dict | None:
@@ -2118,6 +2883,22 @@ class Store:
                    ORDER BY created_at DESC, id DESC
                    LIMIT 1""",
                 (session_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_raw_transcript_analysis_source(
+        self,
+        raw_id: int,
+        generation: int,
+    ) -> dict[str, Any] | None:
+        """Return only bounded durable axes for one bulk failure generation."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT id, student_id, session_id, analysis_status,
+                          analysis_generation, created_at
+                   FROM raw_transcripts
+                   WHERE id = ? AND analysis_generation = ?""",
+                (raw_id, generation),
             ).fetchone()
             return dict(row) if row else None
 
@@ -2366,6 +3147,15 @@ class Store:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_student_ask(self, ask_id: int) -> dict[str, Any] | None:
+        """Return one durable ask for projection after its source commit."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM student_asks WHERE id = ?",
+                (ask_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def set_analysis_pending(self, report_id: int, pending: bool) -> int:
         with self._conn() as c:
             cur = c.execute(
@@ -2431,9 +3221,14 @@ class Store:
             if not row:
                 return None
             current = dict(row)
+            current_status = str(current.get("analysis_status") or "")
             if (
                 current.get("event") != "Stop"
-                or str(current.get("analysis_status") or "") not in {"pending", "failed"}
+                or current_status not in {"pending", "failed"}
+                or (
+                    current_status == "failed"
+                    and current.get("analysis_next_retry_at") is None
+                )
                 or current.get("analysis_input") is None
                 or int(current.get("analysis_attempts") or 0) >= max_attempts
             ):
@@ -2448,6 +3243,10 @@ class Store:
                        analysis_pending = 1
                    WHERE id = ?
                      AND analysis_status IN ('pending', 'failed')
+                     AND (
+                       analysis_status = 'pending'
+                       OR analysis_next_retry_at IS NOT NULL
+                     )
                      AND analysis_input IS NOT NULL
                      AND analysis_attempts < ?""",
                 (next_attempt, report_id, max_attempts),
@@ -2468,6 +3267,7 @@ class Store:
     ) -> int:
         """Terminally fail a legacy report whose durable input is unknowable."""
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             cur = c.execute(
                 """UPDATE reports
                    SET analysis_status = 'failed',
@@ -2482,6 +3282,24 @@ class Store:
                      AND analysis_attempts < ?""",
                 (max_attempts, report_id, max_attempts),
             )
+            if cur.rowcount == 1:
+                row = c.execute(
+                    """SELECT id, student_id, session_id, analysis_attempts
+                       FROM reports WHERE id = ?""",
+                    (report_id,),
+                ).fetchone()
+                if row is not None:
+                    self._insert_system_failure_occurrence_with_conn(
+                        c,
+                        kind="stop",
+                        logical_key=row["id"],
+                        generation=row["analysis_attempts"],
+                        student_id=row["student_id"],
+                        session_id=row["session_id"],
+                        reason_code=SYSTEM_FAILURE_REASON_CODES[
+                            "stop_input_unavailable"
+                        ],
+                    )
             return cur.rowcount
 
     def mark_report_analysis_failed(
@@ -2497,6 +3315,7 @@ class Store:
     ) -> int:
         """Persist one failed attempt without erasing its durable input."""
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             cur = c.execute(
                 """UPDATE reports
                    SET analysis_status = 'failed',
@@ -2523,11 +3342,37 @@ class Store:
                     attempt,
                 ),
             )
+            if cur.rowcount == 1 and next_retry_at is None:
+                row = c.execute(
+                    """SELECT id, student_id, session_id, analysis_attempts
+                       FROM reports WHERE id = ?""",
+                    (report_id,),
+                ).fetchone()
+                if row is not None:
+                    self._insert_system_failure_occurrence_with_conn(
+                        c,
+                        kind="stop",
+                        logical_key=row["id"],
+                        generation=row["analysis_attempts"],
+                        student_id=row["student_id"],
+                        session_id=row["session_id"],
+                        reason_code=SYSTEM_FAILURE_REASON_CODES[
+                            "stop_retries_exhausted"
+                        ],
+                    )
             return cur.rowcount
 
     def recover_interrupted_report_analyses(self, *, max_attempts: int = 3) -> int:
         """Make process-crash ``running`` claims visible to startup recovery."""
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            terminal = c.execute(
+                """SELECT id, student_id, session_id, analysis_attempts
+                   FROM reports
+                   WHERE event = 'Stop' AND analysis_status = 'running'
+                     AND analysis_attempts >= ?""",
+                (max_attempts,),
+            ).fetchall()
             cur = c.execute(
                 """UPDATE reports
                    SET analysis_status = 'failed',
@@ -2540,6 +3385,18 @@ class Store:
                    WHERE event = 'Stop' AND analysis_status = 'running'""",
                 (max_attempts,),
             )
+            for row in terminal:
+                self._insert_system_failure_occurrence_with_conn(
+                    c,
+                    kind="stop",
+                    logical_key=row["id"],
+                    generation=row["analysis_attempts"],
+                    student_id=row["student_id"],
+                    session_id=row["session_id"],
+                    reason_code=SYSTEM_FAILURE_REASON_CODES[
+                        "stop_retries_exhausted"
+                    ],
+                )
             return cur.rowcount
 
     def list_recoverable_reports(self, *, max_attempts: int = 3) -> list[dict]:
@@ -2547,7 +3404,13 @@ class Store:
             rows = c.execute(
                 """SELECT * FROM reports
                    WHERE event = 'Stop'
-                     AND analysis_status IN ('pending', 'failed')
+                     AND (
+                       analysis_status = 'pending'
+                       OR (
+                         analysis_status = 'failed'
+                         AND analysis_next_retry_at IS NOT NULL
+                       )
+                     )
                      AND analysis_attempts < ?
                    ORDER BY id ASC""",
                 (max_attempts,),
@@ -2800,7 +3663,7 @@ class Store:
                 msg_count=msg_count,
                 tool_calls=0,
             )
-            self._add_analysis_with_conn(
+            analysis_id = self._add_analysis_with_conn(
                 c,
                 report_id=report_id,
                 student_id=student_id,
@@ -2857,7 +3720,11 @@ class Store:
                      AND analysis_status IN ('pending', 'running', 'failed')""",
                 (now, student_id, session_id, content_sha256),
             )
-            return {"report_id": report_id, "request_ids": request_ids}
+            return {
+                "report_id": report_id,
+                "analysis_id": analysis_id,
+                "request_ids": request_ids,
+            }
 
     def recent_analyses(
         self,
@@ -2884,6 +3751,217 @@ class Store:
                 params,
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_analysis(self, analysis_id: int) -> dict[str, Any] | None:
+        """Return one durable analysis for projection after its source commit."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT a.*, r.event, r.prompt, r.created_at AS report_at
+                   FROM analyses a JOIN reports r ON a.report_id = r.id
+                   WHERE a.id = ?""",
+                (analysis_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recent_analyses_as_of(
+        self,
+        *,
+        student_id: str,
+        created_at: float,
+        analysis_id: int,
+        session_id: str | None,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return a historical policy window bounded by ``(created_at, id)``."""
+        if limit <= 0:
+            return []
+        clauses = [
+            "a.student_id = ?",
+            "(a.created_at < ? OR (a.created_at = ? AND a.id <= ?))",
+        ]
+        params: list[Any] = [student_id, created_at, created_at, analysis_id]
+        if session_id:
+            clauses.append("a.session_id = ?")
+            params.append(session_id)
+        params.append(min(int(limit), 100))
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT a.*, r.event, r.prompt, r.created_at AS report_at
+                    FROM analyses a JOIN reports r ON a.report_id = r.id
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY a.created_at DESC, a.id DESC
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_attention_backfill_cursor_state(
+        self,
+        source_kind: str,
+    ) -> tuple[int, int]:
+        if source_kind not in ATTENTION_BACKFILL_SOURCE_KINDS:
+            raise ValueError("invalid attention backfill source kind")
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT last_id, version FROM attention_backfill_cursors
+                   WHERE source_kind = ?""",
+                (source_kind,),
+            ).fetchone()
+            if row is None:
+                return 0, 0
+            return (
+                max(0, int(row["last_id"] or 0)),
+                max(0, int(row["version"] or 0)),
+            )
+
+    def compare_and_set_attention_backfill_cursor(
+        self,
+        source_kind: str,
+        *,
+        expected_version: int,
+        last_id: int,
+    ) -> int | None:
+        """Advance or wrap a cursor only for the caller's observed version."""
+        if source_kind not in ATTENTION_BACKFILL_SOURCE_KINDS:
+            raise ValueError("invalid attention backfill source kind")
+        normalized_id = max(0, int(last_id))
+        normalized_version = max(0, int(expected_version))
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                """SELECT version FROM attention_backfill_cursors
+                   WHERE source_kind = ?""",
+                (source_kind,),
+            ).fetchone()
+            current_version = max(0, int(row["version"] or 0)) if row else 0
+            if current_version != normalized_version:
+                return None
+            next_version = current_version + 1
+            if row is None:
+                c.execute(
+                    """INSERT INTO attention_backfill_cursors
+                       (source_kind, last_id, version, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (source_kind, normalized_id, next_version, time.time()),
+                )
+            else:
+                changed = c.execute(
+                    """UPDATE attention_backfill_cursors
+                       SET last_id = ?, version = ?, updated_at = ?
+                       WHERE source_kind = ? AND version = ?""",
+                    (
+                        normalized_id,
+                        next_version,
+                        time.time(),
+                        source_kind,
+                        current_version,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    return None
+            return next_version
+
+    def list_attention_analysis_sources(
+        self,
+        *,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT id FROM analyses
+                   WHERE id > ? ORDER BY id ASC LIMIT ?""",
+                (max(0, int(after_id)), limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_attention_ask_sources(
+        self,
+        *,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT id FROM student_asks
+                   WHERE id > ? ORDER BY id ASC LIMIT ?""",
+                (max(0, int(after_id)), limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_attention_stop_sources(
+        self,
+        *,
+        after: tuple[float, int] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        cursor_clause = ""
+        params: list[Any] = []
+        if after is not None:
+            cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
+            params.extend((after[0], after[0], after[1]))
+        params.append(limit)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT id, created_at FROM reports
+                    WHERE event = 'Stop'
+                      AND (
+                        analysis_error = 'analysis_input_unavailable'
+                        OR (analysis_status = 'failed' AND analysis_attempts >= 3)
+                      )
+                      {cursor_clause}
+                    ORDER BY created_at ASC, id ASC LIMIT ?""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_attention_upload_sources(
+        self,
+        *,
+        after: tuple[float, str] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        cursor_clause = ""
+        params: list[Any] = []
+        if after is not None:
+            cursor_clause = (
+                "AND (created_at > ? OR (created_at = ? AND request_id > ?))"
+            )
+            params.extend((after[0], after[0], after[1]))
+        params.append(limit)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT request_id, created_at FROM upload_requests
+                    WHERE transfer_status = 'failed'
+                      {cursor_clause}
+                    ORDER BY created_at ASC, request_id ASC LIMIT ?""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_attention_raw_sources(
+        self,
+        *,
+        after: tuple[int, int] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        cursor_clause = ""
+        params: list[Any] = []
+        if after is not None:
+            cursor_clause = (
+                "AND (id > ? OR (id = ? AND analysis_generation > ?))"
+            )
+            params.extend((after[0], after[0], after[1]))
+        params.append(limit)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT id, analysis_generation FROM raw_transcripts
+                    WHERE analysis_status = 'failed'
+                      {cursor_clause}
+                    ORDER BY id ASC, analysis_generation ASC LIMIT ?""",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def get_prompt_for_report(self, report_id: int) -> dict | None:
         """Return the durable Stop prompt associated with one report."""
@@ -3402,12 +4480,44 @@ class Store:
         """学员列表 + 状态概览（按 student_id 聚合）。"""
         with self._conn() as c:
             rows = c.execute(
-                """SELECT
+                """WITH analysis_aggregate AS (
+                     SELECT
+                       student_id,
+                       COUNT(id) AS analysis_count,
+                       COUNT(DISTINCT session_id) AS session_count,
+                       MAX(created_at) AS last_ts,
+                       MAX(CASE severity
+                         WHEN 'error' THEN 3
+                         WHEN 'warn' THEN 2
+                         ELSE 1
+                       END) AS severity_rank,
+                       SUM(CASE
+                         WHEN COALESCE(alert, '') != ''
+                           OR understanding IN ('low','stuck')
+                         THEN 1 ELSE 0 END) AS alert_count
+                     FROM analyses
+                     GROUP BY student_id
+                   ),
+                   active_attention AS (
+                     SELECT
+                       student_id,
+                       COUNT(id) AS open_attention_count,
+                       MAX(CASE priority
+                         WHEN 'high' THEN 2
+                         WHEN 'medium' THEN 1
+                         ELSE 0
+                       END) AS priority_rank,
+                       MAX(created_at) AS last_attention_at
+                     FROM attention_items
+                     WHERE status IN ('open', 'in_progress')
+                     GROUP BY student_id
+                   )
+                   SELECT
                      s.student_id,
                      s.display_name AS display_name,
-                     COALESCE(COUNT(a.id), 0) AS analysis_count,
-                     COALESCE(COUNT(DISTINCT a.session_id), 0) AS session_count,
-                     COALESCE(MAX(a.created_at), s.created_at, 0) AS last_ts,
+                     COALESCE(a.analysis_count, 0) AS analysis_count,
+                     COALESCE(a.session_count, 0) AS session_count,
+                     COALESCE(a.last_ts, s.created_at, 0) AS last_ts,
                      COALESCE((
                        SELECT a2.topic
                        FROM analyses a2
@@ -3415,30 +4525,30 @@ class Store:
                        ORDER BY a2.created_at DESC, a2.id DESC
                        LIMIT 1
                      ), '') AS last_topic,
-                     CASE COALESCE(MAX(CASE a.severity
-                       WHEN 'error' THEN 3
-                       WHEN 'warn' THEN 2
-                       ELSE 1
-                     END), 1)
+                     CASE COALESCE(a.severity_rank, 1)
                        WHEN 3 THEN 'error'
                        WHEN 2 THEN 'warn'
                        ELSE 'info'
                      END AS last_severity,
-                     COALESCE(SUM(CASE
-                       WHEN COALESCE(a.alert, '') != ''
-                         OR a.understanding IN ('low','stuck')
-                       THEN 1 ELSE 0 END), 0) AS alert_count,
+                     COALESCE(a.alert_count, 0) AS alert_count,
                      COALESCE((
                        SELECT a2.diagnosis
                        FROM analyses a2
                        WHERE a2.student_id = s.student_id
                        ORDER BY a2.created_at DESC, a2.id DESC
                        LIMIT 1
-                     ), '') AS last_diagnosis
+                     ), '') AS last_diagnosis,
+                     COALESCE(att.open_attention_count, 0) AS open_attention_count,
+                     CASE COALESCE(att.priority_rank, 0)
+                       WHEN 2 THEN 'high'
+                       WHEN 1 THEN 'medium'
+                       ELSE ''
+                     END AS highest_attention_priority,
+                     COALESCE(att.last_attention_at, 0) AS last_attention_at
                    FROM students s
-                   LEFT JOIN analyses a ON a.student_id = s.student_id
-                   GROUP BY s.student_id
-                   ORDER BY COALESCE(MAX(a.created_at), s.created_at, 0) DESC
+                   LEFT JOIN analysis_aggregate a ON a.student_id = s.student_id
+                   LEFT JOIN active_attention att ON att.student_id = s.student_id
+                   ORDER BY COALESCE(a.last_ts, s.created_at, 0) DESC
                    LIMIT ?""",
                 (limit,),
             ).fetchall()
@@ -3476,6 +4586,13 @@ class Store:
         """Delete one student's persisted data in a single transaction."""
         deleted: dict[str, int] = {}
         with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM attention_items WHERE student_id = ?",
+                (student_id,),
+            )
+            if cur.rowcount:
+                deleted["attention_items"] = cur.rowcount
+
             cur = c.execute(
                 """DELETE FROM analyses
                    WHERE student_id = ?

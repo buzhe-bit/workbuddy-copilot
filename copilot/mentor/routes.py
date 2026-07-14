@@ -10,16 +10,24 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from ..app_context import get_session_service, get_store
+from ..app_context import get_attention_service, get_session_service, get_store
+from ..attention import AttentionService
 from ..services import SessionQueryService
 from ..store import Store
 
 router = APIRouter(prefix="/api/mentor", tags=["mentor"])
 log = logging.getLogger("copilot.mentor.routes")
+
+
+class AttentionUpdateIn(BaseModel):
+    status: Literal["in_progress", "resolved", "dismissed"]
+    mentor_id: str = Field(min_length=1, max_length=200)
+    note: str = Field(default="", max_length=500)
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -70,6 +78,49 @@ async def list_students(session_svc: SessionQueryService = Depends(get_session_s
     """返回学员列表 + 状态概览。"""
     students = session_svc.list_students()
     return {"items": [s.__dict__ for s in students]}
+
+
+@router.get("/attention")
+async def list_attention(
+    status: Literal["open", "in_progress", "resolved", "dismissed"] | None = None,
+    priority: Literal["high", "medium"] | None = None,
+    category: Literal["learning", "system"] | None = None,
+    student_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+    attention_svc: AttentionService = Depends(get_attention_service),
+):
+    """Return the authoritative mentor attention queue."""
+    return {
+        "items": attention_svc.list_attention(
+            status=status,
+            priority=priority,
+            category=category,
+            student_id=student_id,
+            limit=limit,
+        ),
+    }
+
+
+@router.patch("/attention/{item_id}")
+async def update_attention(
+    item_id: int,
+    body: AttentionUpdateIn,
+    attention_svc: AttentionService = Depends(get_attention_service),
+):
+    """Apply a transactional queue transition and publish true changes."""
+    try:
+        return await attention_svc.update_attention(
+            item_id,
+            status=body.status,
+            mentor_id=body.mentor_id,
+            note=body.note,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        if str(exc) == "attention status conflict":
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/students/{student_id}/sessions")

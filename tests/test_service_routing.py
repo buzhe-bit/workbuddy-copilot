@@ -549,12 +549,17 @@ def test_concurrent_duplicate_stop_reschedules_once(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("analysis_status", "analysis_attempts", "expected_wrapper_calls"),
+    (
+        "analysis_status",
+        "analysis_attempts",
+        "analysis_next_retry_at",
+        "expected_wrapper_calls",
+    ),
     [
-        ("failed", 1, 1),
-        ("running", 1, 0),
-        ("done", 1, 0),
-        ("failed", 3, 0),
+        ("failed", 1, 0.0, 1),
+        ("running", 1, None, 0),
+        ("done", 1, None, 0),
+        ("failed", 3, None, 0),
     ],
 )
 def test_duplicate_stop_schedules_only_recoverable_states(
@@ -562,6 +567,7 @@ def test_duplicate_stop_schedules_only_recoverable_states(
     monkeypatch,
     analysis_status,
     analysis_attempts,
+    analysis_next_retry_at,
     expected_wrapper_calls,
 ):
     async def scenario():
@@ -578,9 +584,15 @@ def test_duplicate_stop_schedules_only_recoverable_states(
         with store._conn() as conn:
             conn.execute(
                 """UPDATE reports
-                   SET analysis_status = ?, analysis_attempts = ?
+                   SET analysis_status = ?, analysis_attempts = ?,
+                       analysis_next_retry_at = ?
                    WHERE id = ?""",
-                (analysis_status, analysis_attempts, accepted.report_id),
+                (
+                    analysis_status,
+                    analysis_attempts,
+                    analysis_next_retry_at,
+                    accepted.report_id,
+                ),
             )
         wrapper_calls = 0
 

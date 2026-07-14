@@ -74,6 +74,32 @@ class Student:
     last_severity: str = "info"
     alert_count: int = 0
     last_diagnosis: str = ""
+    open_attention_count: int = 0
+    highest_attention_priority: str = ""
+    last_attention_at: float = 0.0
+
+
+AttentionSourceType = Literal["analysis", "student_ask", "system"]
+AttentionCategory = Literal["learning", "system"]
+AttentionPriority = Literal["high", "medium"]
+
+
+@dataclass(frozen=True)
+class AttentionDecision:
+    """A bounded, persistence-ready mentor-attention projection."""
+
+    source_type: AttentionSourceType
+    source_id: str
+    category: AttentionCategory
+    student_id: str
+    session_id: str
+    priority: AttentionPriority
+    reason_code: str
+    reason: str
+    evidence: tuple[str, ...] = ()
+    suggested_action: str = ""
+    confidence: float = 0.5
+    created_at: float = 0.0
 
 
 @dataclass

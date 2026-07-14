@@ -16,7 +16,7 @@ Tasks:
 - Task 2: completed and independently APPROVED (`741bc82`, fixes `e5e656a`, `95bed8f`); final local 3.14 full regression 602 passed / 2 known baseline failures / 1 warning, Python 3.13 release lane remains external.
 - Task 3: completed and independently APPROVED (`dd8daad`, fixes `796d974`, `8774436`); final local Python 3.14 full browser regression 674 passed / 2 known baseline failures / 1 warning, Python 3.13 release lane remains external.
 - Task 4: completed and independently APPROVED (`e8f2a4a`); final local Python 3.14 diagnostic: focused 62 passed, focused + adjacent 131 passed, non-e2e 707 passed / 2 known baseline failures / 1 warning; Python 3.13 and human dual annotation gates remain external.
-- Task 5: pending
+- Task 5: implementation complete and independently APPROVED (C0/I0/M0), focused 83 passed and adjacent 279 passed; no commit yet. Local Python 3.14 non-browser diagnostic 790 passed / 2 known baseline failures / 1 warning; Python 3.13 release lane remains external.
 - Task 6: pending
 - Task 7: pending
 - Task 8: pending
@@ -26,4 +26,4 @@ Tasks:
 - Task 12: pending — 10/50/100/300 student scale, failure and soak gates.
 - Task 13: pending — at least 25 pre-registered cost experiments plus external mirror.
 
-Current branch: `codex/workbuddy-c-diagnosis-evaluation`
+Current branch: `codex/workbuddy-d-attention-backend`

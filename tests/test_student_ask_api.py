@@ -175,7 +175,13 @@ def test_configured_provider_failure_persists_failed_attention_status(tmp_path, 
     stored = store.list_student_asks("stu-1")[0]
     assert stored["answer_status"] == "failed"
     assert stored["error_code"] == "llm_timeout"
-    assert [event["type"] for event in events] == ["student_ask"]
+    assert [event["type"] for event in events] == [
+        "attention_updated",
+        "student_ask",
+    ]
+    attention_event = events[0]
+    assert attention_event["item"]["reason_code"] == "student_ask_failed"
+    assert "为什么超时" not in json.dumps(attention_event, ensure_ascii=False)
 
 
 def test_outer_question_timeout_is_failed_without_dropping_safe_answer(tmp_path, monkeypatch):

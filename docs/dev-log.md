@@ -2123,3 +2123,30 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 | 复审补充 | category / priority 的 JSON 容器型 unhashable 漏洞 4 failed → 16 passed |
 | 最终独立复审 | feature commit `e8f2a4a`：C0 / I0 / M0，Approved |
 | 详细合同 | 见 `docs/diagnosis-evaluation.md` 与 `.superpowers/sdd/task-4-report.md` |
+
+### Task 5 Plan D1：耐久导师关注投影 — 2026-07-14
+
+- 新增 `attention_items` 耐久投影、确定性 AttentionPolicy、并发幂等 Store API 和状态
+  CAS。analysis 用最近 3 次的 historical as-of 窗口；ask 降级/失败/未解决与
+  Stop/upload/bulk system failure 用独立 reason/source key，终态项重放不重开。
+- 投影顺序固定为 durable source commit -> Store 重读 -> attention insert -> creator-only
+  publish。Stop、Bulk、ask、feedback、upload 和 startup recovery 均已接线；投影异常
+  不回滚或掩盖源提交。
+- Backfill 按 analysis/ask/Stop/upload/raw 分类游标分页。公平性 RED 暴露全局
+  cap 的后序饥饿后，将 `max_sources` 定义为每类上限，六类来源单次
+  总量最多 `6 * max_sources`。每类使用持久 version CAS 游标，避免并发回退。
+- Mentor GET/PATCH 返回 bounded reason/evidence/action 和处理状态；WS 使用专用
+  mentor-only 分支且排除 resolution note，学员 float 不收到 attention event。学员概览
+  使用独立 active-attention 子聚合，不与 analyses 乘法放大。
+
+| 阶段 | 结果 |
+|---|---|
+| Task 5 focused | 83 passed / 1 个既有 Starlette warning |
+| 聚焦 + 相邻 13 文件 | 279 passed / 1 个既有 warning |
+| 非 browser 全量（Python 3.14 诊断） | 790 passed / 2 个已登记基线 failed / 1 warning |
+| 基线失败 | `fcntl` platform-import 探针；双 worker 短暂 `/health` |
+| 详细 RED/GREEN | 见 `.superpowers/sdd/task-5-report.md` |
+
+独立审查后补强了不可变失败 occurrence、Stop 终态恢复边界、legacy seed
+顺序、并发游标 CAS、精确身份/删除级联和持久化后 fanout 隔离。实现已
+修复。最终独立复审为 Critical 0 / Important 0 / Minor 0，APPROVE。
