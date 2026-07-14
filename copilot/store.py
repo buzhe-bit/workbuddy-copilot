@@ -3673,6 +3673,7 @@ class Store:
         session_title: str | None = None,
     ) -> int:
         with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             return self._add_analysis_with_conn(
                 c,
                 report_id=report_id,
@@ -3694,6 +3695,16 @@ class Store:
         attempt_count: int = 0,
     ) -> int:
         """Insert analysis details using an existing transaction."""
+        report = c.execute(
+            "SELECT student_id FROM reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        if report is None:
+            raise sqlite3.IntegrityError("analysis report does not exist")
+        report_student_id = str(report["student_id"] or "")
+        if report_student_id != student_id:
+            raise ValueError("report owner mismatch")
+
         cur = c.execute(
             """INSERT INTO analyses
                (report_id, student_id, session_id, session_title,
@@ -3704,7 +3715,7 @@ class Store:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 report_id,
-                student_id,
+                report_student_id,
                 session_id,
                 session_title,
                 result.get("topic", ""),
@@ -3861,8 +3872,8 @@ class Store:
             clauses = []
             params: list = []
             if student_id:
-                clauses.append("a.student_id = ?")
-                params.append(student_id)
+                clauses.append("a.student_id = ? AND r.student_id = ?")
+                params.extend((student_id, student_id))
             if session_id:
                 clauses.append("a.session_id = ?")
                 params.append(session_id)
@@ -3870,7 +3881,8 @@ class Store:
             params.append(limit)
             rows = c.execute(
                 f"""SELECT a.*, r.event, r.prompt, r.created_at AS report_at
-                    FROM analyses a JOIN reports r ON a.report_id = r.id
+                    FROM analyses a JOIN reports r
+                      ON a.report_id = r.id AND a.student_id = r.student_id
                     {where}
                     ORDER BY a.created_at DESC LIMIT ?""",
                 params,

@@ -317,6 +317,21 @@ class TestStore:
         })
         assert aid > 0
 
+    def test_add_analysis_rejects_report_owner_mismatch(self, store):
+        report_id = store.add_report(
+            "bob", "bob-session", "Stop", "bob prompt", "/tmp/x", 1, 0
+        )
+
+        with pytest.raises(ValueError, match="report owner mismatch"):
+            store.add_analysis(
+                report_id,
+                "alice",
+                {"topic": "must not persist", "understanding": "high"},
+                session_id="alice-session",
+            )
+
+        assert store.recent_analyses(None, limit=10) == []
+
     def test_recent_analyses_empty(self, store):
         rows = store.recent_analyses(student_id=None, limit=10)
         assert rows == []

@@ -136,6 +136,7 @@ let uploadTrackingGeneration = 0;
 let uploadAttemptGeneration = 0;
 let studentSelectionGeneration = 0;
 let studentLoadGeneration = 0;
+let systemStatusLoadGeneration = 0;
 let studentAggregateRefreshTimer = null;
 let mentorReauthPromise = null;
 const MENTOR_TOKEN_STORAGE_KEY = 'workbuddy_copilot_mentor_token';
@@ -704,7 +705,7 @@ async function loadAttention() {
 }
 
 async function refreshAttentionData() {
-  await Promise.all([loadStudents(), loadAttention()]);
+  await Promise.all([loadStudents(), loadAttention(), loadSystemStatus()]);
 }
 
 function scheduleStudentAggregateRefresh() {
@@ -872,12 +873,16 @@ function renderSystemStatus() {
 
 async function loadSystemStatus() {
   if (!systemStatusEl) return;
+  const generation = ++systemStatusLoadGeneration;
   try {
     const resp = await authFetch('/api/mentor/system-status');
     if (!resp.ok) throw new Error('system_status_http_' + resp.status);
-    state.systemStatus = await resp.json();
+    const payload = await resp.json();
+    if (generation !== systemStatusLoadGeneration) return;
+    state.systemStatus = payload;
     renderSystemStatus();
   } catch (err) {
+    if (generation !== systemStatusLoadGeneration) return;
     systemStatusEl.textContent = '系统状态不可用';
     systemStatusEl.dataset.level = 'error';
     console.error('加载系统状态失败', err);

@@ -190,11 +190,19 @@ def test_delete_student_removes_fk_children_even_if_child_student_id_drifted(sto
     report_id = store.add_report("student-a", "session-a", "Stop", "p", "", 1, 0)
     analysis_id = store.add_analysis(
         report_id,
-        "student-b",
+        "student-a",
         {"topic": "drifted analysis", "understanding": "high"},
-        "session-b",
-        "wrong student child",
+        "session-a",
+        "original owner child",
     )
+    # 新写路径会拒绝 owner 错配；直接污染底层行来模拟升级前旧库脏数据。
+    with store._conn() as conn:
+        conn.execute(
+            """UPDATE analyses
+               SET student_id = ?, session_id = ?, session_title = ?
+               WHERE id = ?""",
+            ("student-b", "session-b", "wrong student child", analysis_id),
+        )
     prompt_id = store.add_prompt("session-a", 0, "student-a", "prompt-a")
     summary_id = store.add_ai_summary(
         prompt_id,

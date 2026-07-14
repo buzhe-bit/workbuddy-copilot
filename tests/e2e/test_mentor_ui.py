@@ -402,6 +402,91 @@ def test_system_failures_are_visible_without_exposing_record_content(page, stati
     expect(status).not_to_contain_text("provider")
 
 
+def test_system_status_refreshes_on_manual_refresh_and_every_ws_open(page, static_server):
+    page.add_init_script("""
+      window.WebSocket = class ControlledWebSocket {
+        constructor() {
+          window.__controlledMentorSockets = window.__controlledMentorSockets || [];
+          window.__controlledMentorSockets.push(this);
+        }
+      };
+    """)
+    system_status = {
+        "version": "0.2.0",
+        "pending_analyses": 1,
+        "failed_analyses": 0,
+        "open_attention": 0,
+        "float_connections": 0,
+        "mentor_connections": 1,
+        "windows_rollout_status": "implementation_candidate",
+    }
+    install_api_routes(page, system_status=system_status)
+    page.goto(static_server + "/index.html")
+
+    status = page.locator("#system-status")
+    expect(status).to_have_text("待分析 1 · Windows 候选版")
+
+    system_status["pending_analyses"] = 0
+    system_status["failed_analyses"] = 2
+    expect(page.locator("#attention-refresh")).to_be_enabled()
+    page.locator("#attention-refresh").click()
+    expect(status).to_have_text("失败 2 · Windows 候选版")
+
+    system_status["failed_analyses"] = 0
+    page.evaluate("window.__controlledMentorSockets.at(-1).onopen()")
+    expect(status).to_have_text("系统正常 · Windows 候选版")
+
+
+def test_newer_system_status_response_wins_when_requests_finish_out_of_order(
+    page,
+    static_server,
+):
+    open_console(page, static_server)
+    expect(page.locator("#system-status")).to_have_text("系统正常 · Windows 待实机")
+
+    page.evaluate("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.__systemStatusResolvers = [];
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/system-status') {
+            return new Promise((resolve) => {
+              window.__systemStatusResolvers.push((payload) => resolve(new Response(
+                JSON.stringify(payload),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              )));
+            });
+          }
+          return realFetch(input, options);
+        };
+        void window.loadSystemStatus();
+        void window.loadSystemStatus();
+      })();
+    """)
+    page.wait_for_function("() => window.__systemStatusResolvers.length === 2")
+
+    page.evaluate("""
+      window.__systemStatusResolvers[1]({
+        pending_analyses: 0,
+        failed_analyses: 1,
+        windows_rollout_status: 'implementation_candidate'
+      })
+    """)
+    status = page.locator("#system-status")
+    expect(status).to_have_text("失败 1 · Windows 候选版")
+
+    page.evaluate("""
+      window.__systemStatusResolvers[0]({
+        pending_analyses: 9,
+        failed_analyses: 0,
+        windows_rollout_status: 'BLOCKED: old response'
+      })
+    """)
+    page.wait_for_timeout(50)
+    expect(status).to_have_text("失败 1 · Windows 候选版")
+
+
 # ─────────────────────────────────────────────────────────────
 # FE-2（B3 回归）：点一个对话，另一个对话的状态圆点 class 不被刷绿、分析计数不清零。
 # 若把 app.js 改回"从 DOM 反读重建"（selectSession 重算 severity），

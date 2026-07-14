@@ -596,3 +596,30 @@ def test_mapped_student_websocket_rejects_spoof_and_derives_identity_when_omitte
             ws.send_text("mapped principal owns this socket")
 
     assert not seeded.registry.floats
+
+
+def test_recent_excludes_dirty_legacy_analysis_linked_to_another_students_report(
+    tmp_path,
+):
+    seeded = _build_identity_app(tmp_path)
+    other_prompt = f"seed prompt from {STUDENT_B}"
+    with seeded.store._conn() as conn:
+        other_report = conn.execute(
+            "SELECT id FROM reports WHERE student_id = ? AND prompt = ?",
+            (STUDENT_B, other_prompt),
+        ).fetchone()
+        assert other_report is not None
+        updated = conn.execute(
+            "UPDATE analyses SET report_id = ? WHERE student_id = ?",
+            (int(other_report["id"]), STUDENT_A),
+        ).rowcount
+        assert updated == 1
+
+    with TestClient(seeded.app) as client:
+        response = client.get("/recent", headers=_mapped_headers())
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert all(item["student_id"] == STUDENT_A for item in items)
+    assert all(item["prompt"] != other_prompt for item in items)
+    assert all(item["report_id"] != int(other_report["id"]) for item in items)

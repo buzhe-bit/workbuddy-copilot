@@ -266,10 +266,16 @@ def _legacy_token(config: dict[str, Any]) -> str:
     )
 
 
-def _auth_is_public(config: dict[str, Any]) -> bool:
-    mode = str(config.get("auth", {}).get("mode", "") or "").lower()
+def _auth_allows_local_compatibility(config: dict[str, Any]) -> bool:
+    """Only legacy-empty/local/demo modes may keep tokenless/shared access."""
+    auth = config.get("auth")
+    mode = str(auth.get("mode", "") or "").lower() if isinstance(auth, dict) else ""
     env_public = str(os.environ.get("COPILOT_PUBLIC", "") or "").lower()
-    return mode in {"public", "production", "prod"} or env_public in {"1", "true", "yes"}
+    return mode in {"", "local", "demo"} and env_public not in {"1", "true", "yes"}
+
+
+def _auth_requires_credentials(config: dict[str, Any]) -> bool:
+    return not _auth_allows_local_compatibility(config)
 
 
 def _role_token(config: dict[str, Any], role: str | None = None) -> str:
@@ -362,14 +368,11 @@ def shared_student_token_is_allowed(config: dict[str, Any]) -> bool:
     token behavior unless explicitly disabled. Every other mode rejects it;
     a per-student mapping is the only supported non-local student boundary.
     """
-    if _auth_is_public(config):
+    if not _auth_allows_local_compatibility(config):
         return False
     auth = config.get("auth")
     if not isinstance(auth, dict):
         auth = {}
-    mode = str(auth.get("mode", "") or "").lower()
-    if mode not in {"", "local", "demo"}:
-        return False
     configured = auth.get("allow_shared_student_token")
     if configured is not None:
         return configured is True
@@ -414,7 +417,7 @@ def student_principal_for_token(
     if expected:
         if not hmac.compare_digest(supplied_token or "", expected):
             return None
-    elif _has_student_token_mapping(config) or _auth_is_public(config):
+    elif _has_student_token_mapping(config) or _auth_requires_credentials(config):
         # A configured mapping must close the historical tokenless local
         # fallback for unknown callers.
         return None
@@ -448,7 +451,7 @@ def resolve_student_id(
 
 
 def validate_auth_config(config: dict[str, Any]) -> None:
-    """Fail fast for internet-facing mode without role-specific tokens."""
+    """Fail closed for every mode outside legacy-empty/local/demo."""
     auth = config.get("auth", {}) or {}
     if not isinstance(auth, dict):
         raise RuntimeError("auth must be an object")
@@ -464,18 +467,27 @@ def validate_auth_config(config: dict[str, Any]) -> None:
         )
     if _student_token_mapping_has_duplicates(config):
         raise RuntimeError("auth.student_tokens contains duplicate mapped tokens")
-    if not _auth_is_public(config):
+    if _auth_allows_local_compatibility(config):
         return
     missing: list[str] = []
     if not _has_student_token_mapping(config):
         missing.append("student_tokens")
-    if not (os.environ.get("COPILOT_MENTOR_TOKEN") or auth.get("mentor_token")):
+    mentor_token = _role_token(config, "mentor")
+    if not mentor_token:
         missing.append("mentor_token")
     if missing:
         raise RuntimeError(
-            "public auth mode requires an auth.student_tokens mapping and "
-            "auth.mentor_token "
+            "non-local auth mode requires an auth.student_tokens mapping and "
+            "an effective mentor_token "
             f"(missing: {', '.join(missing)})"
+        )
+    mentor_bytes = mentor_token.encode("utf-8")
+    if any(
+        hmac.compare_digest(mentor_bytes, configured_token.encode("utf-8"))
+        for configured_token in auth["student_tokens"].values()
+    ):
+        raise RuntimeError(
+            "student and mentor role tokens must be distinct"
         )
 
 
@@ -483,7 +495,7 @@ def token_is_valid(config: dict[str, Any], supplied: str | None, role: str | Non
     if role == "student":
         return student_principal_for_token(config, supplied) is not None
     expected = _role_token(config, role)
-    if _auth_is_public(config) and not expected:
+    if _auth_requires_credentials(config) and not expected:
         return False
     return (not expected) or hmac.compare_digest(supplied or "", expected)
 

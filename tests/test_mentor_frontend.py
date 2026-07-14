@@ -79,6 +79,17 @@ class TestFrontendStructure:
         assert "failed_analyses" in js
         assert "windows_rollout_status" in js
 
+    def test_system_status_refresh_and_stale_response_contract(self):
+        """系统状态须随手动刷新/WS 重连更新，且旧响应不能覆盖新响应。"""
+        static_dir = Path(__file__).parent.parent / "copilot" / "static" / "mentor"
+        js = (static_dir / "app.js").read_text()
+
+        assert "systemStatusLoadGeneration" in js
+        assert "generation !== systemStatusLoadGeneration" in js
+        assert "Promise.all([loadStudents(), loadAttention(), loadSystemStatus()])" in js
+        # 状态请求继续走统一鉴权入口，从而与其他并发 401 共用 mentorReauthPromise。
+        assert "authFetch('/api/mentor/system-status')" in js
+
     def test_app_js_has_fetch_and_ws(self):
         js_path = Path(__file__).parent.parent / "copilot" / "static" / "mentor" / "app.js"
         if not js_path.exists():

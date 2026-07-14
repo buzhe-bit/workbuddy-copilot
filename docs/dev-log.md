@@ -2228,3 +2228,10 @@ Minor 0，APPROVE。
 | 外部门 | Python 3.13、4 个真 loopback Student Agent、Windows W0/W1 仍待可用环境；Windows 状态保持 `BLOCKED: real-machine evidence missing`。 |
 
 详细身份 RED/GREEN 与环境边界见 `.superpowers/sdd/task-8-identity-report.md`。
+
+Task 8 首轮独立审查为 C1 / I2 / M1，已全部按 RED→GREEN 整改：所有非本地和
+未知 auth mode 统一强制 mapped student + mentor 凭据；有效 mentor token 与任一
+mapped student token 撞库时拒绝启动；analysis 写入从 report 权威校验 owner，
+`/recent` 同时核对 analysis/report owner；系统状态随手动刷新和每次 WS open 重拉，
+并用 generation 丢弃乱序旧响应。整改后聚焦 357 passed；更宽诊断为
+823 passed / 3 个已登记环境门 failed，显式 deselect 后 823 passed / 3 deselected。
