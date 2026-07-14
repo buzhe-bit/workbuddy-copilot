@@ -142,6 +142,12 @@ class StudentTransport:
             raise PermanentTransportError("hook request rejected")
         raise TemporaryNetworkError("hook request unavailable")
 
+    async def post_hook_async(self, event: HookEvent, *, event_id: str = "") -> Accepted:
+        """Run the compatibility HTTP client away from the sole WS loop."""
+        import asyncio
+
+        return await asyncio.to_thread(self.post_hook, event, event_id=event_id)
+
     def ack_message(self, message_id: str, *, student_id: str | None = None) -> Accepted:
         """Acknowledge a rendered/received mentor message through the REST API."""
         resolved_student_id = str(self.student_id or "")
@@ -178,6 +184,20 @@ class StudentTransport:
         if 400 <= status < 500:
             raise PermanentTransportError("message receipt rejected")
         raise TemporaryNetworkError("message receipt unavailable")
+
+    async def ack_message_async(
+        self,
+        message_id: str,
+        *,
+        student_id: str | None = None,
+    ) -> Accepted:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.ack_message,
+            message_id,
+            student_id=student_id,
+        )
 
     def get_pending_messages(
         self,
@@ -216,6 +236,118 @@ class StudentTransport:
         if 400 <= status < 500:
             raise PermanentTransportError("message backlog rejected")
         raise TemporaryNetworkError("message backlog unavailable")
+
+    async def get_pending_messages_async(
+        self,
+        *,
+        limit: int = DEFAULT_PENDING_MESSAGE_LIMIT,
+        after_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.get_pending_messages,
+            limit=limit,
+            after_id=after_id,
+        )
+
+    def get_recent_analyses(
+        self,
+        *,
+        after_analysis_id: int = 0,
+        limit: int = DEFAULT_PENDING_MESSAGE_LIMIT,
+    ) -> dict[str, Any]:
+        """Fetch one authenticated page in durable analysis-commit order."""
+        student_id = str(self.student_id or "").strip()
+        if not student_id:
+            raise PermanentTransportError("analysis backlog rejected")
+        query = urllib.parse.urlencode({
+            "student_id": student_id,
+            "after_analysis_id": max(0, int(after_analysis_id)),
+            "limit": max(1, min(int(limit), DEFAULT_PENDING_MESSAGE_LIMIT)),
+        })
+        request = urllib.request.Request(
+            f"{self.base_url}/api/student/analyses?{query}",
+            headers=self.auth_headers,
+            method="GET",
+        )
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                status_value = getattr(response, "status", None)
+                if status_value is None:
+                    status_value = response.getcode()
+                status = int(status_value)
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            self._raise_http_error(exc)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise TemporaryNetworkError("analysis backlog unavailable") from exc
+        if 200 <= status < 300:
+            body = self._parse_body(raw)
+            items = body.get("items", [])
+            return {
+                "items": (
+                    [dict(item) for item in items if isinstance(item, Mapping)]
+                    if isinstance(items, list)
+                    else []
+                ),
+                "next_cursor": max(0, int(body.get("next_cursor") or 0)),
+                "has_more": bool(body.get("has_more")),
+            }
+        if 400 <= status < 500:
+            raise PermanentTransportError("analysis backlog rejected")
+        raise TemporaryNetworkError("analysis backlog unavailable")
+
+    async def get_recent_analyses_async(
+        self,
+        *,
+        after_analysis_id: int = 0,
+        limit: int = DEFAULT_PENDING_MESSAGE_LIMIT,
+    ) -> dict[str, Any]:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.get_recent_analyses,
+            after_analysis_id=after_analysis_id,
+            limit=limit,
+        )
+
+    def post_sync(self, sessions: list[Mapping[str, Any]]) -> Accepted:
+        student_id = str(self.student_id or "").strip()
+        if not student_id:
+            raise PermanentTransportError("session sync rejected")
+        body = json.dumps(
+            {"student_id": student_id, "sessions": [dict(item) for item in sessions]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/api/sessions/sync",
+            data=body,
+            headers={"Content-Type": "application/json", **self.auth_headers},
+            method="POST",
+        )
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                status_value = getattr(response, "status", None)
+                if status_value is None:
+                    status_value = response.getcode()
+                status = int(status_value)
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            self._raise_http_error(exc)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise TemporaryNetworkError("session sync unavailable") from exc
+        parsed = self._parse_body(raw)
+        if 200 <= status < 300 and parsed.get("ok") is True:
+            return Accepted(status, parsed)
+        if 400 <= status < 500:
+            raise PermanentTransportError("session sync rejected")
+        raise TemporaryNetworkError("session sync unavailable")
+
+    async def post_sync_async(self, sessions: list[Mapping[str, Any]]) -> Accepted:
+        import asyncio
+
+        return await asyncio.to_thread(self.post_sync, sessions)
 
     def open_ws(self) -> Any:
         """Return a long-lived authenticated WebSocket context manager."""

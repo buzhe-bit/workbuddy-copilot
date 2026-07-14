@@ -2242,3 +2242,49 @@ APPROVE，Critical 0 / Important 0 / Minor 0。Task 8 至此作为 Windows Task 
 稳定身份与健康状态基线；Python 3.13、真 Chromium/loopback 与 Windows W0/W1
 仍明确保留为外部发布门。正式复审另跑 41 个聚焦测试，并通过 `node --check`
 与范围 `git diff --check`。
+
+### Task 9 Plan E2：Windows runtime、WorkBuddy 数据与耐久链路 — 2026-07-15
+
+- 保留共享 Student Core、Controller–Service–Repository、EventBus、SQLite 和单 worker；
+  Windows 只新增平台 composition root、W0 profile/scanner、durable transcript outbox 与
+  本地 analysis inbox，没有另造第二套业务核心。
+- Hook/spool 顺序现在是 `/report` 2xx → transcript job durable commit → spool ack；
+  ack 返回 False 或抛错会释放 claim 并以同 event_id 重放。spool 新增向后兼容的
+  `enqueued_at_ns`，离线积压跨重启保持 FIFO，不再按随机 UUID 倒序上报。
+- Hook 的取号协议使用“已锁 owner inode → active reservation → exact used-order tombstone”；
+  stale writer 即使在同号提交完成后才恢复，也只能分配下一个序号。无 high marker 的升级
+  积压只扫描文件元数据，不读取 256KB 正文；10,001 条大积压仍满足真实 Hook 2 秒门。
+  Windows 安装前会动态验证 hard link、同 inode 与第二句柄 byte-lock 冲突，不支持的
+  SpoolDir 在注册 Hook 前 fail closed。
+- 自动 Stop 全文固定 `store_only`，服务端校验同 student/session 的 Stop source；迟到旧
+  Stop 不能覆盖新上下文，同 SHA 不取消正在运行的导师分析，且不产生第二份 BulkUpload
+  analysis/attention/模型调用。watermark 已纳入学员数据删除。
+- analysis delivery 改用 durable `analysis_id` commit cursor；旧 `after_report_id` 仅兼容。
+  WS 只唤醒，REST commit stream 权威，解决高 report 先完成、低 report 后完成时的永久
+  漏诊；catch-up 未耗尽会主动重连，持久化/渲染失败不推进 cursor。
+- Windows transcript 生产 backend 使用 `CreateFileW` + `OPEN_REPARSE_POINT` 固定目录/
+  文件 handle，校验最终路径后从同一 handle 读取；sharing violation 可重试，半写 JSONL
+  不永久毒化 adapter。一次导师批量上传复用一个不可变 snapshot，下一次 Stop/命令重新
+  扫描，避免 N session 的 O(N²) 全目录重复读取。
+- session sync 成功后低频刷新、失败后有界重试；transcript outbox 在 SQLite 持久化
+  `next_attempt_at` 并指数退避至最多 300 秒，失败任务不删除，避免 50 台学员端持续热重试。
+- Windows hosted CI 分别运行 Windows/NTFS/loopback 专项与 221 条共享 Core/服务测试，
+  保存两组 pytest 输出和质量摘要；W1 独立 artifact 仍明确
+  `BLOCKED: real-machine evidence missing`。
+
+| 范围 | 新鲜结果 |
+|---|---|
+| 两轮独立 Task 9 终审 | 均为 P0=0 / P1=0；聚焦复验 308 passed / 3 skipped。 |
+| 最终整仓（沙箱外真实 loopback + Chromium） | JUnit：1110 tests / 0 failures / 0 errors / 3 skipped；pytest 为 1107 passed / 3 skipped / 1 个既有 warning。 |
+| Windows 真 HTTP/WS component | 已包含在最终整仓，1 passed。 |
+| Hook 大积压 deadline | 10,001 条、每条 256KB 的 legacy 目录，真实子进程在 2 秒 timeout 内通过。 |
+| 静态门 | `compileall`、workflow YAML、`node --check`、`git diff --check` 均通过。 |
+
+当前证据只能支持 Windows `implementation_candidate`：本机没有 Python 3.13，也没有
+Windows W0/W1 真机、真实 WorkBuddy/UNC/ACL 证据；不得据此宣称 rollout-ready。Task 10
+继续完成 Windows 浮标、TokenFile/ACL、single-instance、安装升级卸载和登录自启。
+
+两项非阻塞 P2 已登记：`.copilot-enqueue-used/` 当前每个事件保留一个精确 tombstone，
+长期运行需增加健康计数与安全压缩；进程若恰在 owner 创建后、reservation 发布前崩溃，
+可能留下一个空 owner 文件。当前不做无锁扫描清理，因为它会与活 Hook 的加锁窗口竞争并
+造成丢事件；7 天小试点优先保证顺序和不丢失，长期压缩进入后续容量工作。

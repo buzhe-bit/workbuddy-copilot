@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
+    AnalysisEnvelope,
     AttentionDecision,
     normalize_confidence,
     normalize_event_id,
@@ -223,6 +224,16 @@ CREATE TABLE IF NOT EXISTS raw_transcripts (
     created_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS stop_transcript_watermarks (
+    student_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    source_report_id INTEGER NOT NULL,
+    source_event_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(student_id, session_id)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -360,6 +371,15 @@ _MIGRATIONS = [
 ]
 
 _POST_MIGRATION_SQL = [
+    """CREATE TABLE IF NOT EXISTS stop_transcript_watermarks (
+           student_id TEXT NOT NULL,
+           session_id TEXT NOT NULL,
+           source_report_id INTEGER NOT NULL,
+           source_event_id TEXT NOT NULL,
+           content_sha256 TEXT NOT NULL,
+           updated_at REAL NOT NULL,
+           PRIMARY KEY(student_id, session_id)
+       )""",
     """CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_student_event_id_unique
        ON reports(student_id, event_id)
        WHERE event_id IS NOT NULL AND event_id != ''""",
@@ -425,6 +445,10 @@ class UploadRetryClaimConflict(RuntimeError):
 
 class UploadSessionRegistrationConflict(RuntimeError):
     """Raised when an upload child cannot be registered atomically."""
+
+
+class ActiveTranscriptAnalysisConflict(RuntimeError):
+    """Raised when context-only replacement would invalidate active analysis."""
 
 
 class Store:
@@ -1854,112 +1878,250 @@ class Store:
         sha: str,
     ) -> int:
         """Replace one session's bulk-uploaded message content atomically."""
-        now = time.time()
         with self._conn() as c:
             c.execute("BEGIN IMMEDIATE")
-            self._ensure_session_owner_with_conn(c, session_id, student_id)
-            c.execute(
-                """INSERT INTO students (student_id, display_name, token_hash, created_at)
-                   VALUES (?, '', NULL, ?)
-                   ON CONFLICT(student_id) DO NOTHING""",
-                (student_id, now),
+            return self._replace_session_messages_with_conn(
+                c,
+                session_id=session_id,
+                student_id=student_id,
+                turns=turns,
+                raw=raw,
+                sha=sha,
             )
-            c.execute(
-                """INSERT INTO sessions
-                   (session_id, student_id, work_dir, title, created_at, last_activity_at)
-                   VALUES (?, ?, '', '', ?, ?)
-                   ON CONFLICT(session_id) DO UPDATE SET
-                     last_activity_at = CASE
-                       WHEN sessions.last_activity_at IS NULL
-                         OR sessions.last_activity_at < excluded.last_activity_at
-                       THEN excluded.last_activity_at
-                       ELSE sessions.last_activity_at
-                    END""",
-                (session_id, student_id, now, now),
-            )
-            current_bulk = c.execute(
-                """SELECT content_sha256
-                   FROM raw_transcripts
-                   WHERE session_id = ? AND student_id = ?
-                     AND content_sha256 IS NOT NULL AND content_sha256 != ''
-                   ORDER BY created_at DESC, id DESC
-                   LIMIT 1""",
-                (session_id, student_id),
+
+    def replace_session_messages_from_stop(
+        self,
+        *,
+        session_id: str,
+        student_id: str,
+        turns: list[dict[str, Any]],
+        raw: str,
+        sha: str,
+        source_report_id: int,
+        source_event_id: str,
+    ) -> dict[str, Any]:
+        """Atomically validate the source Stop and store context only."""
+        normalized_event_id = normalize_event_id(source_event_id)
+        if normalized_event_id is None:
+            raise ValueError("source_event_id is required")
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            report = c.execute(
+                """SELECT student_id, session_id, event, event_id
+                   FROM reports WHERE id = ?""",
+                (int(source_report_id),),
             ).fetchone()
-            if current_bulk is not None and str(current_bulk["content_sha256"]) == sha:
-                return int(c.execute(
-                    """SELECT COUNT(*) FROM messages
-                       WHERE session_id = ? AND source = 'bulk'""",
-                    (session_id,),
-                ).fetchone()[0])
-            preserved_summaries: dict[tuple[int, str], str] = {}
-            if sha:
-                rows = c.execute(
-                    """SELECT seq, text, summary
-                       FROM messages
-                       WHERE session_id = ?
-                         AND source = 'bulk'
-                         AND role = 'user'
-                         AND content_sha256 = ?
-                         AND COALESCE(summary, '') != ''""",
-                    (session_id, sha),
-                ).fetchall()
-                preserved_summaries = {
-                    (int(row["seq"]), str(row["text"] or "")): str(row["summary"] or "")
-                    for row in rows
-                }
+            if report is None:
+                raise ValueError("source Stop report not found")
+            if (
+                str(report["student_id"] or "") != student_id
+                or str(report["session_id"] or "") != session_id
+                or str(report["event"] or "") != "Stop"
+                or str(report["event_id"] or "") != normalized_event_id
+            ):
+                raise ValueError("source Stop report mismatch")
+            source_id = int(source_report_id)
+            watermark = c.execute(
+                """SELECT source_report_id, source_event_id, content_sha256
+                   FROM stop_transcript_watermarks
+                   WHERE student_id = ? AND session_id = ?""",
+                (student_id, session_id),
+            ).fetchone()
+            if watermark is not None:
+                applied_report_id = int(watermark["source_report_id"])
+                if source_id < applied_report_id:
+                    stored = int(c.execute(
+                        """SELECT COUNT(*) FROM messages
+                           WHERE student_id = ? AND session_id = ?
+                             AND source = 'bulk'""",
+                        (student_id, session_id),
+                    ).fetchone()[0])
+                    return {"stored": stored, "skipped": True, "obsolete": True}
+                if source_id == applied_report_id:
+                    if (
+                        str(watermark["source_event_id"]) != normalized_event_id
+                        or str(watermark["content_sha256"]) != sha
+                    ):
+                        raise ValueError("source Stop transcript collision")
+                    stored = int(c.execute(
+                        """SELECT COUNT(*) FROM messages
+                           WHERE student_id = ? AND session_id = ?
+                             AND source = 'bulk'""",
+                        (student_id, session_id),
+                        ).fetchone()[0])
+                    return {"stored": stored, "skipped": True, "obsolete": False}
+            active_raw = c.execute(
+                """SELECT 1 FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?
+                     AND content_sha256 != ?
+                     AND analysis_status IN ('pending', 'running')
+                   LIMIT 1""",
+                (student_id, session_id, sha),
+            ).fetchone()
+            active_request = c.execute(
+                """SELECT 1 FROM upload_request_sessions
+                   WHERE student_id = ? AND session_id = ? AND sha != ?
+                     AND analysis_status IN ('pending', 'running')
+                   LIMIT 1""",
+                (student_id, session_id, sha),
+            ).fetchone()
+            if active_raw is not None or active_request is not None:
+                raise ActiveTranscriptAnalysisConflict(
+                    "mentor transcript analysis is active; retry store_only later"
+                )
+            existing = c.execute(
+                """SELECT 1 FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ? AND content_sha256 = ?
+                   LIMIT 1""",
+                (student_id, session_id, sha),
+            ).fetchone()
+            stored = self._replace_session_messages_with_conn(
+                c,
+                session_id=session_id,
+                student_id=student_id,
+                turns=turns,
+                raw=raw,
+                sha=sha,
+            )
             c.execute(
-                "DELETE FROM messages WHERE session_id = ? AND source = 'bulk'",
+                """INSERT INTO stop_transcript_watermarks
+                   (student_id, session_id, source_report_id, source_event_id,
+                    content_sha256, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(student_id, session_id) DO UPDATE SET
+                     source_report_id = excluded.source_report_id,
+                     source_event_id = excluded.source_event_id,
+                     content_sha256 = excluded.content_sha256,
+                     updated_at = excluded.updated_at""",
+                (
+                    student_id,
+                    session_id,
+                    source_id,
+                    normalized_event_id,
+                    sha,
+                    time.time(),
+                ),
+            )
+            return {
+                "stored": stored,
+                "skipped": existing is not None,
+                "obsolete": False,
+            }
+
+    def _replace_session_messages_with_conn(
+        self,
+        c: sqlite3.Connection,
+        *,
+        session_id: str,
+        student_id: str,
+        turns: list[dict[str, Any]],
+        raw: str,
+        sha: str,
+    ) -> int:
+        now = time.time()
+        self._ensure_session_owner_with_conn(c, session_id, student_id)
+        c.execute(
+            """INSERT INTO students (student_id, display_name, token_hash, created_at)
+               VALUES (?, '', NULL, ?)
+               ON CONFLICT(student_id) DO NOTHING""",
+            (student_id, now),
+        )
+        c.execute(
+            """INSERT INTO sessions
+               (session_id, student_id, work_dir, title, created_at, last_activity_at)
+               VALUES (?, ?, '', '', ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 last_activity_at = CASE
+                   WHEN sessions.last_activity_at IS NULL
+                     OR sessions.last_activity_at < excluded.last_activity_at
+                   THEN excluded.last_activity_at
+                   ELSE sessions.last_activity_at
+                END""",
+            (session_id, student_id, now, now),
+        )
+        current_bulk = c.execute(
+            """SELECT content_sha256
+               FROM raw_transcripts
+               WHERE session_id = ? AND student_id = ?
+                 AND content_sha256 IS NOT NULL AND content_sha256 != ''
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1""",
+            (session_id, student_id),
+        ).fetchone()
+        if current_bulk is not None and str(current_bulk["content_sha256"]) == sha:
+            return int(c.execute(
+                """SELECT COUNT(*) FROM messages
+                   WHERE session_id = ? AND source = 'bulk'""",
                 (session_id,),
+            ).fetchone()[0])
+        preserved_summaries: dict[tuple[int, str], str] = {}
+        if sha:
+            rows = c.execute(
+                """SELECT seq, text, summary
+                   FROM messages
+                   WHERE session_id = ?
+                     AND source = 'bulk'
+                     AND role = 'user'
+                     AND content_sha256 = ?
+                     AND COALESCE(summary, '') != ''""",
+                (session_id, sha),
+            ).fetchall()
+            preserved_summaries = {
+                (int(row["seq"]), str(row["text"] or "")): str(row["summary"] or "")
+                for row in rows
+            }
+        c.execute(
+            "DELETE FROM messages WHERE session_id = ? AND source = 'bulk'",
+            (session_id,),
+        )
+
+        inserted = 0
+        for idx, turn in enumerate(turns):
+            role = str(turn.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            text = str(turn.get("text") or "")
+            if not text:
+                continue
+            seq = int(turn.get("seq") or 0)
+            ts = turn.get("ts")
+            created_at = ts if isinstance(ts, (int, float)) else now + (idx / 1000.0)
+            summary = preserved_summaries.get((seq, text)) if role == "user" else None
+            c.execute(
+                """INSERT INTO messages
+                   (session_id, student_id, seq, role, text, summary, source,
+                    content_sha256, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'bulk', ?, ?)""",
+                (session_id, student_id, seq, role, text, summary, sha, float(created_at)),
             )
+            inserted += 1
 
-            inserted = 0
-            for idx, turn in enumerate(turns):
-                role = str(turn.get("role") or "")
-                if role not in {"user", "assistant"}:
-                    continue
-                text = str(turn.get("text") or "")
-                if not text:
-                    continue
-                seq = int(turn.get("seq") or 0)
-                ts = turn.get("ts")
-                created_at = ts if isinstance(ts, (int, float)) else now + (idx / 1000.0)
-                summary = preserved_summaries.get((seq, text)) if role == "user" else None
-                c.execute(
-                    """INSERT INTO messages
-                       (session_id, student_id, seq, role, text, summary, source,
-                        content_sha256, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, 'bulk', ?, ?)""",
-                    (session_id, student_id, seq, role, text, summary, sha, float(created_at)),
-                )
-                inserted += 1
-
-            raw_row = c.execute(
-                """SELECT id FROM raw_transcripts
-                   WHERE session_id = ? AND student_id = ?
-                   ORDER BY created_at DESC, id DESC
-                   LIMIT 1""",
-                (session_id, student_id),
-            ).fetchone()
-            if raw_row:
-                c.execute(
-                    """UPDATE raw_transcripts
-                       SET content = ?, content_sha256 = ?, created_at = ?,
-                           analysis_status = '', analysis_error = '',
-                           analysis_model = '', analysis_prompt_hash = '',
-                           analysis_latency_ms = 0, analysis_attempts = 0
-                       WHERE id = ?""",
-                    (raw, sha, now, raw_row["id"]),
-                )
-            else:
-                c.execute(
-                    """INSERT INTO raw_transcripts
-                       (session_id, student_id, content, content_sha256,
-                        analysis_status, analysis_error, created_at)
-                       VALUES (?, ?, ?, ?, '', '', ?)""",
-                    (session_id, student_id, raw, sha, now),
-                )
-            return inserted
+        raw_row = c.execute(
+            """SELECT id FROM raw_transcripts
+               WHERE session_id = ? AND student_id = ?
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1""",
+            (session_id, student_id),
+        ).fetchone()
+        if raw_row:
+            c.execute(
+                """UPDATE raw_transcripts
+                   SET content = ?, content_sha256 = ?, created_at = ?,
+                       analysis_status = '', analysis_error = '',
+                       analysis_model = '', analysis_prompt_hash = '',
+                       analysis_latency_ms = 0, analysis_attempts = 0
+                   WHERE id = ?""",
+                (raw, sha, now, raw_row["id"]),
+            )
+        else:
+            c.execute(
+                """INSERT INTO raw_transcripts
+                   (session_id, student_id, content, content_sha256,
+                    analysis_status, analysis_error, created_at)
+                   VALUES (?, ?, ?, ?, '', '', ?)""",
+                (session_id, student_id, raw, sha, now),
+            )
+        return inserted
 
     def set_raw_transcript_analysis_status(
         self,
@@ -2103,6 +2265,34 @@ class Store:
                     session_id,
                     content_sha256,
                 ),
+            ).rowcount
+
+    def mark_raw_transcript_store_only(
+        self,
+        *,
+        session_id: str,
+        student_id: str,
+        content_sha256: str,
+    ) -> int:
+        """Mark new context-only data without mutating existing analysis work."""
+        with self._conn() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT id FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?
+                     AND content_sha256 = ?
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (student_id, session_id, content_sha256),
+            ).fetchone()
+            if row is None:
+                return 0
+            return connection.execute(
+                """UPDATE raw_transcripts
+                   SET analysis_status = 'skipped', analysis_error = ''
+                   WHERE id = ? AND student_id = ? AND session_id = ?
+                     AND content_sha256 = ?
+                     AND COALESCE(analysis_status, '') IN ('', 'not_requested')""",
+                (row["id"], student_id, session_id, content_sha256),
             ).rowcount
 
     def claim_raw_transcript_analysis(
@@ -3889,6 +4079,102 @@ class Store:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def analysis_envelopes_after(
+        self,
+        student_id: str,
+        *,
+        after_report_id: int = 0,
+        limit: int = 64,
+    ) -> list[dict[str, Any]]:
+        """Return one durable analysis per report in ascending cursor order."""
+        resolved_student_id = str(student_id or "").strip()
+        if not resolved_student_id:
+            return []
+        bounded_limit = max(1, min(int(limit), 101))
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT a.*, r.event
+                   FROM reports r
+                   JOIN analyses a ON a.id = (
+                       SELECT a2.id
+                       FROM analyses a2
+                       WHERE a2.report_id = r.id
+                         AND a2.student_id = r.student_id
+                       ORDER BY a2.created_at DESC, a2.id DESC
+                       LIMIT 1
+                   )
+                   WHERE r.student_id = ? AND r.id > ?
+                   ORDER BY r.id ASC
+                   LIMIT ?""",
+                (resolved_student_id, max(0, int(after_report_id)), bounded_limit),
+            ).fetchall()
+        envelopes: list[dict[str, Any]] = []
+        for row in rows:
+            values = dict(row)
+            try:
+                result = json.loads(str(values.get("raw") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
+            envelopes.append(AnalysisEnvelope(
+                analysis_id=int(values.get("id") or 0),
+                student_id=resolved_student_id,
+                session_id=str(values.get("session_id") or ""),
+                report_id=int(values["report_id"]),
+                event=str(values.get("event") or ""),
+                result=result,
+                timestamp=float(values.get("created_at") or 0.0),
+            ).to_dict())
+        return envelopes
+
+    def analysis_envelopes_after_commit(
+        self,
+        student_id: str,
+        *,
+        after_analysis_id: int = 0,
+        limit: int = 64,
+    ) -> list[dict[str, Any]]:
+        """Return analyses in durable commit order, independent of report order."""
+        resolved_student_id = str(student_id or "").strip()
+        if not resolved_student_id:
+            return []
+        bounded_limit = max(1, min(int(limit), 101))
+        with self._conn() as connection:
+            rows = connection.execute(
+                """SELECT a.*, r.event
+                   FROM analyses a
+                   JOIN reports r
+                     ON r.id = a.report_id AND r.student_id = a.student_id
+                   WHERE a.student_id = ? AND a.id > ?
+                   ORDER BY a.id ASC
+                   LIMIT ?""",
+                (
+                    resolved_student_id,
+                    max(0, int(after_analysis_id)),
+                    bounded_limit,
+                ),
+            ).fetchall()
+        envelopes: list[dict[str, Any]] = []
+        for row in rows:
+            values = dict(row)
+            try:
+                result = json.loads(str(values.get("raw") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
+            envelopes.append(AnalysisEnvelope(
+                analysis_id=int(values.get("id") or 0),
+                student_id=resolved_student_id,
+                session_id=str(values.get("session_id") or ""),
+                report_id=int(values["report_id"]),
+                event=str(values.get("event") or ""),
+                result=result,
+                timestamp=float(values.get("created_at") or 0.0),
+            ).to_dict())
+        return envelopes
+
     def get_analysis(self, analysis_id: int) -> dict[str, Any] | None:
         """Return one durable analysis for projection after its source commit."""
         with self._conn() as c:
@@ -4748,7 +5034,11 @@ class Store:
 
             c.execute("DELETE FROM student_asks WHERE student_id = ?", (student_id,))
 
-            for table in ["messages", "upload_requests"]:
+            for table in [
+                "messages",
+                "upload_requests",
+                "stop_transcript_watermarks",
+            ]:
                 cur = c.execute(f"DELETE FROM {table} WHERE student_id = ?", (student_id,))
                 if cur.rowcount:
                     deleted[table] = cur.rowcount

@@ -154,6 +154,14 @@ def _seed_student_everywhere(store: Store, student_id: str, session_id: str) -> 
     store.add_ai_summary(prompt_id, session_id, student_id, f"{student_id} summary")
     store.add_raw_transcript(session_id, student_id, f"{student_id} raw transcript")
     store.add_mentor_message(student_id, "mentor-1", session_id, f"{student_id} msg", f"msg-{student_id}")
+    with store._conn() as conn:
+        conn.execute(
+            """INSERT INTO stop_transcript_watermarks
+               (student_id, session_id, source_report_id, source_event_id,
+                content_sha256, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (student_id, session_id, report_id, f"evt-{student_id}", "0" * 64, 1.0),
+        )
 
 
 def test_delete_student_cascades_without_cross_student_leak(store):
@@ -166,6 +174,7 @@ def test_delete_student_cascades_without_cross_student_leak(store):
     assert deleted["ai_summaries"] == 1
     assert deleted["prompts"] == 1
     assert deleted["raw_transcripts"] == 1
+    assert deleted["stop_transcript_watermarks"] == 1
     assert deleted["mentor_messages"] == 1
     assert deleted["reports"] == 1
     assert deleted["sessions"] == 1
@@ -177,6 +186,7 @@ def test_delete_student_cascades_without_cross_student_leak(store):
         "prompts",
         "ai_summaries",
         "raw_transcripts",
+        "stop_transcript_watermarks",
         "mentor_messages",
         "sessions",
         "students",

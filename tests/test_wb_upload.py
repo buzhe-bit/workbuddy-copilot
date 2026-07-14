@@ -6,10 +6,20 @@ import sqlite3
 
 from copilot import wb_upload
 from copilot.student_platform.workbuddy import TranscriptReadResult, WorkBuddySession
+from copilot.models import UploadOutcome
 
 
 def _line(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+def _confirmation(session_id: str, payload: dict, *, skipped: bool = False) -> dict:
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "sha": payload["sha"],
+        "skipped": skipped,
+    }
 
 
 def _session(session_id: str, work_dir: str) -> WorkBuddySession:
@@ -130,6 +140,25 @@ def test_content_sha256_is_deterministic_for_filtered_content():
     assert wb_upload.content_sha256(content) == hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def test_cli_serializes_upload_outcome_and_returns_success(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(wb_upload, "_load_runtime_config", lambda _path: {})
+    monkeypatch.setattr(
+        wb_upload,
+        "upload_conversations",
+        lambda *_args, **_kwargs: UploadOutcome(1, 1, 1, 0, 0),
+    )
+
+    exit_code = wb_upload.main(["--student-id", "student-a"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "total": 1,
+        "synced": 1,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+
 def test_get_known_shas_normalizes_new_and_legacy_manifests(monkeypatch):
     requested_urls = []
 
@@ -186,7 +215,8 @@ def test_upload_conversations_probes_legacy_same_sha_without_resending_content(m
     monkeypatch.setattr(
         wb_upload,
         "post_transcript",
-        lambda server_url, session_id, payload, **kwargs: posted.append(payload) or {"ok": True},
+        lambda server_url, session_id, payload, **kwargs: posted.append(payload)
+        or _confirmation(session_id, payload),
     )
 
     result = wb_upload.upload_conversations(
@@ -241,9 +271,8 @@ def test_requested_upload_probes_same_sha_without_resending_and_counts_skipped(
     monkeypatch.setattr(
         wb_upload,
         "post_transcript",
-        lambda server_url, session_id, payload, **kwargs: posted.append(payload) or {
-            "ok": True, "skipped": True,
-        },
+        lambda server_url, session_id, payload, **kwargs: posted.append(payload)
+        or _confirmation(session_id, payload, skipped=True),
     )
 
     result = wb_upload.upload_conversations(
@@ -274,7 +303,8 @@ def test_specific_requested_upload_filters_other_local_sessions(monkeypatch):
     posted = []
     monkeypatch.setattr(
         wb_upload, "post_transcript",
-        lambda server_url, session_id, payload, **kwargs: posted.append(session_id) or {"ok": True},
+        lambda server_url, session_id, payload, **kwargs: posted.append(session_id)
+        or _confirmation(session_id, payload),
     )
 
     result = wb_upload.upload_conversations(
@@ -300,7 +330,8 @@ def test_upload_conversations_posts_same_sha_when_remote_analysis_failed(monkeyp
     monkeypatch.setattr(
         wb_upload,
         "post_transcript",
-        lambda server_url, session_id, payload, **kwargs: posted.append(payload) or {"ok": True},
+        lambda server_url, session_id, payload, **kwargs: posted.append(payload)
+        or _confirmation(session_id, payload),
     )
 
     result = wb_upload.upload_conversations(
@@ -333,7 +364,7 @@ def test_upload_conversations_posts_filtered_content_and_continues_after_failure
         posts.append({"session_id": session_id, "payload": payload, "timeout": timeout})
         if session_id == "sess-fail":
             raise TimeoutError("slow")
-        return {"ok": True}
+        return _confirmation(session_id, payload)
 
     monkeypatch.setattr(wb_upload, "post_transcript", fake_post)
 
@@ -378,7 +409,8 @@ def test_upload_conversations_uses_injected_adapter_without_accessing_home(monke
     monkeypatch.setattr(
         wb_upload,
         "post_transcript",
-        lambda server_url, session_id, payload, **kwargs: posted.append(payload) or {"ok": True},
+        lambda server_url, session_id, payload, **kwargs: posted.append(payload)
+        or _confirmation(session_id, payload),
     )
 
     result = wb_upload.upload_conversations(
@@ -448,7 +480,7 @@ def test_upload_conversations_none_adapter_uses_real_db_and_transcript(
         "post_transcript",
         lambda server_url, session_id, payload, **kwargs: posted.append(
             (session_id, payload)
-        ) or {"ok": True},
+        ) or _confirmation(session_id, payload),
     )
 
     result = wb_upload.upload_conversations(

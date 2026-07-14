@@ -3,14 +3,19 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from copilot.models import UploadOutcome
 from copilot.student_core.models import HookEvent
+from copilot.student_core.process_liveness import ProcessIdentity
 from copilot.student_core.spool import EventSpool
+from copilot.student_core.transcript_jobs import TranscriptUploadQueue
 from copilot.student_core.transport import (
     Accepted,
     PermanentTransportError,
@@ -60,8 +65,35 @@ class FakeUploader:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None]] = []
 
-    async def upload(self, *, request_id: str, session_id: str | None) -> None:
+    async def upload(self, *, request_id: str, session_id: str | None) -> UploadOutcome:
         self.calls.append((request_id, session_id))
+        return UploadOutcome(1, 1, 1, 0, 0)
+
+
+class FakeProcessLiveness:
+    def __init__(self, *, legacy_state: str = "alive", default: str = "alive") -> None:
+        self.legacy_state = legacy_state
+        self.default = default
+
+    def probe(self, _identity: ProcessIdentity) -> str:
+        return self.default
+
+    def probe_pid(self, _pid: int) -> str:
+        return self.legacy_state
+
+
+def spool_with_identity(
+    root: Path,
+    owner: str,
+    *,
+    liveness: FakeProcessLiveness,
+    pid: int,
+) -> EventSpool:
+    return EventSpool(
+        root,
+        process_identity=ProcessIdentity(pid=pid, started_at=pid * 10, owner_token=owner),
+        process_liveness=liveness,
+    )
 
 
 def test_coordinator_acks_only_after_server_accepts(tmp_path: Path) -> None:
@@ -76,6 +108,66 @@ def test_coordinator_acks_only_after_server_accepts(tmp_path: Path) -> None:
         assert spool.pending() == []
         assert len(transport.posts) == 1
         assert transport.post_event_ids == ["event-1"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ack_failure", [False, OSError("disk busy")])
+def test_accepted_report_with_failed_local_ack_releases_claim_for_idempotent_retry(
+    tmp_path: Path,
+    ack_failure: bool | BaseException,
+) -> None:
+    async def scenario() -> None:
+        spool = EventSpool(tmp_path)
+        spool.enqueue(event(), event_id="event-1")
+        original_ack = spool.ack
+
+        def fail_ack(event_id: str) -> bool:
+            if isinstance(ack_failure, BaseException):
+                raise ack_failure
+            assert ack_failure is False
+            return False
+
+        spool.ack = fail_ack  # type: ignore[method-assign]
+        transport = FakeTransport(Accepted(202, {"report_id": 11}))
+
+        accepted = await StudentCoordinator(spool, transport).flush_spool_once()
+
+        assert accepted == 0
+        assert [entry.event_id for entry in spool.pending()] == ["event-1"]
+        assert transport.post_event_ids == ["event-1"]
+        spool.ack = original_ack  # type: ignore[method-assign]
+
+    asyncio.run(scenario())
+
+
+def test_stop_job_uses_authenticated_transport_identity_after_account_rotation(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        spool = EventSpool(tmp_path / "spool")
+        spool.enqueue(
+            HookEvent(
+                event="Stop",
+                student_id="stale-student",
+                session_id="session-1",
+            ),
+            event_id="event-rotated",
+        )
+        queue = TranscriptUploadQueue(tmp_path / "jobs.sqlite3")
+        transport = FakeTransport(
+            Accepted(202, {"report_id": 17}),
+            student_id="current-student",
+        )
+
+        accepted = await StudentCoordinator(
+            spool,
+            transport,
+            transcript_queue=queue,
+        ).flush_spool_once()
+
+        assert accepted == 1
+        assert queue.pending()[0].student_id == "current-student"
 
     asyncio.run(scenario())
 
@@ -98,6 +190,131 @@ def test_coordinator_keeps_spool_entry_when_post_is_not_accepted(
         assert [entry.event_id for entry in spool.pending()] == ["event-1"]
 
     asyncio.run(scenario())
+
+
+def test_spool_delivery_never_overtakes_the_oldest_unconfirmed_event(
+    tmp_path: Path,
+) -> None:
+    class RetryOldestTransport(FakeTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_oldest_once = True
+
+        def post_hook(self, payload: HookEvent, *, event_id: str = "") -> object:
+            self.posts.append(payload)
+            self.post_event_ids.append(event_id)
+            if event_id == "z-oldest" and self.fail_oldest_once:
+                self.fail_oldest_once = False
+                raise TemporaryNetworkError("offline")
+            return Accepted(202)
+
+    async def scenario() -> None:
+        spool = EventSpool(tmp_path)
+        spool.enqueue(event(), event_id="z-oldest")
+        spool.enqueue(event(), event_id="a-later")
+        transport = RetryOldestTransport()
+        coordinator = StudentCoordinator(spool, transport)
+
+        assert await coordinator.flush_spool_once() == 0
+        assert transport.post_event_ids == ["z-oldest"]
+        assert [entry.event_id for entry in spool.pending()] == [
+            "z-oldest",
+            "a-later",
+        ]
+
+        assert await coordinator.flush_spool_once() == 2
+        assert transport.post_event_ids == [
+            "z-oldest",
+            "z-oldest",
+            "a-later",
+        ]
+        assert spool.pending() == []
+
+    asyncio.run(scenario())
+
+
+def test_active_claim_on_oldest_event_blocks_later_delivery(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        first_worker = EventSpool(tmp_path)
+        first_worker.enqueue(event(), event_id="z-oldest")
+        first_worker.enqueue(event(), event_id="a-later")
+        assert first_worker.claim("z-oldest") is True
+
+        second_worker = EventSpool(tmp_path)
+        transport = FakeTransport(Accepted(202))
+        coordinator = StudentCoordinator(second_worker, transport)
+
+        assert await coordinator.flush_spool_once() == 0
+        assert transport.post_event_ids == []
+        # The public pending view still hides work actively owned elsewhere.
+        assert [entry.event_id for entry in second_worker.pending()] == ["a-later"]
+
+        assert first_worker.release_claim("z-oldest") is True
+        assert await coordinator.flush_spool_once() == 2
+        assert transport.post_event_ids == ["z-oldest", "a-later"]
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_enqueue_commit_cannot_publish_a_later_event_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    older_spool = EventSpool(tmp_path)
+    later_spool = EventSpool(tmp_path)
+    delivery_spool = EventSpool(tmp_path)
+    older_at_commit = threading.Event()
+    release_older = threading.Event()
+    later_finished = threading.Event()
+    errors: list[BaseException] = []
+    real_replace = os.replace
+
+    def paused_replace(source, destination) -> None:
+        if Path(destination).name == "z-oldest.json":
+            older_at_commit.set()
+            assert release_older.wait(1)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "copilot.student_core.spool.os.replace",
+        paused_replace,
+    )
+
+    def enqueue(spool: EventSpool, event_id: str, finished=None) -> None:
+        try:
+            spool.enqueue(event(), event_id=event_id)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if finished is not None:
+                finished.set()
+
+    older = threading.Thread(target=enqueue, args=(older_spool, "z-oldest"))
+    later = threading.Thread(
+        target=enqueue,
+        args=(later_spool, "a-later", later_finished),
+    )
+    older.start()
+    assert older_at_commit.wait(1)
+    later.start()
+    transport = FakeTransport(Accepted(202))
+    coordinator = StudentCoordinator(delivery_spool, transport)
+    try:
+        # The later writer must remain behind the older writer's atomic commit
+        # boundary; no wire-visible event may appear in the gap.
+        later_finished.wait(0.1)
+        assert asyncio.run(coordinator.flush_spool_once()) == 0
+        assert transport.post_event_ids == []
+    finally:
+        release_older.set()
+        older.join(timeout=1)
+        later.join(timeout=1)
+
+    assert older.is_alive() is False
+    assert later.is_alive() is False
+    assert errors == []
+    assert asyncio.run(coordinator.flush_spool_once()) == 2
+    assert transport.post_event_ids == ["z-oldest", "a-later"]
 
 
 def test_duplicate_mentor_message_is_handled_and_receipted_once(tmp_path: Path) -> None:
@@ -350,6 +567,41 @@ def test_upload_command_runs_injectable_handler_once_for_duplicate_request(tmp_p
     asyncio.run(scenario())
 
 
+def test_legacy_sync_uploader_runs_off_the_websocket_event_loop(tmp_path: Path) -> None:
+    class BlockingUploader:
+        def __init__(self) -> None:
+            self.release = threading.Event()
+
+        def upload(self, **_kwargs) -> UploadOutcome:
+            self.release.wait(timeout=0.3)
+            return UploadOutcome(1, 1, 1, 0, 0)
+
+    async def scenario() -> None:
+        uploader = BlockingUploader()
+        coordinator = StudentCoordinator(
+            EventSpool(tmp_path),
+            FakeTransport(),
+            uploader,
+        )
+        started_at = time.monotonic()
+        task = asyncio.create_task(coordinator.handle_command({
+            "type": "mentor_command",
+            "student_id": "student-1",
+            "command": "upload_conversations",
+            "request_id": "sync-uploader",
+            "session_id": "session-1",
+        }))
+
+        await asyncio.sleep(0)
+        loop_delay = time.monotonic() - started_at
+        uploader.release.set()
+
+        assert loop_delay < 0.1
+        assert await task is True
+
+    asyncio.run(scenario())
+
+
 def test_unknown_command_is_ignored_without_invoking_uploader(tmp_path: Path) -> None:
     async def scenario() -> None:
         uploader = FakeUploader()
@@ -412,10 +664,11 @@ def test_failed_upload_command_releases_durable_claim_for_retry(tmp_path: Path) 
         def __init__(self) -> None:
             self.calls = 0
 
-        async def upload(self, *, request_id: str, session_id: str | None) -> None:
+        async def upload(self, *, request_id: str, session_id: str | None) -> UploadOutcome:
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("temporary platform failure")
+            return UploadOutcome(1, 1, 1, 0, 0)
 
     async def scenario() -> None:
         command = {
@@ -434,9 +687,7 @@ def test_failed_upload_command_releases_durable_claim_for_retry(tmp_path: Path) 
     asyncio.run(scenario())
 
 
-def test_crash_stale_upload_claim_is_recovered_after_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_crash_stale_upload_claim_is_recovered_after_restart(tmp_path: Path) -> None:
     async def scenario() -> None:
         command = {
             "type": "mentor_command",
@@ -444,18 +695,20 @@ def test_crash_stale_upload_claim_is_recovered_after_restart(
             "command": "upload_conversations",
             "request_id": "recover-crashed-upload",
         }
-        crashed = StudentCoordinator(EventSpool(tmp_path), FakeTransport(), FakeUploader())
+        liveness = FakeProcessLiveness(legacy_state="dead")
+        crashed = StudentCoordinator(
+            spool_with_identity(tmp_path, "crashed", liveness=liveness, pid=101),
+            FakeTransport(),
+            FakeUploader(),
+        )
         claim_path, _done_path = crashed._request_paths(command["request_id"])
-        claim_path.write_text("424242 0\n", encoding="ascii")
-
-        def dead_process(pid: int, signal: int) -> None:
-            assert pid == 424242
-            assert signal == 0
-            raise ProcessLookupError
-
-        monkeypatch.setattr("copilot.student_core.coordinator.os.kill", dead_process)
+        claim_path.write_text("424242 1\n", encoding="ascii")
         restarted_uploader = FakeUploader()
-        restarted = StudentCoordinator(EventSpool(tmp_path), FakeTransport(), restarted_uploader)
+        restarted = StudentCoordinator(
+            spool_with_identity(tmp_path, "restarted", liveness=liveness, pid=102),
+            FakeTransport(),
+            restarted_uploader,
+        )
 
         assert await restarted.handle_command(command) is True
         assert restarted_uploader.calls == [("recover-crashed-upload", None)]
@@ -472,12 +725,21 @@ def test_live_upload_claim_stays_exclusive_after_restart(tmp_path: Path) -> None
             "command": "upload_conversations",
             "request_id": "live-upload",
         }
-        original = StudentCoordinator(EventSpool(tmp_path), FakeTransport(), FakeUploader())
+        liveness = FakeProcessLiveness(legacy_state="alive")
+        original = StudentCoordinator(
+            spool_with_identity(tmp_path, "original", liveness=liveness, pid=103),
+            FakeTransport(),
+            FakeUploader(),
+        )
         claim_path, _done_path = original._request_paths(command["request_id"])
-        claim_path.write_text(f"{os.getpid()} 0\n", encoding="ascii")
+        claim_path.write_text(f"{os.getpid()} 1\n", encoding="ascii")
 
         restarted_uploader = FakeUploader()
-        restarted = StudentCoordinator(EventSpool(tmp_path), FakeTransport(), restarted_uploader)
+        restarted = StudentCoordinator(
+            spool_with_identity(tmp_path, "restarted", liveness=liveness, pid=104),
+            FakeTransport(),
+            restarted_uploader,
+        )
 
         assert await restarted.handle_command(command) is False
         assert restarted_uploader.calls == []
@@ -485,8 +747,8 @@ def test_live_upload_claim_stays_exclusive_after_restart(tmp_path: Path) -> None
     asyncio.run(scenario())
 
 
-def test_expired_upload_claim_recovers_when_process_liveness_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_expired_upload_claim_fails_closed_when_process_liveness_is_unavailable(
+    tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         command = {
@@ -495,42 +757,51 @@ def test_expired_upload_claim_recovers_when_process_liveness_is_unavailable(
             "command": "upload_conversations",
             "request_id": "recover-expired-upload",
         }
-        original = StudentCoordinator(EventSpool(tmp_path), FakeTransport(), FakeUploader())
+        liveness = FakeProcessLiveness(legacy_state="unknown")
+        original = StudentCoordinator(
+            spool_with_identity(tmp_path, "original", liveness=liveness, pid=105),
+            FakeTransport(),
+            FakeUploader(),
+        )
         claim_path, _done_path = original._request_paths(command["request_id"])
-        claim_path.write_text("424243 0\n", encoding="ascii")
-
-        def unknown_liveness(_pid: int, _signal: int) -> None:
-            raise OSError("liveness unavailable")
-
-        monkeypatch.setattr("copilot.student_core.coordinator.os.kill", unknown_liveness)
+        claim_path.write_text("424243 1\n", encoding="ascii")
         uploader = FakeUploader()
         restarted = StudentCoordinator(
-            EventSpool(tmp_path),
+            spool_with_identity(tmp_path, "restarted", liveness=liveness, pid=106),
             FakeTransport(),
             uploader,
             stale_claim_after=0.001,
         )
 
-        assert await restarted.handle_command(command) is True
-        assert uploader.calls == [("recover-expired-upload", None)]
+        assert await restarted.handle_command(command) is False
+        assert uploader.calls == []
+        assert restarted.command_claim_health() == {
+            "status": "degraded",
+            "unknown_claims": [
+                {
+                    "claim_id": restarted._request_marker_stem(command["request_id"]),
+                    "reason": "liveness_unknown",
+                }
+            ],
+        }
 
     asyncio.run(scenario())
 
 
-def test_concurrent_stale_claim_recovery_allows_only_one_new_owner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    first = StudentCoordinator(EventSpool(tmp_path), FakeTransport(), FakeUploader())
-    second = StudentCoordinator(EventSpool(tmp_path), FakeTransport(), FakeUploader())
+def test_concurrent_stale_claim_recovery_allows_only_one_new_owner(tmp_path: Path) -> None:
+    liveness = FakeProcessLiveness(legacy_state="dead", default="alive")
+    first = StudentCoordinator(
+        spool_with_identity(tmp_path, "first", liveness=liveness, pid=107),
+        FakeTransport(),
+        FakeUploader(),
+    )
+    second = StudentCoordinator(
+        spool_with_identity(tmp_path, "second", liveness=liveness, pid=108),
+        FakeTransport(),
+        FakeUploader(),
+    )
     claim_path, _done_path = first._request_paths("concurrent-stale")
-    claim_path.write_text("424244 0\n", encoding="ascii")
-
-    def dead_original_owner(pid: int, signal: int) -> None:
-        assert pid == 424244
-        assert signal == 0
-        raise ProcessLookupError
-
-    monkeypatch.setattr("copilot.student_core.coordinator.os.kill", dead_original_owner)
+    claim_path.write_text("424244 1\n", encoding="ascii")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         claims = list(executor.map(lambda coordinator: coordinator._claim_upload_request("concurrent-stale"), [first, second]))
@@ -680,10 +951,11 @@ def test_concurrent_upload_commands_complete_once_in_shared_sqlite_ledger(tmp_pa
             self.release = asyncio.Event()
             self.calls = 0
 
-        async def upload(self, *, request_id: str, session_id: str | None) -> None:
+        async def upload(self, *, request_id: str, session_id: str | None) -> UploadOutcome:
             self.calls += 1
             self.started.set()
             await self.release.wait()
+            return UploadOutcome(1, 1, 1, 0, 0)
 
     async def scenario() -> None:
         command = {
@@ -781,7 +1053,7 @@ def test_pending_receipt_cursor_reaches_later_rendered_message_after_failed_firs
     asyncio.run(scenario())
 
 
-def test_empty_pending_page_retries_durable_rendered_receipt_after_lost_ack_response(tmp_path: Path) -> None:
+def test_headless_empty_pending_page_does_not_ack_without_a_renderer(tmp_path: Path) -> None:
     class EmptyBacklogTransport(FakeTransport):
         def get_pending_messages(self, *, after_id: int) -> list[dict[str, str]]:
             assert after_id == 0
@@ -793,9 +1065,9 @@ def test_empty_pending_page_retries_durable_rendered_receipt_after_lost_ack_resp
         spool.receipt_ledger.mark_rendered("student-1", "already-delivered-server-side")
         coordinator = StudentCoordinator(spool, transport)
 
-        assert await coordinator.pull_pending_messages() == 1
-        assert transport.acked == [("student-1", "already-delivered-server-side")]
-        assert spool.receipt_ledger.status("student-1", "already-delivered-server-side") == "acked"
+        assert await coordinator.pull_pending_messages() == 0
+        assert transport.acked == []
+        assert spool.receipt_ledger.status("student-1", "already-delivered-server-side") == "rendered"
 
     asyncio.run(scenario())
 

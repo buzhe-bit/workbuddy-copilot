@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import wb_sync
+from .models import UploadOutcome, normalize_event_id
 from .student_platform.workbuddy import (
     WorkBuddyDataAdapter,
     filter_message_jsonl as _filter_message_jsonl,
@@ -199,7 +200,10 @@ def upload_conversations(
     request_id: str | None = None,
     session_id: str | None = None,
     data_adapter: WorkBuddyDataAdapter | None = None,
-) -> dict[str, int]:
+    analysis_mode: str = "analyze",
+    source_event_id: str | None = None,
+    source_report_id: int | None = None,
+) -> UploadOutcome:
     """Upload filtered transcripts one session at a time.
 
     mode="missing" skips sessions whose filtered-content sha matches the server
@@ -207,10 +211,20 @@ def upload_conversations(
     """
     if mode not in {"missing", "full"}:
         raise ValueError("mode must be 'missing' or 'full'")
+    if analysis_mode not in {"analyze", "store_only"}:
+        raise ValueError("analysis_mode must be 'analyze' or 'store_only'")
+    if analysis_mode == "store_only":
+        if request_id:
+            raise ValueError("store_only cannot use a mentor request_id")
+        if not session_id:
+            raise ValueError("store_only requires an exact session_id")
+        if normalize_event_id(source_event_id) is None or int(source_report_id or 0) <= 0:
+            raise ValueError("store_only requires a source Stop event and report")
 
     resolved_student_id = str(student_id or "").strip()
     if not resolved_student_id:
         raise ValueError("student_id is required")
+    requested_session_id = str(session_id or "").strip()
 
     resolved_server_url = _server_url(cfg, server_url)
     resolved_token = token if token is not None else _config_token(cfg)
@@ -223,12 +237,22 @@ def upload_conversations(
         sessions = read_sessions(db_path)
     else:
         sessions = [session.to_dict() for session in data_adapter.list_sessions()]
-    if session_id:
+    if requested_session_id:
         sessions = [
             session for session in sessions
-            if str(session.get("session_id") or session.get("id") or "") == session_id
+            if str(session.get("session_id") or session.get("id") or "")
+            == requested_session_id
         ]
     total = len(sessions)
+    if requested_session_id and total != 1:
+        return UploadOutcome(
+            matched=total,
+            attempted=0,
+            accepted=0,
+            skipped=0,
+            failed=0,
+            error_code="session_not_found" if total == 0 else "session_ambiguous",
+        )
     known: dict[str, dict[str, str]] = {}
     if mode == "missing":
         try:
@@ -244,6 +268,12 @@ def upload_conversations(
     synced = 0
     skipped = 0
     failed = 0
+    attempted = 0
+    error_code = ""
+    snapshot_factory = getattr(data_adapter, "transcript_snapshot", None)
+    transcript_reader = (
+        snapshot_factory() if callable(snapshot_factory) else data_adapter
+    )
 
     for idx, session in enumerate(sessions, start=1):
         session_id = str(session.get("session_id") or session.get("id") or "")
@@ -253,7 +283,7 @@ def upload_conversations(
             continue
 
         try:
-            transcript = data_adapter.read_transcript(session_id)
+            transcript = transcript_reader.read_transcript(session_id)
             if transcript.failure is not None:
                 raise RuntimeError(transcript.failure.code)
             content = filter_message_jsonl_text(transcript.content)
@@ -283,14 +313,39 @@ def upload_conversations(
             }
             if request_id:
                 payload["request_id"] = request_id
-            post_transcript(
+            if analysis_mode == "store_only":
+                payload.update({
+                    "analysis_mode": "store_only",
+                    "source_event_id": str(source_event_id),
+                    "source_report_id": int(source_report_id or 0),
+                })
+            attempted += 1
+            response = post_transcript(
                 resolved_server_url,
                 session_id,
                 payload,
                 token=resolved_token,
                 timeout=timeout,
             )
-            if same_sha_skip:
+            confirmed = (
+                response.get("ok") is True
+                and str(response.get("session_id") or "") == session_id
+                and str(response.get("sha") or "") == sha
+            )
+            if not confirmed:
+                failed += 1
+                error_code = error_code or "response_unconfirmed"
+                _progress(
+                    idx,
+                    total,
+                    synced=synced,
+                    skipped=skipped,
+                    failed=failed,
+                    session_id=session_id,
+                    status="failed",
+                )
+                continue
+            if same_sha_skip or bool(response.get("skipped")):
                 skipped += 1
                 progress_status = "skipped"
             else:
@@ -307,6 +362,7 @@ def upload_conversations(
             )
         except Exception as exc:
             failed += 1
+            error_code = error_code or "upload_failed"
             log.warning("transcript upload failed session=%s: %s", session_id, exc)
             _progress(
                 idx,
@@ -318,7 +374,18 @@ def upload_conversations(
                 status="failed",
             )
 
-    return {"total": total, "synced": synced, "skipped": skipped, "failed": failed}
+    if total == 0:
+        error_code = "session_not_found" if requested_session_id else "no_sessions"
+    elif failed and not error_code:
+        error_code = "partial_failure"
+    return UploadOutcome(
+        matched=total,
+        attempted=attempted,
+        accepted=synced,
+        skipped=skipped,
+        failed=failed,
+        error_code=error_code,
+    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -355,7 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             token=token,
             timeout=args.timeout,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(dict(result), ensure_ascii=False))
         return 0 if result["failed"] == 0 else 1
     except (OSError, sqlite3.Error, urllib.error.URLError, TimeoutError, ValueError) as exc:
         log.error("upload failed: %s", exc)

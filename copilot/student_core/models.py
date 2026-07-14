@@ -77,15 +77,26 @@ class SpoolEntry:
 
     event_id: str
     payload: HookEvent
+    enqueued_at_ns: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.event_id, str) or not _EVENT_ID.fullmatch(self.event_id):
             raise ValueError("invalid event_id")
         if not isinstance(self.payload, HookEvent):
             raise TypeError("payload must be a HookEvent")
+        if (
+            isinstance(self.enqueued_at_ns, bool)
+            or not isinstance(self.enqueued_at_ns, int)
+            or self.enqueued_at_ns < 0
+        ):
+            raise ValueError("enqueued_at_ns must be a non-negative integer")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"event_id": self.event_id, "payload": self.payload.to_dict()}
+        return {
+            "event_id": self.event_id,
+            "enqueued_at_ns": self.enqueued_at_ns,
+            "payload": self.payload.to_dict(),
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SpoolEntry":
@@ -97,4 +108,9 @@ class SpoolEntry:
         payload = data.get("payload")
         if not isinstance(payload, Mapping):
             raise ValueError("payload must be an object")
-        return cls(event_id=event_id, payload=HookEvent.from_dict(payload))
+        enqueued_at_ns = data.get("enqueued_at_ns", 0)
+        return cls(
+            event_id=event_id,
+            payload=HookEvent.from_dict(payload),
+            enqueued_at_ns=enqueued_at_ns,
+        )

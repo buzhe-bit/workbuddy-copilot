@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "evidence_level": "synthetic",
+  "synthetic": true,
+  "workbuddy_version": "synthetic-fixture-only",
+  "config_dir": "<synthetic-runtime-config-dir>",
+  "hook_command": "synthetic-fixture-only",
+  "transcript_mapping": {
+    "database_relative_path": "workbuddy.db",
+    "projects_relative_path": "projects",
+    "session_metadata_keys": [
+      "session_id",
+      "sessionId"
+    ]
+  },
+  "sessions": [
+    {
+      "id": "synthetic-session-space",
+      "cwd": "C:\\Synthetic\\学习空间",
+      "title": "Windows 合成学习会话",
+      "custom_title": "Unicode 标题 ✓",
+      "created_at": 1770000000000,
+      "last_activity_at": 1770000300000,
+      "deleted_at": null
+    },
+    {
+      "id": "synthetic-session-task",
+      "cwd": "C:\\Synthetic\\独立任务",
+      "title": "Windows synthetic task",
+      "custom_title": "",
+      "created_at": 1770000100000,
+      "last_activity_at": 1770000200000,
+      "deleted_at": null
+    }
+  ],
+  "workspaces": [
+    {
+      "path": "C:\\Synthetic\\学习空间",
+      "name": "合成空间 🧪",
+      "last_opened_at": 1770000300000
+    }
+  ]
+}

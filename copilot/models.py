@@ -8,7 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import re
-from typing import Iterator, Literal, Optional, TYPE_CHECKING
+from collections.abc import Mapping
+from typing import Any, Iterator, Literal, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .transcript import TranscriptSnapshot
@@ -159,6 +160,83 @@ class QuestionAnswerOutcome:
     status: Literal["answered", "degraded", "failed"]
     answer: str
     error_code: str = ""
+
+
+@dataclass(frozen=True, eq=False)
+class UploadOutcome(Mapping[str, int]):
+    """Confirmed transcript-upload result.
+
+    The mapping view intentionally preserves the former
+    ``total/synced/skipped/failed`` return contract while new callers use the
+    explicit fields and the fail-closed :attr:`complete` gate.
+    """
+
+    matched: int
+    attempted: int
+    accepted: int
+    skipped: int
+    failed: int
+    error_code: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in ("matched", "attempted", "accepted", "skipped", "failed"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or int(value) != value or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+
+    @property
+    def complete(self) -> bool:
+        """Only a non-empty, fully confirmed match can complete a command."""
+        return (
+            self.matched > 0
+            and self.attempted == self.matched
+            and self.failed == 0
+            and self.accepted + self.skipped == self.attempted
+        )
+
+    def __getitem__(self, key: str) -> int:
+        values = {
+            "total": self.matched,
+            "synced": self.accepted,
+            "skipped": self.skipped,
+            "failed": self.failed,
+        }
+        return values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("total", "synced", "skipped", "failed"))
+
+    def __len__(self) -> int:
+        return 4
+
+
+@dataclass(frozen=True)
+class AnalysisEnvelope:
+    """One stable analysis wire shape shared by WebSocket and catch-up."""
+
+    student_id: str
+    session_id: str
+    report_id: int
+    event: str
+    result: Mapping[str, Any]
+    timestamp: float
+    # ``report_id`` describes the source, but reports can finish analysis out
+    # of order. ``analysis_id`` is assigned at durable commit and is therefore
+    # the only safe delivery cursor. Zero preserves old in-process adapters.
+    analysis_id: int = 0
+    type: str = "analysis"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "analysis_id": self.analysis_id,
+            "student_id": self.student_id,
+            "session_id": self.session_id,
+            "report_id": self.report_id,
+            "event": self.event,
+            "result": dict(self.result),
+            "timestamp": self.timestamp,
+        }
 
 
 @dataclass

@@ -56,9 +56,24 @@ env_parts = [
     f"COPILOT_SPOOL_DIR={shlex.quote(str(Path(spool_dir).expanduser().resolve()))}",
 ]
 
-hook_cmd = os.environ.get("COPILOT_HOOK_COMMAND") or " ".join(
-    env_parts + ["python3", shlex.quote(str(HOOK_SCRIPT)), "||", "true"]
+verified_command = os.environ.get("COPILOT_HOOK_COMMAND")
+reserved_hook_environment = (
+    "COPILOT_STUDENT_ID",
+    "COPILOT_CONFIG",
+    "COPILOT_SPOOL_DIR",
 )
+if verified_command and any(
+    name in verified_command for name in reserved_hook_environment
+):
+    print(
+        "verified hook command must not override a reserved Copilot environment variable",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+command_body = verified_command or " ".join(
+    ["python3", shlex.quote(str(HOOK_SCRIPT)), "||", "true"]
+)
+hook_cmd = " ".join(env_parts + [command_body])
 
 new_hooks = {
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": hook_cmd, "timeout": 2}]}],

@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable
 
 from .config import _validate_analysis_max_concurrency
 from .models import (
-    AcceptedReport, Student, Conversation, TimelineEntry, AnalysisResult,
+    AcceptedReport, AnalysisEnvelope, Student, Conversation, TimelineEntry, AnalysisResult,
 )
 from .eventbus import EventBus
 from .llm import analysis_prompt_hash, coerce_analysis_outcome
@@ -409,17 +409,16 @@ class AnalysisService:
             })
 
         # 发布分析事件
-        await self._publish_after_commit_safely({
-            "type": "analysis",
-            "student_id": student_id,
-            "session_id": session_id,
-            "session_title": session_title,
-            "report_id": report_id,
-            "event": "Stop",
-            "prompt": effective_prompt[:120],
-            "result": result.to_dict(),
-            "timestamp": time.time(),
-        })
+        analysis_row = self.copilot.get_analysis(analysis_id) or {}
+        await self._publish_after_commit_safely(AnalysisEnvelope(
+            analysis_id=analysis_id,
+            student_id=student_id,
+            session_id=session_id,
+            report_id=report_id,
+            event="Stop",
+            result=result.to_dict(),
+            timestamp=float(analysis_row.get("created_at") or 0.0),
+        ).to_dict())
 
         return result
 

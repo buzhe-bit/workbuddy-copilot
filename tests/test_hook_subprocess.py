@@ -7,6 +7,11 @@ import os
 import subprocess
 import sys
 
+import pytest
+
+
+pytestmark = [pytest.mark.windows, pytest.mark.component, pytest.mark.critical]
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HOOK = PROJECT_ROOT / "copilot" / "hook.py"
@@ -61,3 +66,39 @@ def test_stop_subprocess_spools_without_waiting_for_network(tmp_path: Path) -> N
     payload = json.loads(entries[0].read_text(encoding="utf-8"))["payload"]
     assert len(payload["transcript_tail"].encode("utf-8")) <= 256 * 1024
     assert "transcript_full" not in payload
+
+
+def test_stop_subprocess_stays_under_two_seconds_with_large_legacy_backlog(
+    tmp_path: Path,
+) -> None:
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    payload = json.dumps(
+        {
+            "event_id": "legacy-template",
+            "payload": {
+                "event": "Stop",
+                "student_id": "student-subprocess",
+                "transcript_tail": "x" * (256 * 1024),
+            },
+        },
+        separators=(",", ":"),
+    )
+    # NTFS has a bounded hard-link count per inode. Use eleven source inodes so
+    # Windows hosted CI still gets 10k realistic directory entries without any
+    # one file approaching that filesystem limit.
+    templates = []
+    for shard in range(11):
+        template = spool / f"legacy-template-{shard}.json"
+        template.write_text(payload, encoding="utf-8")
+        templates.append(template)
+    for index in range(10_001):
+        os.link(templates[index // 1000], spool / f"legacy-{index}.json")
+
+    completed = _run_hook(
+        tmp_path,
+        json.dumps({"hook_event_name": "Stop", "session_id": "after-upgrade"}),
+    )
+
+    assert completed.returncode == 0
+    assert len(list(spool.glob("*.json"))) == 10_013

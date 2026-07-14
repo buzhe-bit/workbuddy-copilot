@@ -18,6 +18,7 @@ SERVER_RUNTIME_ROOTS = (
 STUDENT_CLIENT_ALLOWLIST = {
     "copilot.floating_native",
     "copilot.hook",
+    "copilot.student_platform.windows_runtime",
     "copilot.wb_sync",
     "copilot.wb_upload",
 }
@@ -293,6 +294,13 @@ def test_server_graph_covers_all_reachable_runtime_modules_and_is_clean():
     } <= set(graph)
     assert STUDENT_CLIENT_ALLOWLIST.isdisjoint(graph)
     assert scan_server_graph() == {}
+
+
+def test_windows_runtime_is_a_student_client_but_never_server_reachable():
+    graph = resolve_server_graph()
+
+    assert "copilot.student_platform.windows_runtime" in STUDENT_CLIENT_ALLOWLIST
+    assert "copilot.student_platform.windows_runtime" not in graph
 
 
 def test_server_graph_includes_implicit_parent_packages():

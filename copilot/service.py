@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -42,7 +43,7 @@ from .llm import (
     coerce_question_answer_outcome,
     question_fallback_answer,
 )
-from .models import AnalysisResult, QuestionAnswerOutcome, normalize_event_id
+from .models import AnalysisEnvelope, AnalysisResult, QuestionAnswerOutcome, normalize_event_id
 from .services import (
     EXPLICIT_RAW_TRANSCRIPT_MARKER,
     AnalysisRetriesExhausted,
@@ -51,7 +52,7 @@ from .services import (
     SessionQueryService,
     bounded_analysis_input,
 )
-from .store import Store
+from .store import ActiveTranscriptAnalysisConflict, Store
 from .upload_service import (
     InvalidStateTransition,
     UploadRequestNotFound,
@@ -177,6 +178,9 @@ class TranscriptUploadIn(BaseModel):
     filtered_content: Any
     sha: str
     request_id: str | None = None
+    analysis_mode: Literal["analyze", "store_only"] = "analyze"
+    source_event_id: _EventId | None = None
+    source_report_id: int | None = None
 
 
 class MentorUploadRequestIn(BaseModel):
@@ -541,17 +545,17 @@ async def _analyze_uploaded_session_background(
                 list(request_ids),
             )
             if report_id is not None:
-                await _publish_event_safely(context, {
-                    "type": "analysis",
-                    "student_id": student_id,
-                    "session_id": session_id,
-                    "session_title": session_title,
-                    "report_id": report_id,
-                    "event": "BulkUpload",
-                    "prompt": latest_prompt[:120],
-                    "result": result.to_dict(),
-                    "timestamp": time.time(),
-                })
+                analysis_id = int(committed_metadata.get("analysis_id") or 0)
+                analysis_row = context.store.get_analysis(analysis_id) or {}
+                await _publish_event_safely(context, AnalysisEnvelope(
+                    analysis_id=analysis_id,
+                    student_id=student_id,
+                    session_id=session_id,
+                    report_id=report_id,
+                    event="BulkUpload",
+                    result=result.to_dict(),
+                    timestamp=float(analysis_row.get("created_at") or 0.0),
+                ).to_dict())
         except Exception:
             log.exception(
                 "bulk post-commit projection/fanout failed student=%s session=%s",
@@ -1000,6 +1004,53 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             )
         }
 
+    @app.get("/api/student/analyses")
+    async def student_analysis_catch_up(
+        after_report_id: int = 0,
+        after_analysis_id: int | None = None,
+        limit: int = 64,
+        student_id: str | None = None,
+        principal: StudentPrincipal = Depends(require_student_principal),
+        store: Store = Depends(get_store),
+    ):
+        """Return a scoped, durable ASC page matching the WS envelope."""
+        resolved_student_id = resolve_student_id(principal, student_id)
+        bounded_limit = max(1, min(int(limit), 100))
+        use_commit_cursor = after_analysis_id is not None
+        cursor = max(
+            0,
+            int(after_analysis_id if use_commit_cursor else after_report_id),
+        )
+        if use_commit_cursor:
+            rows = store.analysis_envelopes_after_commit(
+                resolved_student_id,
+                after_analysis_id=cursor,
+                limit=bounded_limit + 1,
+            )
+            cursor_field = "analysis_id"
+        else:
+            # Backward compatibility for old clients. New resident clients
+            # always use the durable analysis commit cursor above.
+            rows = store.analysis_envelopes_after(
+                resolved_student_id,
+                after_report_id=cursor,
+                limit=bounded_limit + 1,
+            )
+            cursor_field = "report_id"
+        has_more = len(rows) > bounded_limit
+        items = rows[:bounded_limit]
+        next_cursor = (
+            int(items[-1][cursor_field])
+            if items
+            else cursor
+        )
+        return {
+            "items": items,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "cursor_kind": cursor_field,
+        }
+
     @app.post("/api/sessions/sync")
     async def sync_sessions(
         data: SessionsSyncIn,
@@ -1048,6 +1099,71 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="sha is required")
 
         request_id = (data.request_id or "").strip() or None
+        if data.analysis_mode == "store_only":
+            if request_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="store_only cannot be attached to a mentor upload request",
+                )
+            if data.source_event_id is None or not data.source_report_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="store_only requires a source Stop report",
+                )
+            raw = _filtered_content_to_raw(data.filtered_content)
+            verified_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            if sha != verified_sha:
+                raise HTTPException(status_code=409, detail="transcript sha mismatch")
+            existing = store.get_raw_transcript_for_student_session_sha(
+                student_id,
+                session_id,
+                sha,
+            )
+            turns = parse_turns(parse_text(raw).messages)
+            try:
+                stored_result = store.replace_session_messages_from_stop(
+                    session_id=session_id,
+                    student_id=student_id,
+                    turns=turns,
+                    raw=raw,
+                    sha=sha,
+                    source_report_id=int(data.source_report_id),
+                    source_event_id=str(data.source_event_id),
+                )
+            except ActiveTranscriptAnalysisConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "transcript_analysis_active",
+                        "message": str(exc),
+                        "retryable": True,
+                    },
+                    headers={"Retry-After": "2"},
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            obsolete = bool(stored_result.get("obsolete"))
+            if not obsolete:
+                store.mark_raw_transcript_store_only(
+                    session_id=session_id,
+                    student_id=student_id,
+                    content_sha256=sha,
+                )
+            return {
+                "ok": True,
+                "skipped": bool(stored_result.get("skipped")) or existing is not None,
+                "session_id": session_id,
+                "sha": sha,
+                "stored": (
+                    0
+                    if existing is not None or bool(stored_result.get("skipped"))
+                    else int(stored_result.get("stored") or 0)
+                ),
+                "analysis_scheduled": False,
+                "retry_analysis": False,
+                "analysis_mode": "store_only",
+                "obsolete": obsolete,
+            }
         analysis_scheduled = _bulk_upload_llm_enabled(context.config)
 
         known = store.get_known_session_shas(student_id)

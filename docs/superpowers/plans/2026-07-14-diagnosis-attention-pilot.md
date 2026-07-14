@@ -201,8 +201,8 @@
 - `TranscriptUploadQueue.enqueue(event_id, report_id, student_id, session_id)` 使用本地 SQLite/文件队列持久化 Stop 后全文补传；严格顺序为 `/report` 2xx → job durable commit → hook spool ack，全文 `/transcript` 2xx 后才删除 job，同 event_id/SHA 重放幂等。
 - 自动 Stop 全文补传的权威语义固定为 `analysis_mode=store_only`：客户端携带 source event/report，服务端只在其能关联同 student/session 的 Stop report 且无 mentor request 时接受；全文只补上下文，不再触发 BulkUpload 分析/attention。Stop 尾部诊断仍是唯一即时分析，导师主动 upload request 才显式分析全文。
 - `UploadOutcome(matched, attempted, accepted, skipped, failed, error_code)`；指定 session 必须恰好匹配且每个尝试都获服务端确认，不能把 `matched=0, failed=0` 当成功，只有 `complete=True` 才能写 command completion。
-- `AnalysisEnvelope(type, student_id, session_id, report_id, event, result, timestamp)` 作为 WS 与 catch-up 的同一 wire shape；新增 `GET /api/student/analyses?after_report_id=&limit=` 按 report_id ASC 分页，返回 next cursor/has_more。StudentCoordinator 增加可选 `analysis_handler`，WindowsMessageStore 只在持久化/渲染成功后推进 cursor。
-- analysis 恢复顺序固定为先建立 WS 并缓冲，再从本地 cursor 分页补拉至耗尽，再按 report_id 去重排空缓冲并进入实时；handler/store 失败不得推进 cursor。无 UI message_handler 的 headless runtime 不消费、不标 rendered、不 ack 导师消息，绝不伪造送达。
+- `AnalysisEnvelope(type, analysis_id, student_id, session_id, report_id, event, result, timestamp)` 作为 WS 与 catch-up 的同一 wire shape；`GET /api/student/analyses` 新客户端使用 `after_analysis_id` 按 durable analysis commit id ASC 分页并返回 next cursor/has_more，旧 `after_report_id` 仅保留兼容。StudentCoordinator 增加可选 `analysis_handler`，WindowsAnalysisStore 只在持久化/渲染成功后推进 commit cursor。
+- analysis 恢复顺序固定为先建立 WS 并缓冲，再从本地 commit cursor 分页补拉至耗尽，再按 analysis_id 去重排空缓冲并进入实时；WS 只作低延迟唤醒，REST commit stream 是权威顺序，避免高 report 先完成时永久跳过较低 report。handler/store 失败不得推进 cursor。无 UI message_handler 的 headless runtime 不消费、不标 rendered、不 ack 导师消息，绝不伪造送达。
 - `WindowsStudentRuntime` 统一构建 WindowsWorkBuddyData、uploader、StudentTransport、StudentCoordinator、StudentAgent、Stop transcript job drain 和有界 session/analysis sync；`start_student_agent.py` 只负责参数与平台选择。
 - StudentTransport 保留同步兼容方法，新增 `post_hook_async/ack_message_async/get_pending_messages_async/get_recent_analyses_async`；Coordinator 必须优先调用 async 方法，旧同步 adapter 统一经 `asyncio.to_thread`，不得卡住唯一 WS 循环。
 
@@ -210,7 +210,7 @@
 - [ ] 用明确标注 synthetic 的 Windows-shaped fixture 写 schema/JSONL/Unicode/mapping 解析 RED；sharing violation、reparse/junction 和长路径必须在 `windows-latest` 动态创建真实 Windows OS 对象验证，不能由静态 fixture 冒充。真实 UNC/SMB 与 WorkBuddy mapping 进入 W1；生产 mapping 只能来自 W0 manifest/profile，缺失时必须 typed blocked。
 - [ ] 先写 Windows runtime RED：uploader 不得为 None；导师上传命令、指定 session、部分失败不落 completion、重启续传、session sync、analysis 实时/补拉和 WS 重连均走共享 Student Core。
 - [ ] 写 Stop 全文耐久边界 RED：分别在 report 2xx 后、job commit 前后、spool ack 前后、全文发送响应丢失和进程重启时终止；最终 report/job/transcript 各一份，只有 Stop analysis/attention/模型调用各一份，自动全文补传不得产生第二份 BulkUpload 分析。
-- [ ] 写 analysis catch-up RED：断线期间产生超过两页、WS 建连与分页并发产生新分析、重启、重复实时/补拉、handler/store 失败与跨学员参数；最终按 report_id 无漏无重，失败不推进 cursor。
+- [ ] 写 analysis catch-up RED：断线期间产生超过两页、WS 建连与分页并发产生新分析、重启、重复实时/补拉、handler/store 失败与跨学员参数；最终按 analysis commit id 无漏无重，失败不推进 cursor，高 report 先完成也不得遮蔽后完成的低 report。
 - [ ] 写 headless handler RED：message_handler 缺失或失败时导师消息保持未 ack；接上真实耐久 inbox/UI handler 后才允许现有 REST ack。
 - [ ] 修正 Hook 尾读失败语义：transcript 暂时被锁时仍写入空 tail 事件并在 2 秒内 exit 0，不静默丢 Stop。
 - [ ] 将 Student Core 的同步 HTTP 移出 event loop；用阻塞 opener 证明 spool flush 不阻断 WS 收包、导师消息或 stop。

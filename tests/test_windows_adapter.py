@@ -85,10 +85,17 @@ def test_only_a_w0_manifest_with_required_evidence_can_be_ready(
     manifest.write_text(
         json.dumps(
             {
+                "schema_version": 1,
+                "synthetic": False,
+                "evidence_level": "W0",
                 "workbuddy_version": "5.1.2",
-                "config_dir": "%USERPROFILE%\\.workbuddy",
+                "config_dir": str(config_dir),
                 "hook_command": "verified-on-real-machine",
-                "transcript_mapping": "verified-on-real-machine",
+                "transcript_mapping": {
+                    "database_relative_path": "workbuddy.db",
+                    "projects_relative_path": "projects",
+                    "session_metadata_keys": ["session_id", "sessionId"],
+                },
             }
         ),
         encoding="utf-8",
@@ -101,6 +108,31 @@ def test_only_a_w0_manifest_with_required_evidence_can_be_ready(
     assert result.config.path == config_dir
 
 
+def test_legacy_four_string_manifest_cannot_claim_w0_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("WORKBUDDY_CONFIG_DIR", str(config_dir))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "workbuddy_version": "5.1.2",
+                "config_dir": str(config_dir),
+                "hook_command": "unverified-string",
+                "transcript_mapping": "unverified-string",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WindowsWorkBuddyProbe(manifest_path=manifest).probe()
+
+    assert result.status == "blocked"
+    assert result.message == "real-machine evidence incomplete"
+
+
 def test_complete_manifest_cannot_make_a_missing_explicit_config_ready(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -110,10 +142,17 @@ def test_complete_manifest_cannot_make_a_missing_explicit_config_ready(
     manifest.write_text(
         json.dumps(
             {
+                "schema_version": 1,
+                "synthetic": False,
+                "evidence_level": "W0",
                 "workbuddy_version": "5.1.2",
-                "config_dir": "%USERPROFILE%\\.workbuddy",
+                "config_dir": str(missing_config),
                 "hook_command": "verified-on-real-machine",
-                "transcript_mapping": "verified-on-real-machine",
+                "transcript_mapping": {
+                    "database_relative_path": "workbuddy.db",
+                    "projects_relative_path": "projects",
+                    "session_metadata_keys": ["session_id", "sessionId"],
+                },
             }
         ),
         encoding="utf-8",
@@ -144,7 +183,12 @@ def test_windows_config_dir_enumerates_existing_workbuddy_env_fallback(
     assert candidate.exists is True
 
 
-def test_invalid_or_partial_manifest_stays_blocked(tmp_path: Path) -> None:
+def test_invalid_or_partial_manifest_stays_blocked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    monkeypatch.setenv("WORKBUDDY_CONFIG_DIR", str(config_dir))
     manifest = tmp_path / "manifest.json"
     manifest.write_text('{"workbuddy_version":"5.1.2"}', encoding="utf-8")
 

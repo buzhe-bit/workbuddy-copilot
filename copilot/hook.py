@@ -13,11 +13,20 @@ import os
 import re
 import sys
 import tempfile
+import time
 import uuid
 
 
 DEFAULT_TAIL_BYTES = 256 * 1024
 _EVENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_ORDER_RESERVATION_PREFIX = ".copilot-enqueue-order-"
+_ORDER_RESERVATION_SUFFIX = ".lock"
+_ORDER_OWNER_PREFIX = ".copilot-enqueue-order-owner-"
+_ORDER_OWNER_SUFFIX = ".tmp"
+_ORDER_HIGH_PREFIX = ".copilot-enqueue-high-"
+_ORDER_HIGH_SUFFIX = ".mark"
+_ORDER_USED_DIRECTORY = ".copilot-enqueue-used"
+_ORDER_USED_SUFFIX = ".used"
 DEFAULT_CONFIG = {
     "service": {"host": "COPILOT_SERVER_HOST", "port": 8765},
     "hook": {"transcript_tail_bytes": DEFAULT_TAIL_BYTES},
@@ -133,6 +142,249 @@ def _valid_event_id(event_id: str) -> bool:
     return isinstance(event_id, str) and _EVENT_ID.fullmatch(event_id) is not None
 
 
+def _fsync_directory(directory: str) -> None:
+    """Best-effort durability barrier for the atomic directory entry change."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _try_lock_order_reservation(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            msvcrt = __import__("msvcrt")
+            if os.fstat(fd).st_size == 0:
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl = __import__("fcntl")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        return False
+    return True
+
+
+def _unlock_order_reservation(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            msvcrt = __import__("msvcrt")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl = __import__("fcntl")
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _highest_persisted_enqueue_order(spool_dir: str) -> int:
+    """Read EventSpool-compatible rows and outstanding order reservations."""
+    highest = 0
+    try:
+        with os.scandir(spool_dir) as iterator:
+            entries = list(iterator)
+    except OSError:
+        return highest
+    has_valid_high = False
+    for entry in entries:
+        name = entry.name
+        if name.startswith(_ORDER_HIGH_PREFIX) and name.endswith(_ORDER_HIGH_SUFFIX):
+            raw_order = name[len(_ORDER_HIGH_PREFIX) : -len(_ORDER_HIGH_SUFFIX)]
+            if raw_order.isdigit():
+                has_valid_high = True
+                highest = max(highest, int(raw_order))
+            continue
+        if name.startswith(_ORDER_RESERVATION_PREFIX) and name.endswith(
+            _ORDER_RESERVATION_SUFFIX
+        ):
+            raw_order = name[
+                len(_ORDER_RESERVATION_PREFIX) : -len(_ORDER_RESERVATION_SUFFIX)
+            ]
+            if raw_order.isdigit():
+                highest = max(highest, int(raw_order))
+    # The WorkBuddy Hook has a hard two-second process budget. On first upgrade
+    # it must never parse a potentially multi-gigabyte legacy backlog. Legacy
+    # rows had no explicit order, so scan only DirEntry metadata (never their
+    # 256KB payloads) until the resident agent creates a high marker.
+    if not has_valid_high:
+        try:
+            highest = max(highest, os.stat(spool_dir).st_mtime_ns)
+        except OSError:
+            pass
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                highest = max(
+                    highest,
+                    entry.stat(follow_symlinks=False).st_mtime_ns,
+                )
+            except OSError:
+                continue
+    return highest
+
+
+def _record_enqueue_high_watermark(spool_dir: str, order: int) -> None:
+    marker = os.path.join(
+        spool_dir,
+        f"{_ORDER_HIGH_PREFIX}{int(order)}{_ORDER_HIGH_SUFFIX}",
+    )
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        try:
+            os.write(fd, b"1")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _fsync_directory(spool_dir)
+
+    markers: list[tuple[int, str]] = []
+    for name in os.listdir(spool_dir):
+        if not name.startswith(_ORDER_HIGH_PREFIX) or not name.endswith(
+            _ORDER_HIGH_SUFFIX
+        ):
+            continue
+        raw_order = name[len(_ORDER_HIGH_PREFIX) : -len(_ORDER_HIGH_SUFFIX)]
+        if raw_order.isdigit():
+            markers.append((int(raw_order), os.path.join(spool_dir, name)))
+    if not markers:
+        raise OSError("spool enqueue high watermark was not persisted")
+    highest = max(value for value, _path in markers)
+    removed = False
+    for value, path in markers:
+        if value < highest:
+            try:
+                os.unlink(path)
+                removed = True
+            except OSError:
+                pass
+    if removed:
+        _fsync_directory(spool_dir)
+
+
+def _used_order_directory(spool_dir: str) -> str:
+    directory = os.path.join(spool_dir, _ORDER_USED_DIRECTORY)
+    if os.path.islink(directory):
+        raise OSError("used-order directory must not be a symlink")
+    created = not os.path.exists(directory)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if os.path.islink(directory) or not os.path.isdir(directory):
+        raise OSError("used-order directory must be a directory")
+    if created:
+        _fsync_directory(spool_dir)
+    return directory
+
+
+def _used_order_path(spool_dir: str, order: int) -> str:
+    return os.path.join(
+        _used_order_directory(spool_dir),
+        f"{int(order)}{_ORDER_USED_SUFFIX}",
+    )
+
+
+def _order_was_used(spool_dir: str, order: int) -> bool:
+    return os.path.lexists(_used_order_path(spool_dir, order))
+
+
+def _record_used_order(spool_dir: str, source: str, order: int) -> None:
+    marker = _used_order_path(spool_dir, order)
+    try:
+        os.link(source, marker)
+    except FileExistsError:
+        try:
+            if os.path.samestat(os.stat(source), os.stat(marker)):
+                _fsync_directory(os.path.dirname(marker))
+                return
+        except OSError:
+            pass
+        raise FileExistsError(f"spool enqueue order already used: {order}")
+    _fsync_directory(os.path.dirname(marker))
+
+
+def _unlink_owned_reservation(path: str, fd: int, spool_dir: str) -> bool:
+    try:
+        if not os.path.samestat(os.fstat(fd), os.stat(path, follow_symlinks=False)):
+            return False
+        os.unlink(path)
+        _fsync_directory(spool_dir)
+        return True
+    except OSError:
+        # Windows may refuse unlink while the CRT handle is open. Keep the
+        # marker for EventSpool recovery; exact used-order prevents ABA reuse.
+        return False
+
+
+def _reserve_enqueue_order(spool_dir: str) -> tuple[int, list[str], int, str]:
+    _used_order_directory(spool_dir)
+    candidate = max(
+        0,
+        time.time_ns(),
+        _highest_persisted_enqueue_order(spool_dir) + 1,
+    )
+    fd, owner_path = tempfile.mkstemp(
+        dir=spool_dir,
+        prefix=_ORDER_OWNER_PREFIX,
+        suffix=_ORDER_OWNER_SUFFIX,
+    )
+    reservations: list[str] = []
+    try:
+        if not _try_lock_order_reservation(fd):
+            raise OSError("cannot lock spool enqueue order owner")
+        os.fsync(fd)
+        while True:
+            reservation = os.path.join(
+                spool_dir,
+                f"{_ORDER_RESERVATION_PREFIX}{candidate}{_ORDER_RESERVATION_SUFFIX}",
+            )
+            try:
+                os.link(owner_path, reservation)
+            except FileExistsError:
+                candidate = max(
+                    candidate + 1,
+                    time.time_ns(),
+                    _highest_persisted_enqueue_order(spool_dir) + 1,
+                )
+                continue
+            _fsync_directory(spool_dir)
+            reservations.append(reservation)
+            if _order_was_used(spool_dir, candidate):
+                if _unlink_owned_reservation(reservation, fd, spool_dir):
+                    reservations.remove(reservation)
+                candidate = max(
+                    candidate + 1,
+                    time.time_ns(),
+                    _highest_persisted_enqueue_order(spool_dir) + 1,
+                )
+                continue
+            return candidate, reservations, fd, owner_path
+    except BaseException:
+        _unlock_order_reservation(fd)
+        os.close(fd)
+        try:
+            os.unlink(owner_path)
+        except OSError:
+            pass
+        raise
+
+
 def _write_spool_event(spool_dir: str, payload: dict[str, str]) -> str:
     """Atomically write the HookEvent/SpoolEntry-compatible JSON envelope."""
     event_id = uuid.uuid4().hex
@@ -140,8 +392,18 @@ def _write_spool_event(spool_dir: str, payload: dict[str, str]) -> str:
         raise ValueError("invalid generated event id")
     os.makedirs(spool_dir, mode=0o700, exist_ok=True)
     destination = os.path.join(spool_dir, f"{event_id}.json")
+    order_reservations: list[str] = []
+    order_owner_path: str | None = None
+    order_reservation_fd: int | None = None
+    order_recorded = False
     temporary: str | None = None
     try:
+        (
+            enqueue_order,
+            order_reservations,
+            order_reservation_fd,
+            order_owner_path,
+        ) = _reserve_enqueue_order(spool_dir)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -152,19 +414,45 @@ def _write_spool_event(spool_dir: str, payload: dict[str, str]) -> str:
         ) as handle:
             temporary = handle.name
             json.dump(
-                {"event_id": event_id, "payload": payload},
+                {
+                    "event_id": event_id,
+                    "enqueued_at_ns": enqueue_order,
+                    "payload": payload,
+                },
                 handle,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
             handle.flush()
             os.fsync(handle.fileno())
+        _record_used_order(spool_dir, order_owner_path, enqueue_order)
         os.replace(temporary, destination)
+        _fsync_directory(spool_dir)
         temporary = None
+        _record_enqueue_high_watermark(spool_dir, enqueue_order)
+        order_recorded = True
     finally:
         if temporary is not None:
             try:
                 os.unlink(temporary)
+            except OSError:
+                pass
+        if order_reservation_fd is not None:
+            if order_recorded:
+                for reservation in order_reservations:
+                    _unlink_owned_reservation(
+                        reservation,
+                        order_reservation_fd,
+                        spool_dir,
+                    )
+            _unlock_order_reservation(order_reservation_fd)
+            try:
+                os.close(order_reservation_fd)
+            except OSError:
+                pass
+        if order_owner_path is not None:
+            try:
+                os.unlink(order_owner_path)
             except OSError:
                 pass
     return event_id
@@ -189,7 +477,14 @@ def _event_from_input(hook_input: dict, cfg: dict) -> dict[str, str]:
     transcript_path = text("transcript_path")
     transcript_tail = ""
     if transcript_path:
-        transcript_tail = _read_transcript_tail(transcript_path, _tail_size(cfg))
+        try:
+            transcript_tail = _read_transcript_tail(transcript_path, _tail_size(cfg))
+        except OSError:
+            # WorkBuddy/antivirus may hold an exclusive Windows handle during
+            # Stop. Preserve the durable event even when this optional tail is
+            # temporarily unavailable; the resident agent retries full
+            # context through its transcript outbox.
+            transcript_tail = ""
     return {
         "event": event,
         "student_id": student_id,

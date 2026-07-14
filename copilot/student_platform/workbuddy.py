@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import Any
+from typing import Any, Protocol
 
 
 MAX_TRANSCRIPT_CANDIDATES = 512
@@ -99,13 +99,71 @@ class ActiveSessionResult:
 
 
 @dataclass(frozen=True)
-class _TranscriptCandidate:
+class TranscriptCandidate:
     """An inode-pinned JSONL location relative to the opened projects root."""
 
     relative_path: Path
     device: int
     inode: int
     content: bytes
+
+
+# Keep the private spelling available for the existing descriptor helpers.  The
+# public spelling is the narrow scanner seam used by platform adapters.
+_TranscriptCandidate = TranscriptCandidate
+
+
+@dataclass(frozen=True)
+class TranscriptIndexResult:
+    """One bounded scanner pass, including whether a failure may be cached."""
+
+    index: dict[str, tuple[TranscriptCandidate, ...]] = field(default_factory=dict)
+    root: Path | None = None
+    failure: AdapterFailure | None = None
+    cache_failure: bool = True
+    cache_success: bool = True
+
+
+class TranscriptScanner(Protocol):
+    """Narrow platform seam around transcript indexing and content reads."""
+
+    def index(self, adapter: "WorkBuddyDataAdapter") -> TranscriptIndexResult:
+        """Build a bounded session-id index for ``adapter.projects_dir``."""
+
+    def read(self, candidate: TranscriptCandidate) -> TranscriptReadResult:
+        """Return already-verified candidate content without exposing its path."""
+
+
+@dataclass(frozen=True)
+class TranscriptSnapshot:
+    """One immutable scanner result reused within a single upload operation."""
+
+    scanner: TranscriptScanner
+    index: dict[str, tuple[TranscriptCandidate, ...]] = field(default_factory=dict)
+    failure: AdapterFailure | None = None
+
+    def read_transcript(self, session_id: str) -> TranscriptReadResult:
+        if self.failure is not None:
+            return TranscriptReadResult(failure=self.failure)
+        if not isinstance(session_id, str) or not session_id:
+            return TranscriptReadResult(
+                failure=AdapterFailure("transcript_not_found", "session id is missing")
+            )
+        matches = self.index.get(session_id, ())
+        if not matches:
+            return TranscriptReadResult(
+                failure=AdapterFailure(
+                    "transcript_not_found", "no transcript matches session id"
+                )
+            )
+        if len(matches) > 1:
+            return TranscriptReadResult(
+                failure=AdapterFailure(
+                    "transcript_ambiguous",
+                    "multiple transcripts match the same session id",
+                )
+            )
+        return self.scanner.read(matches[0])
 
 
 def _ms_to_seconds(value: Any) -> float:
@@ -183,6 +241,7 @@ class WorkBuddyDataAdapter:
         projects_dir: str | os.PathLike[str] | None = None,
         max_transcript_candidates: int = MAX_TRANSCRIPT_CANDIDATES,
         max_transcript_bytes: int = MAX_TRANSCRIPT_BYTES,
+        transcript_scanner: TranscriptScanner | None = None,
     ) -> None:
         if max_transcript_candidates < 1 or max_transcript_bytes < 1:
             raise ValueError("transcript index limits must be positive")
@@ -199,6 +258,9 @@ class WorkBuddyDataAdapter:
         )
         self.max_transcript_candidates = int(max_transcript_candidates)
         self.max_transcript_bytes = int(max_transcript_bytes)
+        self.transcript_scanner: TranscriptScanner = (
+            transcript_scanner or PosixDescriptorTranscriptScanner()
+        )
         self._transcript_index: dict[str, tuple[_TranscriptCandidate, ...]] | None = None
         self._transcript_index_failure: AdapterFailure | None = None
         self._transcript_root: Path | None = None
@@ -315,31 +377,23 @@ class WorkBuddyDataAdapter:
 
     def read_transcript(self, session_id: str) -> TranscriptReadResult:
         """Read a transcript found by the stable session id, never by cwd encoding."""
+        return self.transcript_snapshot().read_transcript(session_id)
+
+    def transcript_snapshot(self) -> TranscriptSnapshot:
+        """Freeze one bounded index for a batch without hiding later changes."""
         ready = self.probe()
         if ready.failure is not None:
-            return TranscriptReadResult(failure=ready.failure)
-        if not isinstance(session_id, str) or not session_id:
-            return TranscriptReadResult(
-                failure=AdapterFailure("transcript_not_found", "session id is missing")
+            return TranscriptSnapshot(
+                scanner=self.transcript_scanner,
+                failure=ready.failure,
             )
-        index, root, failure = self._ensure_transcript_index()
+        index, _root, failure = self._ensure_transcript_index()
         if failure is not None:
-            return TranscriptReadResult(failure=failure)
-        matches = index.get(session_id, ())
-        if not matches:
-            return TranscriptReadResult(
-                failure=AdapterFailure("transcript_not_found", "no transcript matches session id")
+            return TranscriptSnapshot(
+                scanner=self.transcript_scanner,
+                failure=failure,
             )
-        if len(matches) > 1:
-            return TranscriptReadResult(
-                failure=AdapterFailure(
-                    "transcript_ambiguous", "multiple transcripts match the same session id"
-                )
-            )
-        assert root is not None
-        return TranscriptReadResult(
-            content=matches[0].content.decode("utf-8", errors="replace"),
-        )
+        return TranscriptSnapshot(scanner=self.transcript_scanner, index=index)
 
     def transcript_path_for_session(self, session_id: str) -> Path | None:
         """Deprecated compatibility API; verified transcripts expose content, never paths."""
@@ -369,20 +423,30 @@ class WorkBuddyDataAdapter:
                 self._transcript_root,
                 self._transcript_index_failure,
             )
+        scanned = self.transcript_scanner.index(self)
+        if scanned.failure is not None:
+            if scanned.cache_failure:
+                self._transcript_index_failure = scanned.failure
+            return {}, scanned.root, scanned.failure
+        if scanned.cache_success:
+            self._transcript_root = scanned.root
+            self._transcript_index = scanned.index
+        return scanned.index, scanned.root, None
+
+    def _build_posix_transcript_index(self) -> TranscriptIndexResult:
+        """Run the original descriptor-pinned scanner without changing its contract."""
         root, root_stat, root_failure = self._projects_root()
         if root_failure is not None:
-            self._transcript_index_failure = root_failure
-            return {}, None, root_failure
+            return TranscriptIndexResult(failure=root_failure)
         if root is None:
-            self._transcript_index = {}
-            return {}, None, None
+            return TranscriptIndexResult()
 
         assert root_stat is not None
         root_fd, _opened_root_stat, open_failure = self._open_projects_root_descriptor(
             root, root_stat
         )
         if open_failure is not None:
-            return self._set_index_failure(open_failure.code, open_failure.message)
+            return TranscriptIndexResult(root=root, failure=open_failure)
         assert root_fd is not None
 
         index: dict[str, list[_TranscriptCandidate]] = {}
@@ -393,21 +457,20 @@ class WorkBuddyDataAdapter:
                 root_fd, Path(), index, candidates, bytes_read
             )
             if scan_failure is not None:
-                return self._set_index_failure(scan_failure.code, scan_failure.message)
+                return TranscriptIndexResult(root=root, failure=scan_failure)
         except BaseException as exc:
             failure = self._failure_from_exception(exc)
-            return self._set_index_failure(failure.code, failure.message)
+            return TranscriptIndexResult(root=root, failure=failure)
         finally:
             os.close(root_fd)
 
-        self._transcript_root = root
-        self._transcript_index = {
+        built_index = {
             session_id: tuple(
                 sorted(paths, key=lambda candidate: candidate.relative_path.as_posix())
             )
             for session_id, paths in index.items()
         }
-        return self._transcript_index, root, None
+        return TranscriptIndexResult(index=built_index, root=root)
 
     def _set_index_failure(
         self, code: str, message: str
@@ -675,3 +738,21 @@ class WorkBuddyDataAdapter:
                     "temporarily_unavailable", "WorkBuddy database is temporarily unavailable"
                 )
         return AdapterFailure("temporarily_unavailable", "WorkBuddy local data is unavailable")
+
+
+class PosixDescriptorTranscriptScanner:
+    """The existing descriptor-pinned traversal behind ``TranscriptScanner``.
+
+    Keeping the implementation on ``WorkBuddyDataAdapter`` preserves the
+    long-standing POSIX TOCTOU tests while making the platform choice
+    injectable.  Windows never calls this scanner.
+    """
+
+    def index(self, adapter: WorkBuddyDataAdapter) -> TranscriptIndexResult:
+        return adapter._build_posix_transcript_index()
+
+    @staticmethod
+    def read(candidate: TranscriptCandidate) -> TranscriptReadResult:
+        return TranscriptReadResult(
+            content=candidate.content.decode("utf-8", errors="replace")
+        )

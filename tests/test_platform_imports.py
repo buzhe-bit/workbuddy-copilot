@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +28,11 @@ FORBIDDEN_CORE_IMPORTS = {"AppKit", "Foundation", "objc", "fcntl"}
 MAC_ONLY_REQUIREMENTS = {"pyobjc-core", "pyobjc-framework-cocoa", "rumps"}
 SERVER_ONLY_REQUIREMENTS = {"fastapi", "uvicorn", "httpx"}
 
-pytestmark = [pytest.mark.contract, pytest.mark.core, pytest.mark.critical]
+pytestmark = [
+    pytest.mark.contract,
+    pytest.mark.core,
+    pytest.mark.critical,
+]
 
 
 def _meaningful_lines(path: Path) -> list[str]:
@@ -77,6 +82,7 @@ def _resolved_packages(path: Path, seen: frozenset[Path] = frozenset()) -> set[s
     return packages
 
 
+@pytest.mark.windows
 def test_student_core_import_tree_is_platform_neutral():
     package_dir = PROJECT_ROOT / "copilot" / "student_core"
     source_files = sorted(package_dir.rglob("*.py"))
@@ -119,12 +125,21 @@ print(json.dumps(sorted({name.split(".", 1)[0] for name in sys.modules})))
     )
     assert completed.returncode == 0, completed.stderr
     imported_roots = set(json.loads(completed.stdout.splitlines()[-1]))
-    assert FORBIDDEN_CORE_IMPORTS.isdisjoint(imported_roots), (
+    # Python 3.14's POSIX ``pathlib`` implementation imports ``fcntl``
+    # internally.  That transitive standard-library choice says nothing about
+    # Windows compatibility; direct declarations are rejected above, while a
+    # real Windows lane additionally proves that the package imports without
+    # the unavailable module.
+    runtime_forbidden = {"AppKit", "Foundation", "objc"}
+    if sys.platform.startswith("win"):
+        runtime_forbidden.add("fcntl")
+    assert runtime_forbidden.isdisjoint(imported_roots), (
         "Student Core loaded platform-only modules: "
-        f"{sorted(FORBIDDEN_CORE_IMPORTS & imported_roots)}"
+        f"{sorted(runtime_forbidden & imported_roots)}"
     )
 
 
+@pytest.mark.windows
 def test_core_requirements_are_platform_neutral_client_runtime_only():
     core = REQUIREMENT_FILES["core"]
     assert core.is_file(), "requirements-core.txt is missing"
@@ -136,6 +151,7 @@ def test_core_requirements_are_platform_neutral_client_runtime_only():
     assert packages == {"websockets"}
 
 
+@pytest.mark.windows
 def test_requirement_include_graph_keeps_platform_layers_isolated():
     missing = [path.name for path in REQUIREMENT_FILES.values() if not path.is_file()]
     assert not missing, f"missing requirement files: {missing}"
@@ -153,6 +169,7 @@ def test_requirement_include_graph_keeps_platform_layers_isolated():
     }
 
 
+@pytest.mark.windows
 def test_resolved_requirement_lanes_retain_default_macos_compatibility():
     server_direct, _ = _direct_layer(REQUIREMENT_FILES["server"])
     mac_direct, _ = _direct_layer(REQUIREMENT_FILES["macos"])
@@ -209,6 +226,7 @@ def _run_pytest_probe(
             ) from error
 
 
+@pytest.mark.windows
 def test_pytest_lanes_are_strict_and_critical_skips_fail():
     config = configparser.ConfigParser()
     config.read(PROJECT_ROOT / "pytest.ini", encoding="utf-8")
@@ -219,7 +237,8 @@ def test_pytest_lanes_are_strict_and_critical_skips_fail():
         if line.strip()
     }
 
-    assert pytest_config.getboolean("strict_markers") is True
+    assert "strict_markers" not in pytest_config
+    assert "--strict-markers" in shlex.split(pytest_config.get("addopts", ""))
     assert {
         "critical",
         "contract",
@@ -335,9 +354,14 @@ def test_recursive_collection_ignores_live_probe_but_explicit_probe_uses_policy(
     with TemporaryDirectory(prefix="_pytest_probe_", dir=tests_dir) as probe_dir:
         probe_path = Path(probe_dir) / PROBE_FILENAME
         probe_path.write_text(critical_source, encoding="utf-8")
+        sentinel_path = Path(probe_dir) / "test_collection_sentinel.py"
+        sentinel_path.write_text(
+            "def test_collection_sentinel():\n    pass\n",
+            encoding="utf-8",
+        )
 
         recursive = subprocess.run(
-            [sys.executable, "-m", "pytest", "--collect-only", "tests", "-q"],
+            [sys.executable, "-m", "pytest", "--collect-only", probe_dir, "-q"],
             cwd=PROJECT_ROOT,
             text=True,
             capture_output=True,
@@ -346,6 +370,7 @@ def test_recursive_collection_ignores_live_probe_but_explicit_probe_uses_policy(
         )
         recursive_output = recursive.stdout + recursive.stderr
         assert recursive.returncode == 0, recursive_output
+        assert "test_collection_sentinel.py::test_collection_sentinel" in recursive_output
         assert PROBE_FILENAME not in recursive_output
 
         explicit = subprocess.run(

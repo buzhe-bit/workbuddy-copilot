@@ -73,6 +73,36 @@ def test_assert_single_worker_rejects_uvicorn_cli_workers(monkeypatch, argv):
         assert_single_worker()
 
 
+def test_assert_single_worker_rejects_uvicorn_cli_workers_inside_spawned_child(
+    monkeypatch,
+):
+    signals = []
+    monkeypatch.delenv("COPILOT_WORKERS", raising=False)
+    monkeypatch.delenv("UVICORN_WORKERS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["/venv/bin/uvicorn", "copilot.service:app", "--workers", "2"],
+    )
+    monkeypatch.setattr(
+        app_context.multiprocessing,
+        "parent_process",
+        lambda: SimpleNamespace(pid=4242),
+    )
+    monkeypatch.setattr(
+        app_context.os,
+        "kill",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    with pytest.raises(RuntimeError, match=r"--workers 2"):
+        assert_single_worker()
+
+    expected_signal = signal.SIGTERM if app_context.os.name == "nt" else signal.SIGKILL
+    assert signals == [(4242, expected_signal)]
+
+
 def test_assert_single_worker_ignores_unrelated_workers_argument(monkeypatch):
     monkeypatch.delenv("COPILOT_WORKERS", raising=False)
     monkeypatch.delenv("UVICORN_WORKERS", raising=False)
@@ -222,13 +252,9 @@ def test_lifespan_rejects_second_process_for_same_db(tmp_path, monkeypatch):
         pass
 
 
-def test_lock_collision_signals_only_uvicorn_multiprocess_supervisor(
-    tmp_path,
+def test_supervisor_termination_signals_only_uvicorn_multiprocess_supervisor(
     monkeypatch,
 ):
-    cfg_path = _write_config(tmp_path)
-    first = build_context(cfg_path)
-    second = build_context(cfg_path)
     supervisor = SimpleNamespace(pid=4242)
     signals = []
     monkeypatch.setattr(
@@ -247,12 +273,10 @@ def test_lock_collision_signals_only_uvicorn_multiprocess_supervisor(
         lambda pid, sig: signals.append((pid, sig)),
     )
 
-    with TestClient(create_app(first)):
-        with pytest.raises(RuntimeError, match="single uvicorn worker"):
-            with TestClient(create_app(second)):
-                pass
+    app_context._terminate_uvicorn_multiprocess_supervisor()
 
-    assert signals == [(supervisor.pid, signal.SIGTERM)]
+    expected_signal = signal.SIGTERM if app_context.os.name == "nt" else signal.SIGKILL
+    assert signals == [(supervisor.pid, expected_signal)]
 
 
 def test_lock_collision_does_not_signal_unrelated_multiprocess_parent(

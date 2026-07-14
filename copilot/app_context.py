@@ -7,7 +7,6 @@ module globals.
 """
 from __future__ import annotations
 
-import fcntl
 import hmac
 import logging
 import multiprocessing
@@ -30,6 +29,37 @@ from .store import Store
 from .upload_service import UploadRequestService
 
 log = logging.getLogger("copilot.app_context")
+
+
+if os.name == "nt":
+    import msvcrt
+
+    def _lock_worker_file(lock_file: Any) -> None:
+        """Acquire one non-blocking byte-range lock on Windows."""
+
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write("\0")
+            lock_file.flush()
+            os.fsync(lock_file.fileno())
+        lock_file.seek(0)
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise BlockingIOError("worker lock is already held") from exc
+
+    def _unlock_worker_file(lock_file: Any) -> None:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock_worker_file(lock_file: Any) -> None:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_worker_file(lock_file: Any) -> None:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _env_int(name: str) -> int | None:
@@ -73,33 +103,51 @@ def assert_single_worker() -> None:
     for name in ("COPILOT_WORKERS", "UVICORN_WORKERS", "WEB_CONCURRENCY"):
         workers = _env_int(name)
         if workers is not None and workers > 1:
+            _terminate_uvicorn_multiprocess_supervisor(
+                multiworker_requested=True
+            )
             raise RuntimeError(
                 "WorkBuddy Copilot requires a single uvicorn worker; "
                 f"{name}={workers} would split in-memory WS/EventBus state."
             )
-    if multiprocessing.parent_process() is None:
-        for setting, workers in _uvicorn_cli_worker_settings(sys.argv):
-            if workers > 1:
-                raise RuntimeError(
-                    "WorkBuddy Copilot requires a single uvicorn worker; "
-                    f"{setting} would split in-memory WS/EventBus state."
-                )
+    for setting, workers in _uvicorn_cli_worker_settings(sys.argv):
+        if workers > 1:
+            _terminate_uvicorn_multiprocess_supervisor(
+                multiworker_requested=True
+            )
+            raise RuntimeError(
+                "WorkBuddy Copilot requires a single uvicorn worker; "
+                f"{setting} would split in-memory WS/EventBus state."
+            )
 
 
-def _terminate_uvicorn_multiprocess_supervisor() -> None:
+def _terminate_uvicorn_multiprocess_supervisor(
+    *,
+    multiworker_requested: bool | None = None,
+) -> None:
     """Ask only a recognized Uvicorn CLI supervisor to stop its workers."""
     parent = multiprocessing.parent_process()
     if parent is None or parent.pid is None:
         return
-    if not any(workers > 1 for _, workers in _uvicorn_cli_worker_settings(sys.argv)):
+    cli_settings = _uvicorn_cli_worker_settings(sys.argv)
+    executable = Path(sys.argv[0]) if sys.argv else Path("")
+    is_uvicorn_cli = bool(cli_settings) or executable.stem == "uvicorn" or (
+        executable.name == "__main__.py" and executable.parent.name == "uvicorn"
+    )
+    if not is_uvicorn_cli:
         return
+    if multiworker_requested is None:
+        multiworker_requested = any(workers > 1 for _, workers in cli_settings)
+    if not multiworker_requested:
+        return
+    stop_signal = signal.SIGTERM if os.name == "nt" else signal.SIGKILL
     try:
-        os.kill(parent.pid, signal.SIGTERM)
+        os.kill(parent.pid, stop_signal)
     except ProcessLookupError:
         log.warning("uvicorn multiprocess supervisor already exited pid=%s", parent.pid)
     else:
         log.critical(
-            "single-worker lock collision; terminating uvicorn supervisor pid=%s",
+            "invalid multi-worker startup; terminating uvicorn supervisor pid=%s",
             parent.pid,
         )
 
@@ -176,7 +224,7 @@ def acquire_worker_lock(context: AppContext) -> None:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+", encoding="utf-8")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_worker_file(lock_file)
     except BlockingIOError as exc:
         lock_file.close()
         _terminate_uvicorn_multiprocess_supervisor()
@@ -193,7 +241,7 @@ def release_worker_lock(context: AppContext) -> None:
     if lock_file is None:
         return
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        _unlock_worker_file(lock_file)
     finally:
         lock_file.close()
         context.worker_lock_file = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from typing import Any
@@ -57,6 +58,363 @@ def _transcript() -> str:
             "timestamp": 11.0,
         })
     )
+
+
+def test_stop_store_only_transcript_is_source_bound_and_never_reanalyzed(tmp_path):
+    app, store, _registry, llm_calls = _build_upload_app(tmp_path)
+    report, duplicate = store.accept_report(
+        student_id="student-a",
+        session_id="sess-store-only",
+        event="Stop",
+        event_id="event-store-only",
+        prompt="tail prompt",
+        transcript_path="",
+        msg_count=1,
+        tool_calls=0,
+        analysis_input=_transcript(),
+    )
+    assert duplicate is False
+    raw = _transcript()
+    sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/student/sessions/sess-store-only/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": raw,
+                "sha": sha,
+                "analysis_mode": "store_only",
+                "source_event_id": "event-store-only",
+                "source_report_id": report["id"],
+            },
+        )
+        repeated = client.post(
+            "/api/student/sessions/sess-store-only/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": raw,
+                "sha": sha,
+                "analysis_mode": "store_only",
+                "source_event_id": "event-store-only",
+                "source_report_id": report["id"],
+            },
+        )
+
+    assert first.status_code == 200
+    assert first.json()["analysis_scheduled"] is False
+    assert first.json()["analysis_mode"] == "store_only"
+    assert repeated.status_code == 200
+    assert repeated.json()["skipped"] is True
+    # Startup recovery performs the source Stop analysis exactly once. The
+    # automatic full-context supplement must not trigger a second model call.
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["event"] == "Stop"
+    with store._conn() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM reports WHERE event = 'BulkUpload'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM raw_transcripts WHERE student_id = ? AND session_id = ?",
+            ("student-a", "sess-store-only"),
+        ).fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("overrides", "status"),
+    [
+        ({"source_event_id": "wrong-event"}, 409),
+        ({"source_report_id": 999999}, 409),
+        ({"request_id": "mentor-request"}, 400),
+        ({"sha": "client-lied-about-content"}, 409),
+    ],
+)
+def test_store_only_rejects_unbound_or_unconfirmed_source(tmp_path, overrides, status):
+    app, store, _registry, _llm_calls = _build_upload_app(tmp_path)
+    report, _ = store.accept_report(
+        student_id="student-a",
+        session_id="sess-bound",
+        event="Stop",
+        event_id="event-bound",
+        prompt="",
+        transcript_path="",
+        msg_count=0,
+        tool_calls=0,
+        analysis_input="tail",
+    )
+    raw = _transcript()
+    body = {
+        "student_id": "student-a",
+        "filtered_content": raw,
+        "sha": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "analysis_mode": "store_only",
+        "source_event_id": "event-bound",
+        "source_report_id": report["id"],
+        **overrides,
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/student/sessions/sess-bound/transcript",
+            headers=_headers(),
+            json=body,
+        )
+
+    assert response.status_code == status
+    assert store.get_raw_transcript_for_student_session("student-a", "sess-bound") is None
+
+
+def test_older_stop_transcript_arriving_late_cannot_overwrite_newer_context(
+    tmp_path,
+) -> None:
+    app, store, _registry, _llm_calls = _build_upload_app(tmp_path)
+    old_report, _ = store.accept_report(
+        student_id="student-a",
+        session_id="sess-order",
+        event="Stop",
+        event_id="event-old",
+        prompt="old",
+        transcript_path="",
+        msg_count=1,
+        tool_calls=0,
+        analysis_input="old tail",
+    )
+    new_report, _ = store.accept_report(
+        student_id="student-a",
+        session_id="sess-order",
+        event="Stop",
+        event_id="event-new",
+        prompt="new",
+        transcript_path="",
+        msg_count=1,
+        tool_calls=0,
+        analysis_input="new tail",
+    )
+    old_raw = _line({"type": "message", "role": "user", "content": "OLD CONTEXT"})
+    new_raw = _line({"type": "message", "role": "user", "content": "NEW CONTEXT"})
+
+    def body(raw: str, report: dict[str, Any], event_id: str) -> dict[str, Any]:
+        return {
+            "student_id": "student-a",
+            "filtered_content": raw,
+            "sha": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "analysis_mode": "store_only",
+            "source_event_id": event_id,
+            "source_report_id": report["id"],
+        }
+
+    with TestClient(app) as client:
+        newer = client.post(
+            "/api/student/sessions/sess-order/transcript",
+            headers=_headers(),
+            json=body(new_raw, new_report, "event-new"),
+        )
+        delayed_old = client.post(
+            "/api/student/sessions/sess-order/transcript",
+            headers=_headers(),
+            json=body(old_raw, old_report, "event-old"),
+        )
+
+    stored = store.get_raw_transcript_for_student_session("student-a", "sess-order")
+    assert newer.status_code == 200
+    assert delayed_old.status_code == 200
+    assert delayed_old.json()["skipped"] is True
+    assert delayed_old.json()["obsolete"] is True
+    assert stored is not None
+    assert "NEW CONTEXT" in stored["content"]
+    assert "OLD CONTEXT" not in stored["content"]
+
+
+def test_store_only_same_sha_does_not_cancel_running_mentor_analysis(
+    tmp_path,
+) -> None:
+    app, store, _registry, _llm_calls = _build_upload_app(tmp_path)
+    report, _ = store.accept_report(
+        student_id="student-a",
+        session_id="sess-running",
+        event="Stop",
+        event_id="event-running",
+        prompt="",
+        transcript_path="",
+        msg_count=1,
+        tool_calls=0,
+        analysis_input="tail",
+    )
+    raw = _line({"type": "message", "role": "user", "content": "same sha"})
+    sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    with TestClient(app) as client:
+        store.replace_session_messages(
+            "sess-running",
+            "student-a",
+            [{"seq": 0, "role": "user", "text": "same sha", "ts": 1.0}],
+            raw,
+            sha,
+        )
+        store.queue_raw_transcript_analysis(
+            student_id="student-a",
+            session_id="sess-running",
+            content_sha256=sha,
+        )
+        claim = store.claim_raw_transcript_analysis(
+            student_id="student-a",
+            session_id="sess-running",
+            content_sha256=sha,
+            prompt_hash="mentor-analysis",
+        )
+        assert claim["state"] == "claimed"
+        response = client.post(
+            "/api/student/sessions/sess-running/transcript",
+            headers=_headers(),
+            json={
+                "student_id": "student-a",
+                "filtered_content": raw,
+                "sha": sha,
+                "analysis_mode": "store_only",
+                "source_event_id": "event-running",
+                "source_report_id": report["id"],
+            },
+        )
+
+    current = store.get_raw_transcript_for_student_session_sha(
+        "student-a", "sess-running", sha
+    )
+    assert response.status_code == 200
+    assert current is not None
+    assert current["analysis_status"] == "running"
+    assert current["analysis_generation"] == claim["generation"]
+
+
+@pytest.mark.parametrize("active_status", ["pending", "running"])
+def test_store_only_new_sha_is_retryable_conflict_while_mentor_analysis_is_active(
+    tmp_path,
+    active_status: str,
+) -> None:
+    app, store, _registry, _llm_calls = _build_upload_app(tmp_path)
+    old_report, _ = store.accept_report(
+        student_id="student-a",
+        session_id="sess-active",
+        event="Stop",
+        event_id="event-active-old",
+        prompt="",
+        transcript_path="",
+        msg_count=1,
+        tool_calls=0,
+        analysis_input="old tail",
+    )
+    new_report, _ = store.accept_report(
+        student_id="student-a",
+        session_id="sess-active",
+        event="Stop",
+        event_id="event-active-new",
+        prompt="",
+        transcript_path="",
+        msg_count=1,
+        tool_calls=0,
+        analysis_input="new tail",
+    )
+    old_raw = _line({"type": "message", "role": "user", "content": "OLD ACTIVE"})
+    new_raw = _line({"type": "message", "role": "user", "content": "NEW STOP"})
+    old_sha = hashlib.sha256(old_raw.encode("utf-8")).hexdigest()
+    new_sha = hashlib.sha256(new_raw.encode("utf-8")).hexdigest()
+
+    def store_only_body(raw: str, sha: str, report: dict[str, Any], event_id: str):
+        return {
+            "student_id": "student-a",
+            "filtered_content": raw,
+            "sha": sha,
+            "analysis_mode": "store_only",
+            "source_event_id": event_id,
+            "source_report_id": report["id"],
+        }
+
+    with TestClient(app) as client:
+        seeded = client.post(
+            "/api/student/sessions/sess-active/transcript",
+            headers=_headers(),
+            json=store_only_body(old_raw, old_sha, old_report, "event-active-old"),
+        )
+        assert seeded.status_code == 200
+        assert store.queue_raw_transcript_analysis(
+            student_id="student-a",
+            session_id="sess-active",
+            content_sha256=old_sha,
+        ) == 1
+        if active_status == "running":
+            claim = store.claim_raw_transcript_analysis(
+                student_id="student-a",
+                session_id="sess-active",
+                content_sha256=old_sha,
+                prompt_hash="mentor-active",
+            )
+            assert claim["state"] == "claimed"
+        request_id = store.add_upload_request(
+            mentor_id="mentor-1",
+            student_id="student-a",
+            session_id="sess-active",
+        )
+        child = store.upsert_upload_request_session(
+            request_id,
+            "student-a",
+            "sess-active",
+            old_sha,
+        )
+        assert child["analysis_status"] == active_status
+        request_before = store.get_upload_request(request_id)
+
+        with store._conn() as connection:
+            raw_before = dict(connection.execute(
+                """SELECT * FROM raw_transcripts
+                   WHERE student_id = ? AND session_id = ?""",
+                ("student-a", "sess-active"),
+            ).fetchone())
+            messages_before = [dict(row) for row in connection.execute(
+                """SELECT * FROM messages
+                   WHERE student_id = ? AND session_id = ? ORDER BY id""",
+                ("student-a", "sess-active"),
+            ).fetchall()]
+            watermark_before = dict(connection.execute(
+                """SELECT * FROM stop_transcript_watermarks
+                   WHERE student_id = ? AND session_id = ?""",
+                ("student-a", "sess-active"),
+            ).fetchone())
+
+        conflict = client.post(
+            "/api/student/sessions/sess-active/transcript",
+            headers=_headers(),
+            json=store_only_body(new_raw, new_sha, new_report, "event-active-new"),
+        )
+
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == {
+        "code": "transcript_analysis_active",
+        "message": "mentor transcript analysis is active; retry store_only later",
+        "retryable": True,
+    }
+    assert conflict.headers["retry-after"] == "2"
+    with store._conn() as connection:
+        raw_after = dict(connection.execute(
+            """SELECT * FROM raw_transcripts
+               WHERE student_id = ? AND session_id = ?""",
+            ("student-a", "sess-active"),
+        ).fetchone())
+        messages_after = [dict(row) for row in connection.execute(
+            """SELECT * FROM messages
+               WHERE student_id = ? AND session_id = ? ORDER BY id""",
+            ("student-a", "sess-active"),
+        ).fetchall()]
+        watermark_after = dict(connection.execute(
+            """SELECT * FROM stop_transcript_watermarks
+               WHERE student_id = ? AND session_id = ?""",
+            ("student-a", "sess-active"),
+        ).fetchone())
+    assert raw_after == raw_before
+    assert messages_after == messages_before
+    assert watermark_after == watermark_before
+    assert store.get_upload_request(request_id) == request_before
+    assert store.list_upload_request_sessions(request_id) == [child]
 
 
 def _build_upload_app(tmp_path, *, llm_enabled: bool = True):
