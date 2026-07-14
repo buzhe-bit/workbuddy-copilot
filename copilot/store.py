@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS mentor_messages (
     session_id TEXT,
     text TEXT,
     message_id TEXT UNIQUE,
+    client_request_id TEXT,
     created_at REAL,
     delivered_at REAL,
     read_at REAL,
@@ -355,6 +356,7 @@ _MIGRATIONS = [
     ("student_asks", "feedback", "TEXT NOT NULL DEFAULT ''"),
     ("student_asks", "feedback_note", "TEXT NOT NULL DEFAULT ''"),
     ("student_asks", "feedback_at", "REAL"),
+    ("mentor_messages", "client_request_id", "TEXT"),
 ]
 
 _POST_MIGRATION_SQL = [
@@ -381,6 +383,9 @@ _POST_MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_ai_summaries_prompt ON ai_summaries(prompt_id)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_student ON sessions(student_id)",
     "CREATE INDEX IF NOT EXISTS idx_mentor_messages_student_delivered ON mentor_messages(student_id, delivered_at)",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_mentor_messages_client_request_unique
+       ON mentor_messages(client_request_id)
+       WHERE client_request_id IS NOT NULL AND client_request_id != ''""",
     "CREATE INDEX IF NOT EXISTS idx_raw_transcripts_session ON raw_transcripts(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_raw_transcripts_student_sha ON raw_transcripts(student_id, content_sha256)",
     "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq)",
@@ -1564,6 +1569,100 @@ class Store:
                 (student_id, mentor_id, session_id, text, message_id, time.time()),
             )
             return cur.lastrowid
+
+    def get_or_create_mentor_message(
+        self,
+        *,
+        student_id: str,
+        mentor_id: str,
+        session_id: str,
+        text: str,
+        message_id: str,
+        client_request_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically persist one retry-safe mentor message.
+
+        The client key is global and opaque. Reusing it with a different
+        payload is a conflict rather than permission to mutate the original
+        message. The returned boolean is true only for the inserting caller.
+        """
+        request_id = str(client_request_id or "")
+        if not request_id or len(request_id) > 128:
+            raise ValueError("invalid client_request_id")
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+        if any(char not in allowed for char in request_id):
+            raise ValueError("invalid client_request_id")
+
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            existing = c.execute(
+                "SELECT * FROM mentor_messages WHERE client_request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                row = dict(existing)
+                identity = (
+                    str(row.get("student_id") or ""),
+                    str(row.get("mentor_id") or ""),
+                    str(row.get("session_id") or ""),
+                    str(row.get("text") or ""),
+                )
+                if identity != (student_id, mentor_id, session_id, text):
+                    raise ValueError("client_request_id payload conflict")
+                return row, False
+
+            created_at = time.time()
+            c.execute(
+                """INSERT INTO students
+                   (student_id, display_name, token_hash, created_at)
+                   VALUES (?, '', NULL, ?)
+                   ON CONFLICT(student_id) DO NOTHING""",
+                (student_id, created_at),
+            )
+            cur = c.execute(
+                """INSERT INTO mentor_messages
+                   (student_id, mentor_id, session_id, text, message_id,
+                    client_request_id, created_at, delivered_at, read_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                (
+                    student_id,
+                    mentor_id,
+                    session_id,
+                    text,
+                    message_id,
+                    request_id,
+                    created_at,
+                ),
+            )
+            row = c.execute(
+                "SELECT * FROM mentor_messages WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            return dict(row), True
+
+    def list_mentor_messages_by_client_request_ids(
+        self,
+        client_request_ids: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        """Return found rows once, preserving the caller's first-seen order."""
+        ordered_ids = list(dict.fromkeys(
+            str(value) for value in client_request_ids if str(value)
+        ))
+        if not ordered_ids:
+            return []
+        if len(ordered_ids) > 300:
+            raise ValueError("too many client_request_ids")
+        placeholders = ",".join("?" for _ in ordered_ids)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT client_request_id, message_id, id, student_id,
+                           delivered_at
+                    FROM mentor_messages
+                    WHERE client_request_id IN ({placeholders})""",
+                ordered_ids,
+            ).fetchall()
+        by_request_id = {str(row["client_request_id"]): dict(row) for row in rows}
+        return [by_request_id[value] for value in ordered_ids if value in by_request_id]
 
     def _message_cursor_id(
         self,

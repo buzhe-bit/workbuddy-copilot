@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>导师观察台</title>
-  <link rel="stylesheet" href="style.css?v=11" />
+  <link rel="stylesheet" href="style.css?v=12" />
 </head>
 <body>
   <header class="topbar">
@@ -13,6 +13,51 @@
   </header>
 
   <main class="layout">
+    <!-- 导师干预雷达：只给决策建议，绝不自动发送学员消息 -->
+    <section class="panel panel-attention" aria-labelledby="attention-heading">
+      <div class="panel-heading-row">
+        <h2 id="attention-heading">需要关注</h2>
+        <button id="attention-refresh" class="attention-refresh" type="button">刷新</button>
+      </div>
+      <div class="attention-filters" aria-label="关注队列筛选">
+        <label>
+          <span>状态</span>
+          <select id="attention-status-filter">
+            <option value="active">待处理</option>
+            <option value="open">未处理</option>
+            <option value="in_progress">处理中</option>
+            <option value="resolved">已解决</option>
+            <option value="dismissed">已忽略</option>
+            <option value="">全部</option>
+          </select>
+        </label>
+        <label>
+          <span>级别</span>
+          <select id="attention-priority-filter">
+            <option value="">全部</option>
+            <option value="high">高</option>
+            <option value="medium">中</option>
+          </select>
+        </label>
+        <label>
+          <span>类别</span>
+          <select id="attention-category-filter">
+            <option value="">全部</option>
+            <option value="learning">学习关注</option>
+            <option value="system">系统异常</option>
+          </select>
+        </label>
+        <label>
+          <span>学员</span>
+          <select id="attention-student-filter">
+            <option value="">全部</option>
+          </select>
+        </label>
+      </div>
+      <div id="attention-feedback" class="attention-feedback" role="status" aria-live="polite"></div>
+      <ul id="attention-list" class="attention-list"></ul>
+    </section>
+
     <!-- 左栏：学员列表 -->
     <section class="panel panel-students">
       <h2>学员</h2>
@@ -58,6 +103,6 @@
     </section>
   </main>
 
-  <script src="app.js?v=12"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

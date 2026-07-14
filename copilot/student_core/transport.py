@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import ipaddress
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -43,20 +44,35 @@ def _default_ws_connect(url: str, headers: dict[str, str]):
         parameters = inspect.signature(connect).parameters
     except (TypeError, ValueError):
         parameters = {}
-    if "additional_headers" in parameters:
-        return connect(url, additional_headers=headers)
-    if "extra_headers" in parameters:
-        return connect(url, extra_headers=headers)
-    # Older websockets versions accept arbitrary kwargs and only fail when the
-    # async context is entered. Prefer their legacy spelling when introspection
-    # cannot distinguish the two APIs.
     version = str(getattr(websockets, "__version__", ""))
     try:
         major = int(version.split(".", 1)[0])
     except (TypeError, ValueError):
         major = 0
-    keyword = "additional_headers" if major >= 14 else "extra_headers"
-    return connect(url, **{keyword: headers})
+    if "additional_headers" in parameters:
+        header_keyword = "additional_headers"
+    elif "extra_headers" in parameters:
+        header_keyword = "extra_headers"
+    else:
+        # Older websockets versions accept arbitrary kwargs and only fail when
+        # the async context is entered. Prefer their legacy spelling when
+        # introspection cannot distinguish the two APIs.
+        header_keyword = "additional_headers" if major >= 14 else "extra_headers"
+
+    kwargs: dict[str, Any] = {header_keyword: headers}
+    hostname = urllib.parse.urlsplit(url).hostname or ""
+    try:
+        is_loopback = hostname.lower() == "localhost" or ipaddress.ip_address(
+            hostname,
+        ).is_loopback
+    except ValueError:
+        is_loopback = hostname.lower() == "localhost"
+    # websockets 15+ discovers system proxies automatically. A local Student
+    # Core connection must never require the optional SOCKS dependency or
+    # leave the host through a proxy.
+    if is_loopback and ("proxy" in parameters or major >= 15):
+        kwargs["proxy"] = None
+    return connect(url, **kwargs)
 
 
 class StudentTransport:

@@ -648,29 +648,69 @@ class MessageService:
         self.copilot = copilot_repo
         self.bus = event_bus
 
-    async def send(self, student_id: str, mentor_id: str | None, text: str) -> dict[str, Any]:
+    async def send(
+        self,
+        student_id: str,
+        mentor_id: str | None,
+        text: str,
+        client_request_id: str | None = None,
+    ) -> dict[str, Any]:
         """Persist a mentor message, publish it, and report delivery status."""
         resolved_mentor_id = mentor_id or "mentor"
         message_id = uuid.uuid4().hex
-        self.copilot.upsert_student(student_id)
-        row_id = self.copilot.add_mentor_message(
-            student_id=student_id,
-            mentor_id=resolved_mentor_id,
-            session_id="",
-            text=text,
-            message_id=message_id,
-        )
-        row = self._find_message(student_id, row_id)
-        payload = self._to_wire_message(row)
+        created = True
+        if client_request_id is None:
+            self.copilot.upsert_student(student_id)
+            row_id = self.copilot.add_mentor_message(
+                student_id=student_id,
+                mentor_id=resolved_mentor_id,
+                session_id="",
+                text=text,
+                message_id=message_id,
+            )
+            row = self._find_message(student_id, row_id)
+        else:
+            row, created = self.copilot.get_or_create_mentor_message(
+                student_id=student_id,
+                mentor_id=resolved_mentor_id,
+                session_id="",
+                text=text,
+                message_id=message_id,
+                client_request_id=client_request_id,
+            )
+            row_id = int(row["id"])
+            message_id = str(row["message_id"])
 
-        await self.bus.publish(payload)
+        if created:
+            await self.bus.publish(self._to_wire_message(row))
 
         delivered_row = self._find_message(student_id, row_id)
-        return {
+        result = {
             "message_id": message_id,
             "id": row_id,
             "delivered": bool(delivered_row.get("delivered_at")),
         }
+        if client_request_id is not None:
+            result.update({
+                "client_request_id": client_request_id,
+                "duplicate": not created,
+            })
+        return result
+
+    def get_mentor_message_statuses(
+        self,
+        client_request_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """Return the bounded recovery projection; message text stays private."""
+        return [{
+            "client_request_id": row["client_request_id"],
+            "message_id": row["message_id"],
+            "id": row["id"],
+            "student_id": row["student_id"],
+            "delivered": bool(row.get("delivered_at")),
+        } for row in self.copilot.list_mentor_messages_by_client_request_ids(
+            client_request_ids,
+        )]
 
     def get_catchup(
         self,
@@ -725,13 +765,16 @@ class MessageService:
             return False
 
         row = self._find_message_by_message_id(student_id, message_id)
-        await self.bus.publish({
+        receipt = {
             "type": "message_delivered",
             "student_id": student_id,
             "message_id": message_id,
             "id": row["id"],
             "timestamp": row.get("delivered_at") or time.time(),
-        })
+        }
+        if row.get("client_request_id"):
+            receipt["client_request_id"] = row["client_request_id"]
+        await self.bus.publish(receipt)
         return True
 
     def _find_message(self, student_id: str, row_id: int) -> dict[str, Any]:

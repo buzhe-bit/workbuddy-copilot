@@ -86,7 +86,7 @@
 | FE-1 | [前端] | 打开 /mentor/ | 三栏渲染；学员列表来自 GET /api/mentor/students（非空、带 display_name）|
 | FE-2 | [前端] | 点学员→点对话 | 中栏对话列表、右栏时间线渲染，三类型着色（蓝/紫/橙）。**回归断言 B3：点任一对话后其他学员/会话的状态圆点不被刷绿、告警/分析计数不清零** |
 | FE-3 | [端到端] | 学员侧 /report(UserPromptSubmit+Stop) → 导师台 | 导师台 WS 实时新增 prompt(蓝)/ai_summary(紫)/analysis(橙) 条目，无需刷新 |
-| FE-4 | [端到端] | 导师在 compose 框发消息→发送 | POST /api/mentor/message 成功；假浮标 WS 收到 mentor_message 且**仅目标学员收到**；导师台显示"已送达" |
+| FE-4 | [端到端] | 导师在 compose 框发消息→发送 | POST /api/mentor/message 成功；假浮标 WS 收到 mentor_message 且**仅目标学员收到**；学员端成功渲染并持久化回执后，导师台显示"已展示" |
 | FE-5 | [前端/安全] | 学员把会话标题设为 `<img src=x onerror=alert(1)>` | 导师台把它**当纯文本渲染、不执行 JS**（textContent，XSS 回归）|
 | FE-6 | [前端] | WS 断开后重连 | 重连带 last_seen_message_id 触发补拉，时间线无缺口、无重复（message_id 幂等）|
 | FE-7 | [前端/安全] | 配置 mentor token 后打开 /mentor/ | 首次要求输入或读取 mentor token；所有 REST/WS 请求带 token；token 错误时显示认证失败而不是静默空白 |

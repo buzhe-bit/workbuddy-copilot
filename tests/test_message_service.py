@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 
 from copilot.connections import WSRegistry
 from copilot.eventbus import EventBus
@@ -164,3 +165,177 @@ def test_ack_does_not_republish_receipt_when_message_is_already_delivered(tmp_pa
         assert mentor.sent == []
 
     asyncio.run(scenario())
+
+
+def test_ack_receipt_includes_client_request_id_for_retry_safe_message(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "messages.db")
+        bus = EventBus()
+        published = []
+
+        async def capture(payload):
+            published.append(payload)
+
+        bus.subscribe(capture)
+        service = MessageService(store, bus)
+        sent = await service.send(
+            "student-a",
+            "mentor-1",
+            "Retry-safe receipt",
+            client_request_id="request-receipt",
+        )
+        published.clear()
+
+        assert await service.ack(sent["message_id"], "student-a") is True
+        row = store.list_messages_since("student-a", 0)[0]
+        assert published == [{
+            "type": "message_delivered",
+            "student_id": "student-a",
+            "message_id": sent["message_id"],
+            "id": sent["id"],
+            "client_request_id": "request-receipt",
+            "timestamp": row["delivered_at"],
+        }]
+
+    asyncio.run(scenario())
+
+
+def test_client_request_id_is_idempotent_and_publishes_only_once(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "messages.db")
+        bus = EventBus()
+        published = []
+
+        async def capture(payload):
+            published.append(payload)
+
+        bus.subscribe(capture)
+        service = MessageService(store, bus)
+
+        results = await asyncio.gather(*[
+            service.send(
+                "student-a",
+                "mentor-1",
+                "Try a smaller example",
+                client_request_id="request-123",
+            )
+            for _ in range(10)
+        ])
+        restarted = MessageService(Store(store.db_path), bus)
+        replay_after_restart = await restarted.send(
+            "student-a",
+            "mentor-1",
+            "Try a smaller example",
+            client_request_id="request-123",
+        )
+
+        rows = store.list_messages_since("student-a", 0)
+        assert len(rows) == 1
+        assert rows[0]["client_request_id"] == "request-123"
+        assert len(published) == 1
+        assert {result["message_id"] for result in results} == {rows[0]["message_id"]}
+        assert sum(result["duplicate"] is False for result in results) == 1
+        assert sum(result["duplicate"] is True for result in results) == 9
+        assert replay_after_restart["duplicate"] is True
+        assert replay_after_restart["message_id"] == rows[0]["message_id"]
+
+    asyncio.run(scenario())
+
+
+def test_client_request_id_reuse_with_different_payload_is_rejected(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "messages.db")
+        service = MessageService(store, EventBus())
+
+        await service.send(
+            "student-a",
+            "mentor-1",
+            "Original",
+            client_request_id="request-conflict",
+        )
+
+        try:
+            await service.send(
+                "student-b",
+                "mentor-1",
+                "Changed text",
+                client_request_id="request-conflict",
+            )
+        except ValueError as exc:
+            assert "client_request_id" in str(exc)
+        else:
+            raise AssertionError("conflicting idempotency key must be rejected")
+
+        rows = store.list_messages_since("student-a", 0)
+        assert len(rows) == 1
+        assert rows[0]["text"] == "Original"
+        with sqlite3.connect(store.db_path) as conn:
+            students = {
+                row[0] for row in conn.execute("SELECT student_id FROM students")
+            }
+        assert students == {"student-a"}
+
+    asyncio.run(scenario())
+
+
+def test_mentor_message_status_recovers_delivery_without_exposing_text(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "messages.db")
+        service = MessageService(store, EventBus())
+        sent = await service.send(
+            "student-a",
+            "mentor-1",
+            "Private mentor guidance",
+            client_request_id="request-status",
+        )
+
+        assert await service.ack(sent["message_id"], "student-a") is True
+        statuses = service.get_mentor_message_statuses([
+            "missing-request",
+            "request-status",
+            "request-status",
+        ])
+
+        assert statuses == [{
+            "client_request_id": "request-status",
+            "message_id": sent["message_id"],
+            "id": sent["id"],
+            "student_id": "student-a",
+            "delivered": True,
+        }]
+        assert "text" not in statuses[0]
+
+    asyncio.run(scenario())
+
+
+def test_legacy_mentor_message_schema_migrates_idempotency_column_reentrantly(tmp_path):
+    db_path = tmp_path / "legacy-messages.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""CREATE TABLE mentor_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT,
+            mentor_id TEXT,
+            session_id TEXT,
+            text TEXT,
+            message_id TEXT UNIQUE,
+            created_at REAL,
+            delivered_at REAL,
+            read_at REAL
+        )""")
+
+    Store(db_path)
+    Store(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(mentor_messages)",
+            ).fetchall()
+        }
+        index_names = {
+            row[1] for row in conn.execute(
+                "PRAGMA index_list(mentor_messages)",
+            ).fetchall()
+        }
+    assert "client_request_id" in columns
+    assert "idx_mentor_messages_client_request_unique" in index_names

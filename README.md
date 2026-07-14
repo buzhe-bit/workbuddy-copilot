@@ -80,10 +80,11 @@ Windows 不应执行 macOS 安装或浮标命令。待真实 Windows WorkBuddy �
 | 接口 | 身份 | 用途 |
 |---|---|---|
 | `POST /report` | student token | 接收 Hook/Student Core 事件；快速接受后由服务端后台处理。 |
-| `POST /api/mentor/message` | mentor token | 持久化并定向推送导师文字消息。 |
+| `POST /api/mentor/message` | mentor token | 持久化并定向推送导师文字消息；可选 `client_request_id` 用于幂等恢复。 |
+| `POST /api/mentor/messages/status` | mentor token | 按最多 300 个 `client_request_id` 补查持久化/展示状态，不返回消息正文。 |
 | `GET /api/student/messages` | student token | 常规断线补拉。 |
 | `GET /api/student/messages/pending-receipts` | student token | 仅取待确认导师消息；`limit` 最高 64，支持 `after_id`。 |
-| `POST /api/student/messages/ack` | student token | 学员端成功处理后的唯一送达确认入口。 |
+| `POST /api/student/messages/ack` | student token | 学员端成功渲染并持久化后的唯一“已展示”确认入口。 |
 
 ## 测试
 

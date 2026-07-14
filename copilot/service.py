@@ -88,6 +88,33 @@ class _EventId(str):
         return cls(normalized)
 
 
+class _ClientRequestId(str):
+    """Pydantic 1/2 compatible opaque idempotency key."""
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):
+        from pydantic_core import core_schema
+
+        return core_schema.no_info_after_validator_function(
+            cls.validate,
+            core_schema.str_schema(),
+        )
+
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, value, *args):
+        candidate = str(value or "")
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+        if not candidate or len(candidate) > 128:
+            raise ValueError("invalid client_request_id")
+        if any(char not in allowed for char in candidate):
+            raise ValueError("invalid client_request_id")
+        return cls(candidate)
+
+
 class ReportIn(BaseModel):
     student_id: str
     session_id: str | None = None
@@ -103,6 +130,11 @@ class MentorMessageIn(BaseModel):
     student_id: str
     text: str
     mentor_id: str | None = None
+    client_request_id: _ClientRequestId | None = None
+
+
+class MentorMessageStatusIn(BaseModel):
+    client_request_ids: list[_ClientRequestId]
 
 
 class StudentMessageAckIn(BaseModel):
@@ -1365,11 +1397,32 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         _: None = Depends(require_mentor_token),
         message_svc: MessageService = Depends(get_message_service),
     ):
-        return await message_svc.send(
-            student_id=data.student_id,
-            mentor_id=data.mentor_id,
-            text=data.text,
-        )
+        try:
+            return await message_svc.send(
+                student_id=data.student_id,
+                mentor_id=data.mentor_id,
+                text=data.text,
+                client_request_id=data.client_request_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/mentor/messages/status")
+    async def get_mentor_message_statuses(
+        data: MentorMessageStatusIn,
+        _: None = Depends(require_mentor_token),
+        message_svc: MessageService = Depends(get_message_service),
+    ):
+        if not 1 <= len(data.client_request_ids) <= 300:
+            raise HTTPException(
+                status_code=422,
+                detail="client_request_ids must contain 1 to 300 items",
+            )
+        return {
+            "items": message_svc.get_mentor_message_statuses(
+                [str(value) for value in data.client_request_ids],
+            )
+        }
 
     @app.get("/api/student/messages")
     async def get_student_messages(

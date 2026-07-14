@@ -35,10 +35,10 @@ body {
   color: #4ade80;
 }
 
-/* 三栏 grid 布局 */
+/* 关注队列 + 原有三栏；窄屏在 Task 7 统一收口 */
 .layout {
   display: grid;
-  grid-template-columns: 220px 280px 1fr;
+  grid-template-columns: 300px 220px 280px minmax(360px, 1fr);
   gap: 1px;
   height: calc(100vh - 52px);
   background: #e5e7eb;
@@ -57,6 +57,223 @@ body {
   margin-bottom: 8px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+.panel-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.attention-refresh {
+  border: 0;
+  background: transparent;
+  color: #534AB7;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 3px 5px;
+}
+
+.attention-refresh:disabled {
+  color: #9ca3af;
+  cursor: wait;
+}
+
+.panel-attention {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.attention-filters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.attention-filters label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: #6b7280;
+  font-size: 10px;
+}
+
+.attention-filters select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #374151;
+  font-size: 11px;
+  padding: 5px 6px;
+}
+
+.attention-feedback {
+  min-height: 0;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.attention-feedback:empty {
+  display: none;
+}
+
+.attention-loading,
+.attention-empty,
+.attention-error {
+  padding: 12px 8px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.attention-error {
+  color: #991b1b;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+}
+
+.attention-list {
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 3px;
+}
+
+.attention-card {
+  border: 1px solid #e5e7eb;
+  border-left: 4px solid #f59e0b;
+  border-radius: 9px;
+  background: #fff;
+  padding: 9px;
+  box-shadow: 0 1px 2px rgba(31, 41, 55, .04);
+}
+
+.attention-card.priority-high { border-left-color: #ef4444; }
+.attention-card.priority-medium { border-left-color: #f59e0b; }
+.attention-card.updating { opacity: .65; }
+
+.attention-card-top,
+.attention-card-meta,
+.attention-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.attention-card-top {
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.attention-student-name {
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #111827;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.attention-priority,
+.attention-category,
+.attention-status {
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.attention-priority.high { background: #fee2e2; color: #991b1b; }
+.attention-priority.medium { background: #fef3c7; color: #92400e; }
+.attention-category.learning { background: #e0e7ff; color: #3730a3; }
+.attention-category.system { background: #f3f4f6; color: #374151; }
+.attention-status { background: #eef2ff; color: #4338ca; }
+
+.attention-card-meta {
+  margin-bottom: 6px;
+  color: #6b7280;
+  font-size: 10px;
+}
+
+.attention-reason,
+.attention-action,
+.attention-evidence {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.attention-reason {
+  color: #1f2937;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.attention-evidence {
+  margin: 6px 0 0 16px;
+  color: #4b5563;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.attention-action {
+  margin-top: 7px;
+  padding: 6px 7px;
+  border-radius: 6px;
+  background: #f5f3ff;
+  color: #4c1d95;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.attention-card-actions {
+  margin-top: 8px;
+}
+
+.attention-card-actions button {
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #374151;
+  padding: 4px 7px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.attention-card-actions button.primary {
+  border-color: #534AB7;
+  color: #534AB7;
+}
+
+.attention-card-actions button:disabled {
+  opacity: .55;
+  cursor: wait;
+}
+
+.attention-count {
+  flex-shrink: 0;
+  min-width: 18px;
+  border-radius: 10px;
+  background: #fee2e2;
+  color: #991b1b;
+  padding: 1px 6px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
 }
 
 /* 列表项 */

@@ -20,9 +20,11 @@
 
 import functools
 import http.server
+import json
+import re
 import threading
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
@@ -120,6 +122,14 @@ def install_api_routes(
     upload_statuses=None,
     upload_retry_statuses=None,
     upload_requests=None,
+    attention_items=None,
+    attention_status=200,
+    attention_patch_status=200,
+    attention_patch_hook=None,
+    attention_patches=None,
+    mentor_messages=None,
+    mentor_message_statuses=None,
+    mentor_status_requests=None,
 ):
     """拦截 /api/mentor/* 返回确定性 JSON。"""
     students = students or []
@@ -131,10 +141,120 @@ def install_api_routes(
     upload_statuses = upload_statuses if upload_statuses is not None else {}
     upload_retry_statuses = upload_retry_statuses if upload_retry_statuses is not None else {}
     upload_requests = upload_requests if upload_requests is not None else []
+    attention_items = attention_items if attention_items is not None else []
+    attention_patches = attention_patches if attention_patches is not None else []
+    mentor_messages = mentor_messages if mentor_messages is not None else []
+    mentor_message_statuses = (
+        mentor_message_statuses if mentor_message_statuses is not None else {}
+    )
+    mentor_status_requests = (
+        mentor_status_requests if mentor_status_requests is not None else []
+    )
 
     def handler(route):
         path = urlparse(route.request.url).path
-        if path == "/api/mentor/students":
+        if path == "/api/mentor/attention":
+            if attention_status != 200:
+                route.fulfill(status=attention_status, json={"detail": "attention failed"})
+            else:
+                query = parse_qs(urlparse(route.request.url).query)
+                rows = list(attention_items)
+                for key in ("status", "priority", "category", "student_id"):
+                    expected = query.get(key, [None])[0]
+                    if expected is not None:
+                        rows = [row for row in rows if str(row.get(key, "")) == expected]
+                rows.sort(key=lambda row: (
+                    0 if row.get("priority") == "high" else 1,
+                    float(row.get("created_at") or 0),
+                    int(row.get("id") or 0),
+                ))
+                limit = int(query.get("limit", [100])[0])
+                route.fulfill(json={"items": rows[:limit]})
+        elif path.startswith("/api/mentor/attention/"):
+            item_id = int(path.rsplit("/", 1)[-1])
+            payload = json.loads(route.request.post_data or "{}")
+            attention_patches.append({
+                "id": item_id,
+                "method": route.request.method,
+                **payload,
+            })
+            item = next((row for row in attention_items if int(row["id"]) == item_id), None)
+            if route.request.method != "PATCH":
+                route.fulfill(status=405, json={"detail": "PATCH required"})
+            elif not str(payload.get("mentor_id", "")).strip():
+                route.fulfill(status=422, json={"detail": "mentor_id required"})
+            elif attention_patch_status != 200:
+                route.fulfill(status=attention_patch_status, json={"detail": "patch failed"})
+            elif item is None:
+                route.fulfill(status=404, json={"detail": "not found"})
+            else:
+                previous_status = item.get("status", "open")
+                item.update({
+                    "status": payload.get("status", item.get("status", "open")),
+                    "handled_by": payload.get("mentor_id", ""),
+                    "resolution_note": payload.get("note", ""),
+                    "updated_at": item.get("updated_at", 0) + 1,
+                })
+                student = next(
+                    (row for row in students if row.get("student_id") == item.get("student_id")),
+                    None,
+                )
+                was_active = previous_status in {"open", "in_progress"}
+                is_active = item.get("status") in {"open", "in_progress"}
+                if student is not None and was_active != is_active:
+                    current_count = int(student.get("open_attention_count") or 0)
+                    student["open_attention_count"] = max(
+                        0, current_count + (1 if is_active else -1)
+                    )
+                    if student["open_attention_count"] == 0:
+                        student["highest_attention_priority"] = None
+                    else:
+                        active = [
+                            row for row in attention_items
+                            if row.get("student_id") == item.get("student_id")
+                            and row.get("status") in {"open", "in_progress"}
+                        ]
+                        if len(active) == student["open_attention_count"]:
+                            student["highest_attention_priority"] = (
+                                "high" if any(row.get("priority") == "high" for row in active)
+                                else "medium"
+                            )
+                if attention_patch_hook is not None:
+                    attention_patch_hook(dict(item))
+                route.fulfill(json=item)
+        elif path == "/api/mentor/messages/status":
+            payload = json.loads(route.request.post_data or "{}")
+            client_request_ids = list(payload.get("client_request_ids") or [])
+            mentor_status_requests.append(client_request_ids)
+            route.fulfill(json={
+                "items": [
+                    dict(mentor_message_statuses[client_request_id])
+                    for client_request_id in client_request_ids
+                    if client_request_id in mentor_message_statuses
+                ],
+            })
+        elif path == "/api/mentor/message":
+            payload = json.loads(route.request.post_data or "{}")
+            mentor_messages.append(payload)
+            client_request_id = payload.get("client_request_id")
+            existing = mentor_message_statuses.get(client_request_id)
+            if existing is None:
+                message_number = len(mentor_messages)
+                existing = {
+                    "client_request_id": client_request_id,
+                    "message_id": f"message-{message_number}",
+                    "id": message_number,
+                    "student_id": payload.get("student_id"),
+                    "delivered": False,
+                }
+                if client_request_id:
+                    mentor_message_statuses[client_request_id] = existing
+            route.fulfill(json={
+                "message_id": existing["message_id"],
+                "id": existing["id"],
+                "delivered": existing["delivered"],
+            })
+        elif path == "/api/mentor/students":
             route.fulfill(json={"items": students})
         elif path.startswith("/api/mentor/students/") and path.endswith("/request-upload"):
             sid = unquote(path[len("/api/mentor/students/"):-len("/request-upload")])
@@ -1427,3 +1547,1470 @@ def test_d3_ai_summary_placeholder_and_failure(page, static_server):
     expect(card2.locator(".ai-summary")).to_have_text("只有摘要，没有 reply_ref")
     assert card2.locator(".ai-detail-toggle").count() == 0, \
         "无 reply_ref 的摘要不应出现'显示详情'按钮"
+
+
+# ───────────────────────────────────────────────────────────
+# Task 6: 导师干预雷达。关注队列只做导师决策辅助，建议绝不自动发送。
+# ───────────────────────────────────────────────────────────
+def _attention_item(
+    item_id,
+    *,
+    student_id="s1",
+    session_id="sess1",
+    priority="high",
+    category="learning",
+    status="open",
+    reason="卡在明确的技术边界",
+    suggested_action="请学员先复现最小失败用例",
+    evidence=None,
+    confidence=0.9,
+    created_at=10,
+):
+    return {
+        "id": item_id,
+        "source_type": "analysis" if category == "learning" else "system",
+        "source_id": str(item_id),
+        "category": category,
+        "student_id": student_id,
+        "session_id": session_id,
+        "priority": priority,
+        "reason_code": "analysis_error" if category == "learning" else "system_bulk_analysis_failed",
+        "reason": reason,
+        "evidence": evidence if evidence is not None else ["连续两次在同一步失败"],
+        "suggested_action": suggested_action,
+        "confidence": confidence,
+        "status": status,
+        "handled_by": "",
+        "resolution_note": "",
+        "handled_at": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+
+
+def test_attention_queue_sorts_filters_and_renders_user_text_safely(
+    page,
+    static_server,
+):
+    malicious = XSS_PAYLOAD + "诊断"
+    students = [
+        {"student_id": "s1", "display_name": "学员甲", "last_severity": "info",
+         "session_count": 1, "analysis_count": 1, "open_attention_count": 2,
+         "highest_attention_priority": "high", "last_attention_at": 20},
+        {"student_id": "s2", "display_name": "学员乙", "last_severity": "warn",
+         "session_count": 1, "analysis_count": 1, "open_attention_count": 1,
+         "highest_attention_priority": "medium", "last_attention_at": 30},
+    ]
+    items = [
+        _attention_item(3, student_id="s2", session_id="sess2", priority="medium",
+                        category="system", created_at=1),
+        _attention_item(2, reason=malicious, evidence=[malicious],
+                        suggested_action=malicious, created_at=20),
+        _attention_item(1, created_at=10),
+        _attention_item(4, status="resolved", created_at=0),
+    ]
+    open_console(page, static_server, students=students, attention_items=items)
+
+    cards = page.locator(".attention-card")
+    expect(cards).to_have_count(3)  # 默认 active，不展示 resolved
+    assert cards.evaluate_all(
+        "nodes => nodes.map(node => Number(node.dataset.attentionId))"
+    ) == [1, 2, 3]
+    expect(cards.nth(0).locator(".attention-student-name")).to_have_text("学员甲")
+    expect(cards.nth(0).locator(".attention-priority")).to_have_text("高")
+    expect(cards.nth(0).locator(".attention-evidence")).to_contain_text("连续两次在同一步失败")
+    expect(cards.nth(0).locator(".attention-confidence")).to_have_text("置信度 90%")
+    expect(cards.nth(0).locator(".attention-action")).to_contain_text(
+        "请学员先复现最小失败用例"
+    )
+    expect(cards.nth(2).locator(".attention-category")).to_have_text("系统异常")
+    expect(cards.nth(1).locator(".attention-reason")).to_have_text(malicious)
+    assert cards.nth(1).locator("img").count() == 0
+    assert page.evaluate("window.__xss") in (None, False)
+
+    page.locator("#attention-priority-filter").select_option("medium")
+    expect(cards).to_have_count(1)
+    expect(cards.nth(0)).to_have_attribute("data-attention-id", "3")
+
+    page.locator("#attention-priority-filter").select_option("")
+    page.locator("#attention-student-filter").select_option("s2")
+    expect(cards).to_have_count(1)
+    expect(cards.nth(0)).to_have_attribute("data-attention-id", "3")
+
+    page.locator("#attention-student-filter").select_option("")
+    page.locator("#attention-category-filter").select_option("learning")
+    expect(cards).to_have_count(2)
+    page.locator("#attention-status-filter").select_option("resolved")
+    expect(cards).to_have_count(1)
+    expect(cards.nth(0)).to_have_attribute("data-attention-id", "4")
+
+
+def test_students_sort_by_attention_then_count_then_activity(page, static_server):
+    students = [
+        {"student_id": "none", "display_name": "无关注", "last_ts": 999},
+        {"student_id": "medium", "display_name": "中优先",
+         "open_attention_count": 9, "highest_attention_priority": "medium",
+         "last_attention_at": 999},
+        {"student_id": "high-old", "display_name": "高优先旧",
+         "open_attention_count": 2, "highest_attention_priority": "high",
+         "last_attention_at": 10},
+        {"student_id": "high-new", "display_name": "高优先新",
+         "open_attention_count": 2, "highest_attention_priority": "high",
+         "last_attention_at": 20},
+        {"student_id": "high-many", "display_name": "高优先多",
+         "open_attention_count": 3, "highest_attention_priority": "high",
+         "last_attention_at": 1},
+    ]
+    open_console(page, static_server, students=students)
+
+    rows = page.locator(".student-item")
+    expect(rows).to_have_count(5)
+    assert rows.evaluate_all(
+        "nodes => nodes.map(node => node.dataset.studentId)"
+    ) == ["high-many", "high-new", "high-old", "medium", "none"]
+    assert rows.locator(".attention-count").all_text_contents() == ["3", "2", "2", "9"]
+
+
+def test_active_attention_is_not_crowded_out_by_terminal_history(page, static_server):
+    terminal = [
+        _attention_item(item_id, status="resolved", created_at=item_id)
+        for item_id in range(1, 201)
+    ]
+    active = _attention_item(201, status="open", created_at=201)
+    open_console(
+        page,
+        static_server,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        attention_items=terminal + [active],
+    )
+
+    expect(page.locator('.attention-card[data-attention-id="201"]')).to_have_count(1)
+    expect(page.locator(".attention-card")).to_have_count(1)
+
+
+def test_server_side_category_filter_finds_item_beyond_unfiltered_limit(
+    page,
+    static_server,
+):
+    learning = [
+        _attention_item(item_id, priority="high", category="learning", created_at=item_id)
+        for item_id in range(1, 201)
+    ]
+    system = _attention_item(
+        201,
+        priority="medium",
+        category="system",
+        created_at=201,
+    )
+    open_console(
+        page,
+        static_server,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        attention_items=learning + [system],
+    )
+    expect(page.locator('.attention-card[data-attention-id="201"]')).to_have_count(0)
+
+    page.locator("#attention-category-filter").select_option("system")
+    expect(page.locator('.attention-card[data-attention-id="201"]')).to_have_count(1)
+    expect(page.locator(".attention-card")).to_have_count(1)
+
+
+def test_attention_view_and_prefill_reuse_context_without_auto_send(
+    page,
+    static_server,
+):
+    messages = []
+    suggestion = "请先运行单个失败测试，把第一条报错发给我"
+    students = [
+        {"student_id": "s1", "display_name": "学员甲", "last_severity": "info",
+         "session_count": 1, "analysis_count": 1},
+        {"student_id": "s2", "display_name": "学员乙", "last_severity": "error",
+         "session_count": 1, "analysis_count": 1, "open_attention_count": 1,
+         "highest_attention_priority": "high"},
+    ]
+    sessions = {
+        "s1": [{"session_id": "sess1", "session_title": "对话甲", "analysis_count": 1}],
+        "s2": [{"session_id": "sess2", "session_title": "需要干预的对话", "analysis_count": 1}],
+    }
+    timeline = {"sess2": [{"type": "analysis", "content": "卡点原文", "created_at": 2}]}
+    items = [_attention_item(21, student_id="s2", session_id="sess2",
+                             suggested_action=suggestion)]
+    open_console(
+        page,
+        static_server,
+        students=students,
+        sessions_by_student=sessions,
+        timeline_by_session=timeline,
+        attention_items=items,
+        mentor_messages=messages,
+    )
+
+    card = page.locator('.attention-card[data-attention-id="21"]')
+    card.locator('[data-action="view"]').click()
+    expect(page.locator('.student-item[data-student-id="s2"]')).to_have_class(
+        re.compile(r"\bselected\b")
+    )
+    expect(page.locator('.session-item[data-session-id="sess2"]')).to_have_class(
+        re.compile(r"\bselected\b")
+    )
+    expect(page.locator("#timeline")).to_contain_text("卡点原文")
+
+    card.locator('[data-action="prefill"]').click()
+    expect(page.locator("#compose-input")).to_have_value(suggestion)
+    assert messages == []
+    expect(page.locator("#timeline .card-me")).to_have_count(0)
+
+    page.locator("#compose-send").click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    assert len(messages) == 1
+    assert messages[0]["student_id"] == "s2"
+    assert messages[0]["text"] == suggestion
+    assert messages[0]["client_request_id"].startswith("mentor-message-")
+
+    # 同一学员/对话再次查看关注项，不得清空尚在等回执的导师消息。
+    card.locator('[data-action="view"]').click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+
+
+def test_attention_cross_student_navigation_preserves_delivery_receipt_state(
+    page,
+    static_server,
+):
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    students = [
+        {"student_id": "a", "display_name": "A 学员"},
+        {"student_id": "b", "display_name": "B 学员"},
+    ]
+    sessions = {
+        "a": [{"session_id": "sess-a", "session_title": "A 对话"}],
+        "b": [{"session_id": "sess-b", "session_title": "B 对话"}],
+    }
+    install_api_routes(
+        page,
+        students=students,
+        sessions_by_student=sessions,
+        timeline_by_session={"sess-a": [], "sess-b": []},
+        attention_items=[
+            _attention_item(23, student_id="a", session_id="sess-a", created_at=10),
+            _attention_item(24, student_id="b", session_id="sess-b", created_at=20),
+        ],
+    )
+    page.goto(static_server + "/index.html")
+
+    page.locator('.attention-card[data-attention-id="23"] [data-action="view"]').click()
+    page.locator("#compose-input").fill("给 A 的导师提示")
+    page.locator("#compose-send").click()
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中…")
+
+    page.locator('.attention-card[data-attention-id="24"] [data-action="view"]').click()
+    expect(page.locator("#timeline .card-me")).to_have_count(0)
+    ws_holder["socket"].send(json.dumps({
+        "type": "message_delivered",
+        "student_id": "a",
+        "message_id": "message-1",
+        "id": 1,
+    }))
+
+    page.locator('.attention-card[data-attention-id="23"] [data-action="view"]').click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+
+
+def test_delivery_receipt_before_message_post_response_is_not_lost(page, static_server):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/message') {
+            return new Promise((resolve) => {
+              window.__resolveMentorMessage = () => resolve(new Response(JSON.stringify({
+                message_id: 'message-early', id: 99, delivered: false
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(25)],
+    )
+    page.goto(static_server + "/index.html")
+    page.locator('.attention-card[data-attention-id="25"] [data-action="view"]').click()
+    page.locator("#compose-input").fill("早回执消息")
+    page.locator("#compose-send").click()
+    page.wait_for_function("() => typeof window.__resolveMentorMessage === 'function'")
+
+    ws_holder["socket"].send(json.dumps({
+        "type": "message_delivered",
+        "student_id": "s1",
+        "message_id": "message-early",
+        "id": 99,
+    }))
+    page.evaluate("window.__resolveMentorMessage()")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+
+
+def test_lost_message_post_response_recovers_from_status_on_first_ws_open(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.WebSocket = class ControlledWebSocket {
+          constructor() { window.__controlledMentorSocket = this; }
+        };
+        window.fetch = async (input, options) => {
+          const url = new URL(String(input), location.href);
+          const response = await realFetch(input, options);
+          if (url.pathname === '/api/mentor/message' && !window.__mentorResponseLost) {
+            window.__mentorResponseLost = true;
+            throw new TypeError('response lost after persistence');
+          }
+          return response;
+        };
+      })();
+    """)
+    messages = []
+    statuses = {}
+    status_requests = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(26)],
+        mentor_messages=messages,
+        mentor_message_statuses=statuses,
+        mentor_status_requests=status_requests,
+    )
+    page.goto(static_server + "/index.html")
+    page.locator('.attention-card[data-attention-id="26"] [data-action="view"]').click()
+    page.locator("#compose-input").fill("响应丢失但已入库")
+    with page.expect_response(
+        lambda response: urlparse(response.url).path == "/api/mentor/messages/status"
+    ):
+        page.locator("#compose-send").click()
+    page.wait_for_function("() => window.__mentorResponseLost === true")
+
+    assert len(messages) == 1
+    client_request_id = messages[0].get("client_request_id")
+    assert client_request_id
+    assert client_request_id in statuses
+    assert any(client_request_id in request for request in status_requests)
+    assert len(messages) == 1
+    statuses[client_request_id]["delivered"] = True
+
+    page.evaluate("window.__controlledMentorSocket.onopen()")
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    assert len(messages) == 1
+    assert sum(client_request_id in request for request in status_requests) >= 2
+
+
+def test_lost_response_rechecks_same_id_until_delayed_commit_without_ws_reconnect(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.WebSocket = class ControlledWebSocket {
+          constructor() { window.__controlledMentorSocket = this; }
+        };
+        window.__messagePostAttempts = 0;
+        window.__statusRequestTimes = [];
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/messages/status') {
+            window.__statusRequestTimes.push(performance.now());
+          }
+          if (url.pathname === '/api/mentor/message') {
+            window.__messagePostAttempts += 1;
+            window.__delayedMessagePayload = JSON.parse(options.body);
+            return Promise.reject(new TypeError('connection closed before commit'));
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    statuses = {}
+    status_requests = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(29)],
+        mentor_message_statuses=statuses,
+        mentor_status_requests=status_requests,
+    )
+    page.goto(static_server + "/index.html")
+    page.locator('.attention-card[data-attention-id="29"] [data-action="view"]').click()
+    page.locator("#compose-input").fill("后端延迟提交")
+    with page.expect_response(
+        lambda response: urlparse(response.url).path == "/api/mentor/messages/status"
+    ):
+        page.locator("#compose-send").click()
+
+    payload = page.evaluate("window.__delayedMessagePayload")
+    client_request_id = payload["client_request_id"]
+    assert status_requests == [[client_request_id]]
+    assert page.evaluate("window.__messagePostAttempts") == 1
+
+    # 超过原 1s 窗口后事务才可见（SQLite 默认 lock wait 可达 5s）；
+    # 不触发 WS 重连，仍必须用同一键收敛。
+    page.wait_for_timeout(1200)
+    assert len(status_requests) == 3
+    statuses[client_request_id] = {
+        "client_request_id": client_request_id,
+        "message_id": "message-delayed",
+        "id": 29,
+        "student_id": "s1",
+        "delivered": True,
+    }
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    assert page.evaluate("window.__messagePostAttempts") == 1
+    assert len(status_requests) == 4
+    assert all(request == [client_request_id] for request in status_requests)
+    request_times = page.evaluate("window.__statusRequestTimes")
+    assert 150 <= request_times[1] - request_times[0] <= 700
+    assert 700 <= request_times[2] - request_times[0] <= 1600
+    assert 2400 <= request_times[3] - request_times[0] <= 3900
+
+    # 第四次命中即停，不应再跑 6s 补查。
+    page.wait_for_timeout(3200)
+    assert len(status_requests) == 4
+
+
+def test_client_request_id_receipt_matches_before_post_response(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/message') {
+            window.__pendingMentorPayload = JSON.parse(options.body);
+            return new Promise(() => {});
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(33)],
+    )
+    page.goto(static_server + "/index.html")
+    page.locator('.attention-card[data-attention-id="33"] [data-action="view"]').click()
+    page.locator("#compose-input").fill("只知道客户端幂等键")
+    page.locator("#compose-send").click()
+    page.wait_for_function("() => !!window.__pendingMentorPayload")
+    client_request_id = page.evaluate(
+        "window.__pendingMentorPayload.client_request_id"
+    )
+
+    ws_holder["socket"].send(json.dumps({
+        "type": "message_delivered",
+        "student_id": "s1",
+        "message_id": "message-late",
+        "id": 33,
+        "client_request_id": client_request_id,
+    }))
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+
+
+def test_status_hit_undelivered_clears_false_failed_state(page, static_server):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.WebSocket = class ControlledWebSocket {
+          constructor() { window.__controlledMentorSocket = this; }
+        };
+        window.fetch = async (input, options) => {
+          const url = new URL(String(input), location.href);
+          const response = await realFetch(input, options);
+          if (url.pathname === '/api/mentor/message') {
+            throw new TypeError('response lost after persistence');
+          }
+          return response;
+        };
+      })();
+    """)
+    messages = []
+    statuses = {}
+    status_requests = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(30)],
+        mentor_messages=messages,
+        mentor_message_statuses=statuses,
+        mentor_status_requests=status_requests,
+    )
+    page.goto(static_server + "/index.html")
+    page.locator('.attention-card[data-attention-id="30"] [data-action="view"]').click()
+    page.locator("#compose-input").fill("已入库但未送达")
+    with page.expect_response(
+        lambda response: urlparse(response.url).path == "/api/mentor/messages/status"
+    ):
+        page.locator("#compose-send").click()
+
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中…")
+    assert len(messages) == 1
+    assert status_requests == [[messages[0]["client_request_id"]]]
+
+
+def test_stale_undelivered_status_cannot_downgrade_newer_ws_receipt(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.WebSocket = class ControlledWebSocket {
+          constructor() { window.__controlledMentorSocket = this; }
+        };
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/messages/status' && window.__holdMessageStatus) {
+            const clientRequestId = JSON.parse(options.body).client_request_ids[0];
+            return new Promise((resolve) => {
+              window.__resolveOldMessageStatus = () => resolve(new Response(JSON.stringify({
+                items: [{
+                  client_request_id: clientRequestId,
+                  message_id: 'message-1', id: 1, student_id: 's1', delivered: false
+                }]
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    messages = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(32)],
+        mentor_messages=messages,
+    )
+    page.goto(static_server + "/index.html")
+    page.locator('.attention-card[data-attention-id="32"] [data-action="view"]').click()
+    page.evaluate("() => sendMentorMessage('新回执不得被旧快照覆盖')")
+    assert len(messages) == 1
+
+    page.evaluate("window.__holdMessageStatus = true")
+    page.evaluate("window.__controlledMentorSocket.onopen()")
+    page.wait_for_function("() => typeof window.__resolveOldMessageStatus === 'function'")
+    page.evaluate("""
+      window.__controlledMentorSocket.onmessage({data: JSON.stringify({
+        type: 'message_delivered', student_id: 's1', message_id: 'message-1', id: 1
+      })})
+    """)
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+
+    page.evaluate("window.__resolveOldMessageStatus()")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+
+
+def test_ws_reconnect_recovers_delivery_ack_missed_while_disconnected(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      window.WebSocket = class ControlledWebSocket {
+        constructor() { window.__controlledMentorSocket = this; }
+      };
+    """)
+    messages = []
+    statuses = {}
+    status_requests = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(27)],
+        mentor_messages=messages,
+        mentor_message_statuses=statuses,
+        mentor_status_requests=status_requests,
+    )
+    page.goto(static_server + "/index.html")
+    page.evaluate("window.__controlledMentorSocket.onopen()")
+    page.locator('.attention-card[data-attention-id="27"] [data-action="view"]').click()
+    page.evaluate("() => sendMentorMessage('断线期间学员已确认')")
+
+    assert len(messages) == 1
+    client_request_id = messages[0].get("client_request_id")
+    assert client_request_id
+    statuses[client_request_id]["delivered"] = True
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中…")
+
+    # 用同一 onopen 回调模拟重连成功：不自动重发，只查状态。
+    page.evaluate("window.__controlledMentorSocket.onopen()")
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    assert len(messages) == 1
+    assert any(client_request_id in request for request in status_requests)
+
+
+def test_outbound_message_recovery_is_bounded_to_300_without_duplicate_render(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      window.WebSocket = class ControlledWebSocket {
+        constructor() { window.__controlledMentorSocket = this; }
+      };
+    """)
+    messages = []
+    statuses = {}
+    status_requests = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={
+            "s1": [{"session_id": "sess1", "session_title": "对话"}],
+        },
+        timeline_by_session={"sess1": []},
+        attention_items=[_attention_item(28)],
+        mentor_messages=messages,
+        mentor_message_statuses=statuses,
+        mentor_status_requests=status_requests,
+    )
+    page.goto(static_server + "/index.html")
+    page.locator('.attention-card[data-attention-id="28"] [data-action="view"]').click()
+    page.evaluate("""
+      () => Promise.all(Array.from({length: 301}, (_, index) =>
+        sendMentorMessage('批量消息 ' + index)
+      ))
+    """)
+
+    assert len(messages) == 301
+    client_request_ids = [message.get("client_request_id") for message in messages]
+    assert all(client_request_ids)
+    assert len(set(client_request_ids)) == 301
+    expect(page.locator("#timeline .card-me")).to_have_count(300)
+
+    page.evaluate("window.__controlledMentorSocket.onopen()")
+    expect(page.locator("#timeline .card-me")).to_have_count(300)
+    assert status_requests
+    assert len(status_requests[-1]) == 300
+    assert len(set(status_requests[-1])) == 300
+    assert client_request_ids[0] not in status_requests[-1]
+    assert client_request_ids[-1] in status_requests[-1]
+    assert len(messages) == 301
+
+
+def test_attention_status_actions_patch_and_update_active_student_count(
+    page,
+    static_server,
+):
+    patches = []
+    students = [{
+        "student_id": "s1",
+        "display_name": "学员甲",
+        "last_severity": "error",
+        "session_count": 1,
+        "analysis_count": 1,
+        "open_attention_count": 1,
+        "highest_attention_priority": "high",
+    }]
+    items = [_attention_item(31)]
+    open_console(
+        page,
+        static_server,
+        students=students,
+        attention_items=items,
+        attention_patches=patches,
+    )
+
+    card = page.locator('.attention-card[data-attention-id="31"]')
+    expect(page.locator('.student-item .attention-count')).to_have_text("1")
+    card.locator('[data-action="in_progress"]').click()
+    expect(card.locator(".attention-status")).to_have_text("处理中")
+    assert patches[-1]["status"] == "in_progress"
+    assert patches[-1]["method"] == "PATCH"
+    assert patches[-1]["mentor_id"].startswith("mentor-console-")
+    assert page.evaluate(
+        "localStorage.getItem('workbuddy_copilot_mentor_id')"
+    ) == patches[-1]["mentor_id"]
+
+    card.locator('[data-action="resolved"]').click()
+    expect(card).to_have_count(0)  # 默认 active 中已解决项立即移出
+    assert patches[-1]["status"] == "resolved"
+    expect(page.locator('.student-item .attention-count')).to_have_count(0)
+
+
+def test_patch_websocket_before_http_response_decrements_student_count_once(
+    page,
+    static_server,
+):
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+
+    def publish_before_response(item):
+        ws_holder["socket"].send(json.dumps({
+            "type": "attention_updated",
+            "action": "updated",
+            "item": {key: value for key, value in item.items()
+                     if key != "resolution_note"},
+        }))
+
+    install_api_routes(
+        page,
+        students=[{
+            "student_id": "s1", "display_name": "学员甲",
+            "open_attention_count": 3, "highest_attention_priority": "high",
+        }],
+        attention_items=[_attention_item(34)],
+        attention_patch_hook=publish_before_response,
+    )
+    page.goto(static_server + "/index.html")
+
+    page.locator('.attention-card[data-attention-id="34"] [data-action="resolved"]').click()
+    expect(page.locator('.student-item .attention-count')).to_have_text("2")
+
+
+def test_resolving_last_high_item_downgrades_student_priority_sort(
+    page,
+    static_server,
+):
+    students = [
+        {"student_id": "s1", "display_name": "原高优先",
+         "open_attention_count": 2, "highest_attention_priority": "high",
+         "last_attention_at": 10},
+        {"student_id": "s2", "display_name": "中优先更新",
+         "open_attention_count": 1, "highest_attention_priority": "medium",
+         "last_attention_at": 100},
+    ]
+    items = [
+        _attention_item(35, student_id="s1", priority="high", created_at=10),
+        _attention_item(36, student_id="s1", priority="medium", created_at=11),
+        _attention_item(37, student_id="s2", priority="medium", created_at=100),
+    ]
+    open_console(page, static_server, students=students, attention_items=items)
+    expect(page.locator(".student-item").first).to_have_attribute("data-student-id", "s1")
+
+    page.locator('.attention-card[data-attention-id="35"] [data-action="resolved"]').click()
+    expect(page.locator(".student-item").first).to_have_attribute("data-student-id", "s2")
+
+
+def test_attention_dismissed_action_removes_active_card(page, static_server):
+    patches = []
+    students = [{
+        "student_id": "s1", "display_name": "学员甲", "last_severity": "warn",
+        "open_attention_count": 1, "highest_attention_priority": "medium",
+    }]
+    open_console(
+        page,
+        static_server,
+        students=students,
+        attention_items=[_attention_item(32, priority="medium")],
+        attention_patches=patches,
+    )
+
+    page.locator('.attention-card[data-attention-id="32"] [data-action="dismissed"]').click()
+    expect(page.locator('.attention-card[data-attention-id="32"]')).to_have_count(0)
+    assert patches[-1]["status"] == "dismissed"
+    assert patches[-1]["mentor_id"].startswith("mentor-console-")
+
+
+def test_attention_patch_failure_keeps_authoritative_status_and_shows_error(
+    page,
+    static_server,
+):
+    open_console(
+        page,
+        static_server,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        attention_items=[_attention_item(33)],
+        attention_patch_status=409,
+    )
+
+    card = page.locator('.attention-card[data-attention-id="33"]')
+    card.locator('[data-action="resolved"]').click()
+    expect(card).to_have_count(1)
+    expect(card.locator(".attention-status")).to_have_text("未处理")
+    expect(card.locator(".attention-error")).to_have_text("更新失败，请重试")
+
+    # 后续权威 REST 快照已证明真实状态，不得永久保留旧的 UI 错误。
+    page.locator("#attention-refresh").click()
+    expect(card.locator(".attention-error")).to_have_count(0)
+
+
+def test_attention_websocket_increment_is_sorted_and_terminal_update_removes_card(
+    page,
+    static_server,
+):
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲",
+                   "last_severity": "info", "session_count": 1, "analysis_count": 1}],
+        attention_items=[_attention_item(41, priority="medium", created_at=1)],
+    )
+    page.goto(static_server + "/index.html")
+    expect(page.locator(".attention-card")).to_have_count(1)
+
+    created = _attention_item(42, priority="high", created_at=20)
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated",
+        "action": "created",
+        "item": created,
+    }))
+    expect(page.locator(".attention-card")).to_have_count(2)
+    assert page.locator(".attention-card").evaluate_all(
+        "nodes => nodes.map(node => Number(node.dataset.attentionId))"
+    ) == [42, 41]
+
+    created["status"] = "resolved"
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated",
+        "action": "updated",
+        "item": created,
+    }))
+    expect(page.locator(".attention-card")).to_have_count(1)
+    expect(page.locator(".attention-card")).to_have_attribute("data-attention-id", "41")
+
+
+def test_attention_websocket_item_remains_visible_after_rest_load_error(
+    page,
+    static_server,
+):
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        attention_status=500,
+    )
+    page.goto(static_server + "/index.html")
+    expect(page.locator(".attention-error")).to_have_text("关注队列加载失败")
+
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated",
+        "action": "created",
+        "item": _attention_item(45),
+    }))
+    expect(page.locator('.attention-card[data-attention-id="45"]')).to_have_count(1)
+    expect(page.locator(".attention-error")).to_have_text("关注队列加载失败")
+
+
+def test_attention_missing_source_session_reports_fallback_to_student(
+    page,
+    static_server,
+):
+    open_console(
+        page,
+        static_server,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={"s1": []},
+        attention_items=[_attention_item(46, session_id="missing-session")],
+    )
+
+    page.locator('.attention-card[data-attention-id="46"] [data-action="view"]').click()
+    expect(page.locator('.student-item[data-student-id="s1"]')).to_have_class(
+        re.compile(r"\bselected\b")
+    )
+    expect(page.locator("#attention-feedback")).to_have_text(
+        "来源对话当前不可用，已定位到学员"
+    )
+
+
+def test_attention_duplicate_and_stale_websocket_events_do_not_regress_state(
+    page,
+    static_server,
+):
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    authoritative_items = []
+    students = [{"student_id": "s1", "display_name": "学员甲",
+                 "open_attention_count": 0}]
+    install_api_routes(
+        page,
+        students=students,
+        attention_items=authoritative_items,
+    )
+    page.goto(static_server + "/index.html")
+    expect(page.locator(".attention-empty")).to_be_visible()
+
+    created = _attention_item(43, created_at=20)
+    event = {"type": "attention_updated", "action": "created", "item": created}
+    authoritative_items.append(dict(created))
+    students[0].update({"open_attention_count": 1, "highest_attention_priority": "high"})
+    ws_holder["socket"].send(json.dumps(event))
+    ws_holder["socket"].send(json.dumps(event))
+    expect(page.locator('.attention-card[data-attention-id="43"]')).to_have_count(1)
+    expect(page.locator('.student-item .attention-count')).to_have_text("1")
+
+    resolved = dict(created, status="resolved", updated_at=30)
+    authoritative_items[0].update(resolved)
+    students[0].update({"open_attention_count": 0, "highest_attention_priority": None})
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated", "action": "updated", "item": resolved,
+    }))
+    expect(page.locator('.attention-card[data-attention-id="43"]')).to_have_count(0)
+    expect(page.locator('.student-item .attention-count')).to_have_count(0)
+
+    stale_open = dict(created, status="open", updated_at=20)
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated", "action": "updated", "item": stale_open,
+    }))
+    page.locator("#attention-status-filter").select_option("")
+    card = page.locator('.attention-card[data-attention-id="43"]')
+    expect(card).to_have_count(1)
+    expect(card.locator(".attention-status")).to_have_text("已解决")
+
+
+def test_delayed_created_ws_cannot_double_count_authoritative_student_snapshot(
+    page,
+    static_server,
+):
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    # 模拟该项在 attention 的有界/筛选缓存外，但 students 权威聚合已计入。
+    students = [{
+        "student_id": "s1", "display_name": "学员甲",
+        "open_attention_count": 1, "highest_attention_priority": "high",
+    }]
+    install_api_routes(
+        page,
+        students=students,
+        attention_items=[],
+    )
+    page.goto(static_server + "/index.html")
+    expect(page.locator('.student-item .attention-count')).to_have_text("1")
+
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated",
+        "action": "created",
+        "item": _attention_item(56, created_at=90),
+    }))
+    expect(page.locator('.attention-card[data-attention-id="56"]')).to_have_count(1)
+    page.wait_for_timeout(200)
+    expect(page.locator('.student-item .attention-count')).to_have_text("1")
+
+
+def test_attention_websocket_before_initial_get_is_not_lost_or_regressed(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.__attentionResolvers = [];
+        window.fetch = (input, options) => {
+          const url = String(input);
+          if (url.includes('/api/mentor/attention')) {
+            return new Promise((resolve) => {
+              window.__attentionResolvers.push(resolve);
+              window.__resolveAttention = () => {
+                const payload = JSON.stringify({items: [{
+                  id: 44, source_type: 'analysis', source_id: '44', category: 'learning',
+                  student_id: 's1', session_id: 'sess1', priority: 'medium',
+                  reason_code: 'analysis_warn', reason: '过时原因', evidence: [],
+                  suggested_action: '过时建议', confidence: 0.6, status: 'open',
+                  created_at: 10, updated_at: 10
+                }]});
+                window.__attentionResolvers.splice(0).forEach((done) => done(new Response(
+                  payload, {status: 200, headers: {'Content-Type': 'application/json'}}
+                )));
+              };
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+    )
+    page.goto(static_server + "/index.html", wait_until="domcontentloaded")
+    page.wait_for_function("() => typeof window.__resolveAttention === 'function'")
+
+    fresh = _attention_item(44, priority="high", reason="实时新原因", created_at=30)
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated", "action": "created", "item": fresh,
+    }))
+    expect(page.locator('.attention-card[data-attention-id="44"] .attention-reason')).to_have_text(
+        "实时新原因"
+    )
+    page.evaluate("window.__resolveAttention()")
+    expect(page.locator('.attention-card[data-attention-id="44"] .attention-reason')).to_have_text(
+        "实时新原因"
+    )
+
+
+def test_first_websocket_open_closes_rest_handoff_gap(page, static_server):
+    page.add_init_script("""
+      window.WebSocket = class ControlledWebSocket {
+        constructor() { window.__controlledMentorSocket = this; }
+      };
+    """)
+    authoritative_items = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        attention_items=authoritative_items,
+    )
+    page.goto(static_server + "/index.html")
+    expect(page.locator(".attention-empty")).to_be_visible()
+
+    authoritative_items.append(_attention_item(55, created_at=30))
+    page.evaluate("window.__controlledMentorSocket.onopen()")
+    expect(page.locator('.attention-card[data-attention-id="55"]')).to_have_count(1)
+
+
+def test_authoritative_refresh_removes_untouched_ghost_but_replays_new_ws_item(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.__refreshAttentionResolvers = [];
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/attention' && window.__holdAttentionRefresh) {
+            return new Promise((resolve) => {
+              window.__refreshAttentionResolvers.push(resolve);
+              window.__resolveRefreshAttention = () => {
+                window.__holdAttentionRefresh = false;
+                window.__refreshAttentionResolvers.splice(0).forEach((done) => done(
+                  new Response(JSON.stringify({items: []}), {
+                    status: 200, headers: {'Content-Type': 'application/json'}
+                  })
+                ));
+              };
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    authoritative_items = [_attention_item(51, created_at=10)]
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲",
+                   "open_attention_count": 1, "highest_attention_priority": "high"}],
+        attention_items=authoritative_items,
+    )
+    page.goto(static_server + "/index.html")
+    expect(page.locator('.attention-card[data-attention-id="51"]')).to_have_count(1)
+
+    authoritative_items.clear()
+    page.evaluate("window.__holdAttentionRefresh = true")
+    page.locator("#attention-refresh").click()
+    page.wait_for_function("() => window.__refreshAttentionResolvers.length === 2")
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated",
+        "action": "created",
+        "item": _attention_item(52, created_at=20),
+    }))
+    expect(page.locator(".attention-card")).to_have_count(2)
+    page.evaluate("window.__resolveRefreshAttention()")
+
+    expect(page.locator('.attention-card[data-attention-id="51"]')).to_have_count(0)
+    expect(page.locator('.attention-card[data-attention-id="52"]')).to_have_count(1)
+
+
+def test_slow_old_student_sessions_cannot_replace_new_selection(page, static_server):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, options) => {
+          const url = String(input);
+          if (url.includes('/api/mentor/students/a/sessions')) {
+            return new Promise((resolve) => {
+              window.__resolveOldSessions = () => resolve(new Response(JSON.stringify({
+                items: [{session_id: 'old-a', session_title: '过时 A 对话'}]
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    open_console(
+        page,
+        static_server,
+        students=[
+            {"student_id": "a", "display_name": "A"},
+            {"student_id": "b", "display_name": "B"},
+        ],
+        sessions_by_student={
+            "b": [{"session_id": "b-current", "session_title": "B 对话"}],
+        },
+    )
+    page.locator('.student-item[data-student-id="a"]').click()
+    page.wait_for_function("() => typeof window.__resolveOldSessions === 'function'")
+    page.locator('.student-item[data-student-id="b"]').click()
+    expect(page.locator('.student-item[data-student-id="b"]')).to_have_class(
+        re.compile(r"\bselected\b")
+    )
+    expect(page.locator('.session-item[data-session-id="b-current"]')).to_have_count(1)
+
+    page.evaluate("window.__resolveOldSessions()")
+    page.wait_for_timeout(100)
+    expect(page.locator('.session-item[data-session-id="b-current"]')).to_have_count(1)
+    expect(page.locator('.session-item[data-session-id="old-a"]')).to_have_count(0)
+
+
+@pytest.mark.parametrize(
+    ("attention_status", "expected_selector", "expected_text"),
+    [
+        (200, ".attention-empty", "暂无需要关注的学员"),
+        (500, ".attention-error", "关注队列加载失败"),
+    ],
+)
+def test_attention_empty_and_error_states(
+    page,
+    static_server,
+    attention_status,
+    expected_selector,
+    expected_text,
+):
+    open_console(
+        page,
+        static_server,
+        attention_items=[],
+        attention_status=attention_status,
+    )
+
+    expect(page.locator(expected_selector)).to_have_text(expected_text)
+
+
+def test_attention_loading_state_is_visible_while_request_is_pending(page, static_server):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.__attentionResolvers = [];
+        window.fetch = (input, options) => {
+          if (String(input).includes('/api/mentor/attention')) {
+            return new Promise((resolve) => {
+              window.__attentionResolvers.push(resolve);
+              window.__resolveAttention = () => {
+                window.__attentionResolvers.splice(0).forEach((done) => done(new Response(
+                  JSON.stringify({items: []}),
+                  {status: 200, headers: {'Content-Type': 'application/json'}}
+                )));
+              };
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    install_ws_route(page)
+    install_api_routes(page, attention_items=[])
+
+    page.goto(static_server + "/index.html", wait_until="domcontentloaded")
+
+    expect(page.locator(".attention-loading")).to_be_visible()
+    page.evaluate("window.__resolveAttention()")
+    expect(page.locator(".attention-empty")).to_have_text("暂无需要关注的学员")
+
+
+def test_attention_refresh_reloads_queue_and_student_aggregates(page, static_server):
+    students = [{
+        "student_id": "s1", "display_name": "学员甲",
+        "open_attention_count": 0, "highest_attention_priority": None,
+    }]
+    items = []
+    open_console(
+        page,
+        static_server,
+        students=students,
+        attention_items=items,
+    )
+    expect(page.locator(".attention-empty")).to_be_visible()
+
+    students[0].update({
+        "open_attention_count": 1,
+        "highest_attention_priority": "high",
+        "last_attention_at": 50,
+    })
+    items.append(_attention_item(47, created_at=50))
+    page.locator("#attention-refresh").click()
+
+    expect(page.locator('.attention-card[data-attention-id="47"]')).to_have_count(1)
+    expect(page.locator('.student-item[data-student-id="s1"] .attention-count')).to_have_text("1")
+
+
+def test_refresh_stale_students_response_cannot_overwrite_new_attention_event(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/students' && window.__holdNextStudents) {
+            window.__holdNextStudents = false;
+            return new Promise((resolve) => {
+              window.__resolveStaleStudents = () => resolve(new Response(JSON.stringify({
+                items: [{
+                  student_id: 's1', display_name: '学员甲',
+                  open_attention_count: 0, highest_attention_priority: null
+                }]
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    students = [{
+        "student_id": "s1", "display_name": "学员甲",
+        "open_attention_count": 0, "highest_attention_priority": None,
+    }]
+    install_api_routes(
+        page,
+        students=students,
+        attention_items=[],
+    )
+    page.goto(static_server + "/index.html")
+    page.evaluate("window.__holdNextStudents = true")
+    page.locator("#attention-refresh").click()
+    page.wait_for_function("() => typeof window.__resolveStaleStudents === 'function'")
+
+    students[0].update({
+        "open_attention_count": 1, "highest_attention_priority": "high",
+    })
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated",
+        "action": "created",
+        "item": _attention_item(48, created_at=60),
+    }))
+    expect(page.locator('.student-item .attention-count')).to_have_text("1")
+    page.evaluate("window.__resolveStaleStudents()")
+    expect(page.locator('.student-item .attention-count')).to_have_text("1")
+
+
+def test_unrelated_student_event_does_not_block_authoritative_aggregate_correction(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/students' && window.__holdNextStudents) {
+            window.__holdNextStudents = false;
+            return new Promise((resolve) => {
+              window.__resolveCorrectedStudents = () => resolve(new Response(JSON.stringify({
+                items: [
+                  {student_id: 'a', display_name: 'A', open_attention_count: 0,
+                   highest_attention_priority: null},
+                  {student_id: 'b', display_name: 'B', open_attention_count: 0,
+                   highest_attention_priority: null}
+                ]
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    authoritative_items = [
+        _attention_item(53, student_id="a", session_id="sess-a", created_at=10),
+    ]
+    students = [
+        {"student_id": "a", "display_name": "A", "open_attention_count": 1,
+         "highest_attention_priority": "high"},
+        {"student_id": "b", "display_name": "B", "open_attention_count": 0,
+         "highest_attention_priority": None},
+    ]
+    install_api_routes(
+        page,
+        students=students,
+        attention_items=authoritative_items,
+    )
+    page.goto(static_server + "/index.html")
+    expect(page.locator('.student-item[data-student-id="a"] .attention-count')).to_have_text("1")
+
+    authoritative_items.clear()
+    students[0].update({"open_attention_count": 0, "highest_attention_priority": None})
+    page.evaluate("window.__holdNextStudents = true")
+    page.locator("#attention-refresh").click()
+    page.wait_for_function("() => typeof window.__resolveCorrectedStudents === 'function'")
+    students[1].update({"open_attention_count": 1, "highest_attention_priority": "high"})
+    ws_holder["socket"].send(json.dumps({
+        "type": "attention_updated",
+        "action": "created",
+        "item": _attention_item(54, student_id="b", session_id="sess-b", created_at=20),
+    }))
+    page.evaluate("window.__resolveCorrectedStudents()")
+
+    expect(page.locator('.student-item[data-student-id="a"] .attention-count')).to_have_count(0)
+    expect(page.locator('.student-item[data-student-id="b"] .attention-count')).to_have_text("1")
+
+
+def test_older_students_refresh_cannot_overwrite_newer_authoritative_response(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+      (() => {
+        const realFetch = window.fetch.bind(window);
+        window.fetch = (input, options) => {
+          const url = new URL(String(input), location.href);
+          if (url.pathname === '/api/mentor/students' && window.__holdNextStudents) {
+            window.__holdNextStudents = false;
+            return new Promise((resolve) => {
+              window.__resolveOlderStudents = () => resolve(new Response(JSON.stringify({
+                items: [{
+                  student_id: 's1', display_name: '学员甲',
+                  open_attention_count: 0, highest_attention_priority: null
+                }]
+              }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+            });
+          }
+          return realFetch(input, options);
+        };
+      })();
+    """)
+    students = [{
+        "student_id": "s1", "display_name": "学员甲",
+        "open_attention_count": 0, "highest_attention_priority": None,
+    }]
+    open_console(page, static_server, students=students, attention_items=[])
+
+    page.evaluate("window.__holdNextStudents = true")
+    page.locator("#attention-refresh").click()
+    page.wait_for_function("() => typeof window.__resolveOlderStudents === 'function'")
+    page.wait_for_function("() => !document.querySelector('#attention-refresh').disabled")
+    students[0].update({
+        "open_attention_count": 2,
+        "highest_attention_priority": "high",
+        "last_attention_at": 80,
+    })
+    page.locator("#attention-refresh").click()
+    expect(page.locator('.student-item .attention-count')).to_have_text("2")
+
+    page.evaluate("window.__resolveOlderStudents()")
+    page.wait_for_timeout(100)
+    expect(page.locator('.student-item .attention-count')).to_have_text("2")
+
+
+def test_concurrent_refresh_401_uses_single_shared_token_prompt(page, static_server):
+    page.add_init_script("""
+      sessionStorage.setItem('workbuddy_copilot_mentor_token', 'old-token');
+      window.__mentorPromptCount = 0;
+      window.prompt = () => {
+        window.__mentorPromptCount += 1;
+        return 'new-token-' + window.__mentorPromptCount;
+      };
+    """)
+    install_ws_route(page)
+
+    def auth_handler(route):
+        request = route.request
+        auth = request.headers.get("authorization", "")
+        if auth == "Bearer old-token":
+            route.fulfill(status=401, json={"detail": "expired"})
+            return
+        path = urlparse(request.url).path
+        if path == "/api/mentor/students":
+            route.fulfill(json={"items": []})
+        elif path == "/api/mentor/attention":
+            route.fulfill(json={"items": []})
+        else:
+            route.fulfill(status=404, json={"detail": "not found"})
+
+    page.route("**/api/mentor/**", auth_handler)
+    page.goto(static_server + "/index.html")
+    expect(page.locator(".attention-empty")).to_be_visible()
+    assert page.evaluate("window.__mentorPromptCount") == 1
+
+    page.evaluate(
+        "sessionStorage.setItem('workbuddy_copilot_mentor_token', 'old-token')"
+    )
+    page.locator("#attention-refresh").click()
+    page.wait_for_function("() => !document.querySelector('#attention-refresh').disabled")
+    assert page.evaluate("window.__mentorPromptCount") == 2

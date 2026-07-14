@@ -2151,3 +2151,25 @@ student-scoped cursor 与可选 limit，但严格要求 `delivered_at IS NULL`�
 顺序、并发游标 CAS、精确身份/删除级联和持久化后 fanout 隔离。实现已
 修复。最终独立复审为 Critical 0 / Important 0 / Minor 0，APPROVE。
 功能提交：`d7ed73c` (`feat: add durable mentor attention projection`)。
+
+### Task 6 Plan D2：导师干预雷达与消息恢复 — 2026-07-14
+
+- 在原导师台上增加关注队列、筛选、证据/置信度/建议卡片和
+  `view|prefill|in_progress|resolved|dismissed` 操作；仍复用唯一学员/会话/时间线状态。
+- REST/WS 交接、权威刷新、学员选择与关注项修订都有竞态回归；
+  可控文本只用 `textContent`，建议只预填不自动发送。
+- 导师消息增加可选 `client_request_id`、SQLite 原子幂等写入与最多
+  300 条的隐私有界状态补查。POST 响应丢失和 WS 断线后不自动重发，
+  用同一键有界恢复，送达状态只单调前进。
+- 真实系统回归暴露 loopback WebSocket 被 `websockets 16` 误送 SOCKS 代理；
+  现只对 localhost/loopback 禁用代理，远程 WSS 行为不变。
+
+| 范围 | 结果 |
+|---|---|
+| 导师台静态 + 真 Chromium | 72 passed / 1 个已有 warning |
+| attention/message/store/API 相邻回归 | 149 passed / 1 个已有 warning |
+| StudentTransport / 真实系统回归 | 20 passed / 4 passed |
+| 完整非导师台 Python 3.14 诊断 | 804 passed / 2 个已登记基线 failed / 1 warning |
+| 详细合同 | `.superpowers/sdd/task-6-report.md` |
+
+最终独立审查为 Critical 0 / Important 0 / Minor 0，APPROVE。

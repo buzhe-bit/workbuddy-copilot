@@ -1,12 +1,17 @@
 """测试 mentor API 路由（MVC 重构后，mock 打在 Service 层）。"""
+import asyncio
+
 import pytest
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from copilot.app_context import get_message_service, get_session_service, get_store
+from copilot.eventbus import EventBus
 from copilot.service import app
 from copilot.models import Student, Conversation, TimelineEntry
+from copilot.services import MessageService
+from copilot.store import Store
 
 
 @pytest.fixture
@@ -272,10 +277,11 @@ class TestMentorPromptReply:
 class TestReverseMessageApi:
     def test_post_mentor_message_returns_message_id_and_delivery_status(self, client):
         class FakeMessageService:
-            async def send(self, student_id, mentor_id, text):
+            async def send(self, student_id, mentor_id, text, client_request_id=None):
                 assert student_id == "stu-1"
                 assert mentor_id == "mentor-9"
                 assert text == "Try a smaller example"
+                assert client_request_id is None
                 return {"message_id": "msg-1", "id": 3, "delivered": True}
 
         app.dependency_overrides[get_message_service] = lambda: FakeMessageService()
@@ -287,6 +293,128 @@ class TestReverseMessageApi:
             })
             assert resp.status_code == 200
             assert resp.json() == {"message_id": "msg-1", "id": 3, "delivered": True}
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_post_mentor_message_forwards_client_request_id(self, client):
+        class FakeMessageService:
+            async def send(self, student_id, mentor_id, text, client_request_id=None):
+                assert student_id == "stu-1"
+                assert mentor_id is None
+                assert text == "Retry-safe hint"
+                assert client_request_id == "request-123"
+                return {
+                    "message_id": "msg-1",
+                    "id": 3,
+                    "delivered": False,
+                    "client_request_id": client_request_id,
+                    "duplicate": False,
+                }
+
+        app.dependency_overrides[get_message_service] = lambda: FakeMessageService()
+        try:
+            resp = client.post("/api/mentor/message", json={
+                "student_id": "stu-1",
+                "text": "Retry-safe hint",
+                "client_request_id": "request-123",
+            })
+            assert resp.status_code == 200
+            assert resp.json()["client_request_id"] == "request-123"
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_mentor_message_status_is_bounded_and_mentor_protected(
+        self,
+        client,
+        monkeypatch,
+    ):
+        class FakeMessageService:
+            def get_mentor_message_statuses(self, client_request_ids):
+                assert client_request_ids == ["request-123", "missing"]
+                return [{
+                    "client_request_id": "request-123",
+                    "message_id": "msg-1",
+                    "id": 3,
+                    "student_id": "stu-1",
+                    "delivered": True,
+                }]
+
+        monkeypatch.setenv("COPILOT_TOKEN", "secret")
+        app.dependency_overrides[get_message_service] = lambda: FakeMessageService()
+        try:
+            denied = client.post("/api/mentor/messages/status", json={
+                "client_request_ids": ["request-123", "missing"],
+            })
+            allowed = client.post(
+                "/api/mentor/messages/status",
+                json={"client_request_ids": ["request-123", "missing"]},
+                headers={"Authorization": "Bearer secret"},
+            )
+            too_many = client.post(
+                "/api/mentor/messages/status",
+                json={"client_request_ids": [f"request-{i}" for i in range(301)]},
+                headers={"Authorization": "Bearer secret"},
+            )
+
+            assert denied.status_code == 401
+            assert allowed.status_code == 200
+            assert allowed.json() == {"items": [{
+                "client_request_id": "request-123",
+                "message_id": "msg-1",
+                "id": 3,
+                "student_id": "stu-1",
+                "delivered": True,
+            }]}
+            assert too_many.status_code == 422
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_conflicting_client_request_id_returns_409(self, client):
+        class FakeMessageService:
+            async def send(self, **kwargs):
+                raise ValueError("client_request_id payload conflict")
+
+        app.dependency_overrides[get_message_service] = lambda: FakeMessageService()
+        try:
+            response = client.post("/api/mentor/message", json={
+                "student_id": "stu-1",
+                "text": "Changed hint",
+                "client_request_id": "request-conflict",
+            })
+            assert response.status_code == 409
+            assert response.json()["detail"] == "client_request_id payload conflict"
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_real_status_projection_does_not_expose_message_text(
+        self,
+        client,
+        tmp_path,
+    ):
+        store = Store(tmp_path / "message-status.db")
+        service = MessageService(store, EventBus())
+        sent = asyncio.run(service.send(
+            "stu-1",
+            "mentor-1",
+            "private mentor guidance",
+            client_request_id="request-private",
+        ))
+        asyncio.run(service.ack(sent["message_id"], "stu-1"))
+
+        app.dependency_overrides[get_message_service] = lambda: service
+        try:
+            response = client.post("/api/mentor/messages/status", json={
+                "client_request_ids": ["request-private"],
+            })
+            assert response.status_code == 200
+            assert response.json() == {"items": [{
+                "client_request_id": "request-private",
+                "message_id": sent["message_id"],
+                "id": sent["id"],
+                "student_id": "stu-1",
+                "delivered": True,
+            }]}
+            assert "private mentor guidance" not in response.text
         finally:
             app.dependency_overrides.clear()
 

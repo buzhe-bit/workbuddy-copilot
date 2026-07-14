@@ -288,3 +288,10 @@ def test_default_ws_connector_uses_installed_websockets_api_without_connecting(
 
     assert captured["uri"] == "ws://127.0.0.1:1/ws"
     assert captured["additional_headers"] == {"Authorization": "Bearer t"}
+    assert captured["proxy"] is None
+
+    captured.clear()
+    _default_ws_connect("wss://copilot.example/ws", {"Authorization": "Bearer t"})
+    assert captured["uri"] == "wss://copilot.example/ws"
+    assert captured["additional_headers"] == {"Authorization": "Bearer t"}
+    assert "proxy" not in captured

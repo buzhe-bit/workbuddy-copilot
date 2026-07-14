@@ -35,7 +35,7 @@ class TestFrontendFiles:
 class TestFrontendStructure:
     """前端结构验证。"""
 
-    def test_index_html_has_three_columns(self):
+    def test_index_html_preserves_original_three_work_areas(self):
         index_path = Path(__file__).parent.parent / "copilot" / "static" / "mentor" / "index.html"
         if not index_path.exists():
             pytest.skip("index.html 尚未创建")
@@ -44,6 +44,28 @@ class TestFrontendStructure:
         assert "学员" in content or "student" in content.lower()
         assert "对话" in content or "session" in content.lower()
         assert "时间线" in content or "timeline" in content.lower()
+
+    def test_attention_radar_static_contract(self):
+        static_dir = Path(__file__).parent.parent / "copilot" / "static" / "mentor"
+        html = (static_dir / "index.html").read_text()
+        js = (static_dir / "app.js").read_text()
+
+        for element_id in (
+            "attention-list",
+            "attention-status-filter",
+            "attention-priority-filter",
+            "attention-category-filter",
+            "attention-student-filter",
+        ):
+            assert f'id="{element_id}"' in html
+        assert "/api/mentor/attention" in js
+        assert "attention_updated" in js
+        assert "focusAttentionContext" in js
+        assert "prefillAttentionSuggestion" in js
+        assert "MENTOR_ID_STORAGE_KEY" in js
+        assert "currentMentorId" in js
+        assert "mentor_id: currentMentorId()" in js
+        assert "首次建连也必须补拉" in js
 
     def test_app_js_has_fetch_and_ws(self):
         js_path = Path(__file__).parent.parent / "copilot" / "static" / "mentor" / "app.js"

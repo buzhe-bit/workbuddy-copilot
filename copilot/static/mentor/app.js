@@ -1,5 +1,5 @@
 // 导师观察台前端逻辑
-// 三栏：学员列表 / 对话列表 / 时间线（徽章+卡片四类型区分）
+// 导师干预雷达 + 原三栏：学员列表 / 对话列表 / 时间线
 //
 // 架构：内存 state 单一数据源
 //   - 所有 render 只读 state；事件只改 state 再 render（不从 DOM 反读）
@@ -9,7 +9,8 @@
 //   GET  /api/mentor/students                       学员列表
 //   GET  /api/mentor/students/{id}/sessions         某学员的对话列表
 //   GET  /api/mentor/sessions/{id}/timeline         某对话的时间线
-//   POST /api/mentor/message {student_id,text}      导师定向发消息
+//   POST /api/mentor/message {student_id,text,client_request_id} 幂等发消息
+//   POST /api/mentor/messages/status               断线/响应丢失后补查送达状态
 //   WS   /ws/mentor                                 实时事件推送
 
 'use strict';
@@ -18,6 +19,7 @@
 // 单一数据源
 // ─────────────────────────────────────────────────────────────
 const state = {
+  attention: newAttentionState(),
   students: [],          // [{student_id, display_name, last_severity, session_count, analysis_count, alert_count, ...}]
   sessions: [],          // [{session_id, session_title, last_severity, analysis_count, alert_count, ...}]
   timeline: [],          // 归一化条目（见 normalize* 函数）
@@ -34,6 +36,9 @@ const state = {
   //   { open, loading, content:null|string, failed } —— 展开态与已加载内容都在此，
   //   不从 DOM 反读、跨重渲染保留；加载过一次即缓存，隐藏后再展开不重新请求。
   replies: {},
+  // 出站导师消息独立于当前 timeline，切学员后仍能匹配送达回执。
+  outboundMessages: [],
+  pendingDeliveryReceipts: [],
 };
 
 // 取（惰性创建）某 reply_ref 的回复展开态
@@ -72,6 +77,25 @@ function newUploadRequestState() {
   };
 }
 
+function newAttentionState() {
+  return {
+    items: [],
+    filters: { status: 'active', priority: '', category: '', studentId: '' },
+    loading: false,
+    error: '',
+    loadGeneration: 0,
+    revision: 0,
+    itemRevisions: {},
+  };
+}
+
+const attentionListEl = document.getElementById('attention-list');
+const attentionFeedbackEl = document.getElementById('attention-feedback');
+const attentionRefreshBtn = document.getElementById('attention-refresh');
+const attentionStatusFilter = document.getElementById('attention-status-filter');
+const attentionPriorityFilter = document.getElementById('attention-priority-filter');
+const attentionCategoryFilter = document.getElementById('attention-category-filter');
+const attentionStudentFilter = document.getElementById('attention-student-filter');
 const studentListEl = document.getElementById('student-list');
 const sessionListEl = document.getElementById('session-list');
 const timelineEl = document.getElementById('timeline');
@@ -90,7 +114,15 @@ let uploadPollController = null;
 let uploadPollTimer = null;
 let uploadTrackingGeneration = 0;
 let uploadAttemptGeneration = 0;
+let studentSelectionGeneration = 0;
+let studentLoadGeneration = 0;
+let studentAggregateRefreshTimer = null;
+let mentorReauthPromise = null;
 const MENTOR_TOKEN_STORAGE_KEY = 'workbuddy_copilot_mentor_token';
+const MENTOR_ID_STORAGE_KEY = 'workbuddy_copilot_mentor_id';
+let fallbackMentorId = '';
+const MAX_OUTBOUND_MESSAGES = 300;
+const MAX_MESSAGE_STATUS_BATCH = 300;
 
 // ─────────────────────────────────────────────────────────────
 // 工具
@@ -133,6 +165,50 @@ function clearMentorToken() {
   sessionStorage.removeItem(MENTOR_TOKEN_STORAGE_KEY);
 }
 
+function currentMentorId() {
+  try {
+    const stored = localStorage.getItem(MENTOR_ID_STORAGE_KEY);
+    if (stored) return stored;
+    const suffix = window.crypto && typeof window.crypto.randomUUID === 'function'
+      ? window.crypto.randomUUID()
+      : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    const created = 'mentor-console-' + suffix;
+    localStorage.setItem(MENTOR_ID_STORAGE_KEY, created);
+    return created;
+  } catch (err) {
+    if (!fallbackMentorId) {
+      fallbackMentorId = 'mentor-console-' + Date.now().toString(36) + '-' +
+        Math.random().toString(36).slice(2);
+    }
+    return fallbackMentorId;
+  }
+}
+
+function newClientRequestId() {
+  const suffix = window.crypto && typeof window.crypto.randomUUID === 'function'
+    ? window.crypto.randomUUID()
+    : Date.now().toString(36) + '-' + (++outboundSeq) + '-' +
+      Math.random().toString(36).slice(2);
+  return 'mentor-message-' + suffix;
+}
+
+function reauthenticateMentor(failedToken) {
+  const available = storedMentorToken();
+  if (available && available !== failedToken) return Promise.resolve(available);
+  if (!mentorReauthPromise) {
+    mentorReauthPromise = Promise.resolve().then(() => {
+      const current = storedMentorToken();
+      if (current && current !== failedToken) return current;
+      clearMentorToken();
+      wsStatusEl.textContent = '认证失败';
+      return askMentorToken();
+    }).finally(() => {
+      mentorReauthPromise = null;
+    });
+  }
+  return mentorReauthPromise;
+}
+
 async function authFetch(url, options) {
   const opts = Object.assign({}, options || {});
   const headers = new Headers(opts.headers || {});
@@ -144,9 +220,7 @@ async function authFetch(url, options) {
   opts.headers = headers;
   const resp = await fetch(url, opts);
   if (resp.status === 401) {
-    clearMentorToken();
-    wsStatusEl.textContent = '认证失败';
-    const retryToken = askMentorToken();
+    const retryToken = await reauthenticateMentor(token);
     if (retryToken) {
       const retryOpts = Object.assign({}, options || {});
       const retryHeaders = new Headers(retryOpts.headers || {});
@@ -175,23 +249,425 @@ function el(tag, className, text) {
   return node;
 }
 
+// 导师干预雷达：REST 是权威补拉，WS/PATCH 按 id + updated_at 增量合并。
+function attentionIsActive(item) {
+  return item && (item.status === 'open' || item.status === 'in_progress');
+}
+
+function attentionUpdatedAt(item) {
+  const value = Number(item && item.updated_at);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function attentionStatusRank(status) {
+  if (status === 'resolved' || status === 'dismissed') return 2;
+  if (status === 'in_progress') return 1;
+  return 0;
+}
+
+function upsertAttentionItem(incoming) {
+  if (!incoming || incoming.id == null) return { changed: false, previous: null };
+  const itemId = String(incoming.id);
+  const index = state.attention.items.findIndex((item) => String(item.id) === itemId);
+  const previous = index >= 0 ? state.attention.items[index] : null;
+  if (previous) {
+    const incomingUpdatedAt = attentionUpdatedAt(incoming);
+    const previousUpdatedAt = attentionUpdatedAt(previous);
+    if (incomingUpdatedAt < previousUpdatedAt) {
+      return { changed: false, previous: previous };
+    }
+    if (
+      incomingUpdatedAt === previousUpdatedAt &&
+      attentionStatusRank(incoming.status) < attentionStatusRank(previous.status)
+    ) {
+      return { changed: false, previous: previous };
+    }
+  }
+  const next = Object.assign({}, previous || {}, incoming);
+  if (previous && JSON.stringify(next) === JSON.stringify(previous)) {
+    return { changed: false, previous: previous };
+  }
+  if (index >= 0) state.attention.items[index] = next;
+  else state.attention.items.push(next);
+  return { changed: true, previous: previous };
+}
+
+function recordAttentionMutation(itemId) {
+  state.attention.revision += 1;
+  state.attention.itemRevisions[String(itemId)] = state.attention.revision;
+}
+
+function attentionPriorityRank(priority) {
+  if (priority === 'high') return 2;
+  if (priority === 'medium') return 1;
+  return 0;
+}
+
+function compareAttentionItems(a, b) {
+  const priorityDelta = attentionPriorityRank(b.priority) - attentionPriorityRank(a.priority);
+  if (priorityDelta) return priorityDelta;
+  const createdDelta = (Number(a.created_at) || 0) - (Number(b.created_at) || 0);
+  if (createdDelta) return createdDelta;
+  return (Number(a.id) || 0) - (Number(b.id) || 0);
+}
+
+function attentionStudentName(studentId) {
+  const student = state.students.find((item) => item.student_id === studentId);
+  return (student && (student.display_name || student.student_id)) || studentId || '未知学员';
+}
+
+function attentionStatusText(status) {
+  const labels = {
+    open: '未处理',
+    in_progress: '处理中',
+    resolved: '已解决',
+    dismissed: '已忽略',
+  };
+  return labels[status] || '未知状态';
+}
+
+function attentionMatchesFilters(item) {
+  const filters = state.attention.filters;
+  if (filters.status === 'active' && !attentionIsActive(item)) return false;
+  if (filters.status && filters.status !== 'active' && item.status !== filters.status) return false;
+  if (filters.priority && item.priority !== filters.priority) return false;
+  if (filters.category && item.category !== filters.category) return false;
+  if (filters.studentId && item.student_id !== filters.studentId) return false;
+  return true;
+}
+
+function renderAttentionStudentFilter() {
+  if (!attentionStudentFilter) return;
+  const selected = state.attention.filters.studentId;
+  attentionStudentFilter.innerHTML = '';
+  const all = el('option', null, '全部');
+  all.value = '';
+  attentionStudentFilter.appendChild(all);
+  state.students.forEach((student) => {
+    const option = el(
+      'option',
+      null,
+      student.display_name || student.student_id || '(未命名学员)'
+    );
+    option.value = student.student_id;
+    attentionStudentFilter.appendChild(option);
+  });
+  if (selected && !state.students.some((student) => student.student_id === selected)) {
+    const option = el('option', null, selected);
+    option.value = selected;
+    attentionStudentFilter.appendChild(option);
+  }
+  attentionStudentFilter.value = selected;
+}
+
+function makeAttentionAction(label, action, item, primary) {
+  const button = el('button', primary ? 'primary' : '', label);
+  button.type = 'button';
+  button.dataset.action = action;
+  button.disabled = !!item._updating;
+  if (action === 'view') {
+    button.addEventListener('click', () => focusAttentionContext(item));
+  } else if (action === 'prefill') {
+    button.addEventListener('click', () => prefillAttentionSuggestion(item));
+  } else {
+    button.addEventListener('click', () => updateAttentionStatus(item.id, action));
+  }
+  return button;
+}
+
+function buildAttentionCard(item) {
+  const priority = item.priority === 'high' ? 'high' : 'medium';
+  const category = item.category === 'system' ? 'system' : 'learning';
+  const card = el('li', 'attention-card priority-' + priority);
+  card.dataset.attentionId = String(item.id);
+  if (item._updating) card.classList.add('updating');
+
+  const top = el('div', 'attention-card-top');
+  top.appendChild(el('span', 'attention-student-name', attentionStudentName(item.student_id)));
+  top.appendChild(el('span', 'attention-priority ' + priority, priority === 'high' ? '高' : '中'));
+  card.appendChild(top);
+
+  const meta = el('div', 'attention-card-meta');
+  meta.appendChild(el(
+    'span', 'attention-category ' + category,
+    category === 'system' ? '系统异常' : '学习关注'
+  ));
+  meta.appendChild(el('span', 'attention-status', attentionStatusText(item.status)));
+  const confidence = Math.round(Math.max(0, Math.min(1, Number(item.confidence) || 0)) * 100);
+  meta.appendChild(el('span', 'attention-confidence', '置信度 ' + confidence + '%'));
+  meta.appendChild(el('span', 'attention-created-at', formatTime(item.created_at)));
+  card.appendChild(meta);
+
+  card.appendChild(el('div', 'attention-reason', item.reason || '需要导师关注'));
+  const evidence = Array.isArray(item.evidence) ? item.evidence.slice(0, 3) : [];
+  if (evidence.length) {
+    const list = el('ul', 'attention-evidence');
+    evidence.forEach((value) => list.appendChild(el('li', null, value)));
+    card.appendChild(list);
+  }
+  if (item.suggested_action) {
+    card.appendChild(el('div', 'attention-action', '建议：' + item.suggested_action));
+  }
+  if (item._error) card.appendChild(el('div', 'attention-error', item._error));
+
+  const actions = el('div', 'attention-card-actions');
+  actions.appendChild(makeAttentionAction('查看对话', 'view', item, false));
+  actions.appendChild(makeAttentionAction('填入消息框', 'prefill', item, true));
+  if (item.status === 'open') {
+    actions.appendChild(makeAttentionAction('处理中', 'in_progress', item, false));
+  }
+  if (attentionIsActive(item)) {
+    actions.appendChild(makeAttentionAction('已解决', 'resolved', item, false));
+    actions.appendChild(makeAttentionAction('忽略', 'dismissed', item, false));
+  }
+  card.appendChild(actions);
+  return card;
+}
+
+function renderAttention() {
+  if (!attentionListEl) return;
+  attentionListEl.innerHTML = '';
+  if (attentionRefreshBtn) attentionRefreshBtn.disabled = state.attention.loading;
+  if (attentionFeedbackEl) attentionFeedbackEl.textContent = '';
+  if (state.attention.loading) {
+    attentionListEl.appendChild(el('li', 'attention-loading', '正在加载关注队列…'));
+  }
+  if (state.attention.error) {
+    attentionListEl.appendChild(el('li', 'attention-error', '关注队列加载失败'));
+  }
+  const visible = state.attention.items
+    .filter(attentionMatchesFilters)
+    .slice()
+    .sort(compareAttentionItems);
+  visible.forEach((item) => attentionListEl.appendChild(buildAttentionCard(item)));
+  if (!state.attention.loading && !state.attention.error && !visible.length) {
+    attentionListEl.appendChild(el('li', 'attention-empty', '暂无需要关注的学员'));
+  }
+}
+
+function attentionStatusesForFilter(statusFilter) {
+  const statuses = ['open', 'in_progress'];
+  if (statusFilter === 'resolved' || statusFilter === 'dismissed') {
+    statuses.push(statusFilter);
+  } else if (!statusFilter) {
+    statuses.push('resolved', 'dismissed');
+  }
+  return statuses;
+}
+
+function attentionMatchesLoadScope(item, statuses, filters) {
+  if (!statuses.includes(item.status)) return false;
+  if (filters.priority && item.priority !== filters.priority) return false;
+  if (filters.category && item.category !== filters.category) return false;
+  if (filters.studentId && item.student_id !== filters.studentId) return false;
+  return true;
+}
+
+async function loadAttention() {
+  const generation = ++state.attention.loadGeneration;
+  const startingRevision = state.attention.revision;
+  const filters = Object.assign({}, state.attention.filters);
+  const requestedStatuses = attentionStatusesForFilter(filters.status);
+  state.attention.loading = true;
+  state.attention.error = '';
+  renderAttention();
+  try {
+    const responses = await Promise.all(requestedStatuses.map((status) => {
+      const params = new URLSearchParams({ status: status, limit: '200' });
+      if (filters.priority) {
+        params.set('priority', filters.priority);
+      }
+      if (filters.category) {
+        params.set('category', filters.category);
+      }
+      if (filters.studentId) {
+        params.set('student_id', filters.studentId);
+      }
+      return authFetch('/api/mentor/attention?' + params.toString());
+    }));
+    const failed = responses.find((resp) => !resp.ok);
+    if (failed) throw new Error('attention_http_' + failed.status);
+    const payloads = await Promise.all(responses.map((resp) => resp.json()));
+    if (generation !== state.attention.loadGeneration) return;
+    state.attention.items = state.attention.items.filter((item) => {
+      if (!attentionMatchesLoadScope(item, requestedStatuses, filters)) return true;
+      return (state.attention.itemRevisions[String(item.id)] || 0) > startingRevision;
+    });
+    payloads.forEach((data) => {
+      const incoming = Array.isArray(data.items) ? data.items : [];
+      incoming.forEach((item) => upsertAttentionItem(item));
+    });
+  } catch (err) {
+    if (generation !== state.attention.loadGeneration) return;
+    console.error('加载关注队列失败', err);
+    state.attention.error = 'load_failed';
+  } finally {
+    if (generation === state.attention.loadGeneration) {
+      state.attention.loading = false;
+      renderAttention();
+    }
+  }
+}
+
+async function refreshAttentionData() {
+  await Promise.all([loadStudents(), loadAttention()]);
+}
+
+function scheduleStudentAggregateRefresh() {
+  if (studentAggregateRefreshTimer != null) {
+    clearTimeout(studentAggregateRefreshTimer);
+  }
+  studentAggregateRefreshTimer = setTimeout(() => {
+    studentAggregateRefreshTimer = null;
+    loadStudents();
+  }, 50);
+}
+
+async function focusAttentionContext(item) {
+  if (!item || !item.student_id) return false;
+  if (attentionFeedbackEl) attentionFeedbackEl.textContent = '';
+  if (state.currentStudentId !== item.student_id) {
+    const selected = await selectStudent(item.student_id);
+    if (!selected || state.currentStudentId !== item.student_id) return false;
+  }
+  if (item.session_id && state.currentSessionId !== item.session_id) {
+    const sessionExists = state.sessions.some((session) => session.session_id === item.session_id);
+    if (!sessionExists) {
+      if (attentionFeedbackEl) {
+        attentionFeedbackEl.textContent = '来源对话当前不可用，已定位到学员';
+      }
+      return true;
+    }
+    await selectSession(item.session_id);
+    if (state.currentStudentId !== item.student_id || state.currentSessionId !== item.session_id) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function prefillAttentionSuggestion(item) {
+  const focused = await focusAttentionContext(item);
+  if (!focused || !item.suggested_action) return;
+  composeInput.value = item.suggested_action;
+  composeInput.focus();
+}
+
+async function updateAttentionStatus(itemId, status) {
+  const item = state.attention.items.find((candidate) => String(candidate.id) === String(itemId));
+  if (!item || item._updating) return;
+  item._updating = true;
+  item._error = '';
+  renderAttention();
+  let conflict = false;
+  try {
+    const resp = await authFetch('/api/mentor/attention/' + encodeURIComponent(itemId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: status, mentor_id: currentMentorId(), note: '' }),
+    });
+    if (!resp.ok) {
+      conflict = resp.status === 409;
+      throw new Error('attention_patch_http_' + resp.status);
+    }
+    const incoming = await resp.json();
+    incoming._updating = false;
+    incoming._error = '';
+    const result = upsertAttentionItem(incoming);
+    if (result.changed) {
+      recordAttentionMutation(incoming.id);
+      scheduleStudentAggregateRefresh();
+    }
+  } catch (err) {
+    console.error('更新关注项失败', err);
+    if (conflict) await refreshAttentionData();
+    const current = state.attention.items.find(
+      (candidate) => String(candidate.id) === String(itemId)
+    ) || item;
+    current._updating = false;
+    current._error = '更新失败，请重试';
+  } finally {
+    const current = state.attention.items.find((candidate) => String(candidate.id) === String(itemId));
+    if (current) current._updating = false;
+    renderAttention();
+  }
+}
+
+function acceptAttentionEvent(payload) {
+  const incoming = payload && payload.item;
+  if (!incoming) return;
+  const result = upsertAttentionItem(incoming);
+  if (!result.changed) return;
+  recordAttentionMutation(incoming.id);
+  // students 聚合没有与 WS 共享版本水位，不做本地 +/- 猜测；
+  // 事件持久化后 debounce 回读权威聚合，generation 丢弃旧响应。
+  scheduleStudentAggregateRefresh();
+  renderAttention();
+}
+
+if (attentionRefreshBtn) attentionRefreshBtn.addEventListener('click', refreshAttentionData);
+if (attentionStatusFilter) attentionStatusFilter.addEventListener('change', () => {
+  state.attention.filters.status = attentionStatusFilter.value;
+  renderAttention();
+  loadAttention();
+});
+if (attentionPriorityFilter) attentionPriorityFilter.addEventListener('change', () => {
+  state.attention.filters.priority = attentionPriorityFilter.value;
+  renderAttention();
+  loadAttention();
+});
+if (attentionCategoryFilter) attentionCategoryFilter.addEventListener('change', () => {
+  state.attention.filters.category = attentionCategoryFilter.value;
+  renderAttention();
+  loadAttention();
+});
+if (attentionStudentFilter) attentionStudentFilter.addEventListener('change', () => {
+  state.attention.filters.studentId = attentionStudentFilter.value;
+  renderAttention();
+  loadAttention();
+});
+
 // ─────────────────────────────────────────────────────────────
 // 学员列表
 // ─────────────────────────────────────────────────────────────
 async function loadStudents() {
+  const generation = ++studentLoadGeneration;
   try {
     const resp = await authFetch('/api/mentor/students');
+    if (!resp.ok) throw new Error('students_http_' + resp.status);
     const data = await resp.json();
+    if (generation !== studentLoadGeneration) return;
     state.students = data.items || [];
     renderStudents();
+    renderAttentionStudentFilter();
+    renderAttention();
   } catch (err) {
-    console.error('加载学员列表失败', err);
+    if (generation === studentLoadGeneration) {
+      console.error('加载学员列表失败', err);
+    }
   }
 }
 
 function renderStudents() {
   studentListEl.innerHTML = ''; // 清空骨架（非用户值），安全
-  state.students.forEach((s) => {
+  const students = state.students
+    .map((student, index) => ({ student: student, index: index }))
+    .sort((left, right) => {
+      const a = left.student;
+      const b = right.student;
+      const priorityDelta = attentionPriorityRank(b.highest_attention_priority) -
+        attentionPriorityRank(a.highest_attention_priority);
+      if (priorityDelta) return priorityDelta;
+      const countDelta = (Number(b.open_attention_count) || 0) -
+        (Number(a.open_attention_count) || 0);
+      if (countDelta) return countDelta;
+      const activityDelta = (Number(b.last_attention_at || b.last_ts) || 0) -
+        (Number(a.last_attention_at || a.last_ts) || 0);
+      if (activityDelta) return activityDelta;
+      return left.index - right.index;
+    })
+    .map((entry) => entry.student);
+  students.forEach((s) => {
     const li = el('li', 'student-item');
     li.dataset.studentId = s.student_id;
     if (s.student_id === state.currentStudentId) li.classList.add('selected');
@@ -204,6 +680,10 @@ function renderStudents() {
     const analysisCount = s.analysis_count || 0;
     info.appendChild(el('div', 'meta', sessionCount + ' 对话 · ' + analysisCount + ' 分析'));
     li.appendChild(info);
+    const attentionCount = Number(s.open_attention_count) || 0;
+    if (attentionCount > 0) {
+      li.appendChild(el('span', 'attention-count', String(attentionCount)));
+    }
 
     li.addEventListener('click', () => selectStudent(s.student_id));
     studentListEl.appendChild(li);
@@ -214,6 +694,7 @@ function renderStudents() {
 // 选中学员 → 加载对话列表
 // ─────────────────────────────────────────────────────────────
 async function selectStudent(studentId) {
+  const generation = ++studentSelectionGeneration;
   uploadAttemptGeneration += 1;
   cancelUploadTracking();
   state.currentStudentId = studentId;
@@ -231,11 +712,19 @@ async function selectStudent(studentId) {
   updateSyncEnabled(); // 选中学员后同步按钮可用
   try {
     const resp = await authFetch('/api/mentor/students/' + encodeURIComponent(studentId) + '/sessions');
+    if (!resp.ok) throw new Error('sessions_http_' + resp.status);
     const data = await resp.json();
+    if (generation !== studentSelectionGeneration || state.currentStudentId !== studentId) {
+      return false;
+    }
     state.sessions = data.items || [];
     renderSessions();
+    return true;
   } catch (err) {
-    console.error('加载对话列表失败', err);
+    if (generation === studentSelectionGeneration) {
+      console.error('加载对话列表失败', err);
+    }
+    return false;
   }
 }
 
@@ -401,9 +890,9 @@ async function fetchTimeline(sessionId, { replace } = {}) {
     const items = (data.items || []).map(normalizeRestEntry);
     if (state.currentSessionId !== sessionId) return; // 期间已切走
     if (replace) {
-      // 保留尚未持久化到接口的出站消息（乐观插入的导师提示）
-      const pendingOutbound = state.timeline.filter(
-        (e) => e.type === 'mentor_message' && e._optimistic
+      // timeline 接口不返回导师出站消息；按学员恢复本页面发送记录。
+      const pendingOutbound = state.outboundMessages.filter(
+        (entry) => entry.student_id === state.currentStudentId
       );
       state.timeline = items.concat(pendingOutbound);
     } else {
@@ -647,7 +1136,7 @@ function badge(cls, text) {
 }
 
 function deliveredPill(entry) {
-  if (entry.delivered) return el('span', 'pill', '✓ 已送达');
+  if (entry.delivered) return el('span', 'pill', '✓ 已展示');
   if (entry._failed) return el('span', 'pill failed', '发送失败');
   return el('span', 'pill sending', '发送中…');
 }
@@ -973,7 +1462,7 @@ if (syncBtn) syncBtn.addEventListener('click', requestStudentUpload);
 if (retryAnalysisBtn) retryAnalysisBtn.addEventListener('click', retryUploadAnalysis);
 
 // ─────────────────────────────────────────────────────────────
-// 导师发消息 + 已送达
+// 导师发消息 + 学员端已展示
 // ─────────────────────────────────────────────────────────────
 function updateComposeEnabled() {
   const enabled = !!state.currentStudentId;
@@ -984,10 +1473,114 @@ function updateComposeEnabled() {
     : '选中学员后可发送提示…（不改 AI，仅提示学员）';
 }
 
+function retainOutboundMessage(entry) {
+  state.outboundMessages.push(entry);
+  if (state.outboundMessages.length <= MAX_OUTBOUND_MESSAGES) return;
+  let removable = state.outboundMessages.findIndex(
+    (message) => message.delivered || message._failed
+  );
+  if (removable < 0) removable = 0;
+  const removed = state.outboundMessages.splice(removable, 1)[0];
+  state.timeline = state.timeline.filter((message) => message !== removed);
+}
+
+function applyRecoveredMessageStatus(item) {
+  if (!item || !item.client_request_id) return false;
+  const entry = state.outboundMessages.find(
+    (message) => message.client_request_id === item.client_request_id
+  );
+  if (!entry || (item.student_id && item.student_id !== entry.student_id)) return false;
+
+  let changed = false;
+  if (item.message_id && entry.message_id !== item.message_id) {
+    entry.message_id = item.message_id;
+    changed = true;
+  }
+  if (item.id != null && entry.server_id !== item.id) {
+    entry.server_id = item.id;
+    changed = true;
+  }
+  // 状态查询命中即证明 POST 已持久化；不再把“响应丢失”误报为发送失败。
+  if (entry._failed) {
+    entry._failed = false;
+    changed = true;
+  }
+  // 送达状态只单调前进，避免较旧查询覆盖较新回执。
+  if (item.delivered && !entry.delivered) {
+    entry.delivered = true;
+    changed = true;
+  }
+  state.pendingDeliveryReceipts = state.pendingDeliveryReceipts.filter((receipt) => {
+    if (!deliveryMatchesEntry(entry, receipt)) return true;
+    if (!entry.delivered) {
+      entry.delivered = true;
+      changed = true;
+    }
+    return false;
+  });
+  return changed;
+}
+
+async function reconcileOutboundMessageStatuses(requestedClientRequestIds) {
+  const retained = new Map(
+    state.outboundMessages
+      .filter((message) => message.client_request_id && !message.delivered)
+      .map((message) => [message.client_request_id, message])
+  );
+  const sourceIds = Array.isArray(requestedClientRequestIds)
+    ? requestedClientRequestIds
+    : Array.from(retained.keys()).slice(-MAX_MESSAGE_STATUS_BATCH);
+  const clientRequestIds = Array.from(new Set(sourceIds))
+    .filter((clientRequestId) => retained.has(clientRequestId))
+    .slice(0, MAX_MESSAGE_STATUS_BATCH);
+  const found = new Set();
+  if (!clientRequestIds.length) return found;
+
+  try {
+    const resp = await authFetch('/api/mentor/messages/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_request_ids: clientRequestIds }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    let changed = false;
+    (data.items || []).forEach((item) => {
+      const entry = retained.get(item && item.client_request_id);
+      if (!entry || (item.student_id && item.student_id !== entry.student_id)) return;
+      found.add(item.client_request_id);
+      if (applyRecoveredMessageStatus(item)) changed = true;
+    });
+    if (changed) renderTimeline();
+  } catch (err) {
+    console.error('恢复导师消息状态失败', err);
+  }
+  return found;
+}
+
+function waitForMessageRecovery(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function recoverFailedOutboundMessage(entry) {
+  const startedAt = Date.now();
+  // SQLite 默认写锁等待可达 5s；最后一次放在 6s，
+  // 仍是有界查询，且始终使用原 client_request_id，不重发消息。
+  const retryOffsets = [0, 250, 1000, 3000, 6000];
+  for (const retryOffset of retryOffsets) {
+    const remainingDelay = startedAt + retryOffset - Date.now();
+    if (remainingDelay > 0) await waitForMessageRecovery(remainingDelay);
+    if (!state.outboundMessages.includes(entry) || entry.delivered) return;
+    const found = await reconcileOutboundMessageStatuses([entry.client_request_id]);
+    if (found.has(entry.client_request_id)) return;
+  }
+}
+
 async function sendMentorMessage(text) {
   const studentId = state.currentStudentId;
   if (!studentId || !text.trim()) return;
   const localId = 'out-' + (++outboundSeq);
+  const clientRequestId = newClientRequestId();
 
   // 乐观插入出站条（state 驱动），初始「发送中」
   const entry = {
@@ -1001,7 +1594,10 @@ async function sendMentorMessage(text) {
     server_id: null,
     delivered: false,
     _optimistic: true,
+    student_id: studentId,
+    client_request_id: clientRequestId,
   };
+  retainOutboundMessage(entry);
   state.timeline.push(entry);
   renderTimeline();
 
@@ -1009,7 +1605,11 @@ async function sendMentorMessage(text) {
     const resp = await authFetch('/api/mentor/message', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ student_id: studentId, text: entry.content }),
+      body: JSON.stringify({
+        student_id: studentId,
+        text: entry.content,
+        client_request_id: clientRequestId,
+      }),
     });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
@@ -1018,27 +1618,60 @@ async function sendMentorMessage(text) {
     // 服务端只会在 StudentAgent 的 REST receipt 已持久化后返回 true；
     // 普通 WebSocket 写入成功仍保持“发送中”，等待 message_delivered 事件。
     if (data.delivered) entry.delivered = true;
+    state.pendingDeliveryReceipts = state.pendingDeliveryReceipts.filter((receipt) => {
+      if (!deliveryMatchesEntry(entry, receipt)) return true;
+      entry.delivered = true;
+      entry._failed = false;
+      return false;
+    });
     state.lastSeenMessageId = entry.message_id || state.lastSeenMessageId;
   } catch (err) {
     console.error('发送提示失败', err);
     entry._failed = true;
+    // 请求可能已入库、仅响应丢失；用幂等键查状态，绝不自动重发。
+    recoverFailedOutboundMessage(entry);
   }
   renderTimeline();
 }
 
-// WS message_delivered → 把对应出站条标记已送达（按 message_id / server_id 匹配）
+// WS message_delivered → 把对应出站条标记学员端已展示
+function deliveryMatchesEntry(entry, payload) {
+  const byMsgId = payload.message_id && entry.message_id === payload.message_id;
+  const byServerId = payload.id != null && entry.server_id === payload.id;
+  const byClientRequestId = payload.client_request_id &&
+    entry.client_request_id === payload.client_request_id;
+  return !!(byMsgId || byServerId || byClientRequestId);
+}
+
 function markDelivered(payload) {
   let changed = false;
-  state.timeline.forEach((e) => {
-    if (e.type !== 'mentor_message' || e.delivered) return;
-    const byMsgId = payload.message_id && e.message_id === payload.message_id;
-    const byServerId = payload.id != null && e.server_id === payload.id;
-    if (byMsgId || byServerId) {
+  let matched = false;
+  const candidates = state.outboundMessages.concat(
+    state.timeline.filter((entry) => !state.outboundMessages.includes(entry))
+  );
+  candidates.forEach((e) => {
+    if (e.type !== 'mentor_message' || !deliveryMatchesEntry(e, payload)) return;
+    matched = true;
+    if (!e.message_id && payload.message_id) e.message_id = payload.message_id;
+    if (e.server_id == null && payload.id != null) e.server_id = payload.id;
+    if (!e.delivered) {
       e.delivered = true;
       e._failed = false;
       changed = true;
     }
   });
+  if (!matched) {
+    const duplicate = state.pendingDeliveryReceipts.some((receipt) =>
+      (payload.message_id && receipt.message_id === payload.message_id) ||
+      (payload.id != null && receipt.id === payload.id) ||
+      (payload.client_request_id &&
+        receipt.client_request_id === payload.client_request_id)
+    );
+    if (!duplicate) {
+      state.pendingDeliveryReceipts.push(payload);
+      if (state.pendingDeliveryReceipts.length > 300) state.pendingDeliveryReceipts.shift();
+    }
+  }
   if (changed) renderTimeline();
 }
 
@@ -1071,6 +1704,10 @@ function connectMentorWS() {
     if (state.currentSessionId) {
       fetchTimeline(state.currentSessionId, { replace: true });
     }
+    // 首次建连也必须补拉：关闭初始 REST 快照与 WS open 之间的事件空窗。
+    refreshAttentionData();
+    // 首连/重连都用 client_request_id 补查，恢复断线期间错过的送达回执。
+    reconcileOutboundMessageStatuses();
   };
 
   ws.onmessage = (evt) => {
@@ -1081,7 +1718,12 @@ function connectMentorWS() {
       return;
     }
 
-    // 已送达回执：不限会话，按 id 匹配出站条
+    if (payload.type === 'attention_updated') {
+      acceptAttentionEvent(payload);
+      return;
+    }
+
+    // 已展示回执：不限会话，按 client/message/server id 匹配出站条
     if (payload.type === 'message_delivered') {
       markDelivered(payload);
       return;
@@ -1117,9 +1759,11 @@ function connectMentorWS() {
 // 初始化
 // ─────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
+  renderAttention();     // 初始关注队列骨架
   renderTimeline();      // 初始空态提示
   updateComposeEnabled();
   updateSyncEnabled();   // 初始未选中学员 → 同步按钮禁用
-  loadStudents();
+  // 先完成一次导师鉴权，再拉关注队列，避免 public 模式并发 401 弹两次 token 输入。
+  loadStudents().then(loadAttention);
   connectMentorWS();
 });
