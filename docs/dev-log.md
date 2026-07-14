@@ -2235,3 +2235,10 @@ mapped student token 撞库时拒绝启动；analysis 写入从 report 权威校
 `/recent` 同时核对 analysis/report owner；系统状态随手动刷新和每次 WS open 重拉，
 并用 generation 丢弃乱序旧响应。整改后聚焦 357 passed；更宽诊断为
 823 passed / 3 个已登记环境门 failed，显式 deselect 后 823 passed / 3 deselected。
+
+正式复审重新核对 `ca0eeb0..2e95dd5` 的鉴权、角色 token 隔离、analysis/report
+owner 双重约束与 system-status 刷新竞态，结论为 Spec APPROVE、Code quality
+APPROVE，Critical 0 / Important 0 / Minor 0。Task 8 至此作为 Windows Task 9 的
+稳定身份与健康状态基线；Python 3.13、真 Chromium/loopback 与 Windows W0/W1
+仍明确保留为外部发布门。正式复审另跑 41 个聚焦测试，并通过 `node --check`
+与范围 `git diff --check`。
