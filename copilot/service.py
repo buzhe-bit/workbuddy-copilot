@@ -150,6 +150,7 @@ class StudentAskIn(BaseModel):
     student_id: str | None = None
     question: str
     session_id: str | None = None
+    client_request_id: _ClientRequestId | None = None
 
 
 class StudentAskFeedbackIn(BaseModel):
@@ -252,6 +253,16 @@ def _student_ask_timeout(config: dict[str, Any]) -> float:
     except (TypeError, ValueError):
         base = 30.0
     return min(max(base + 5.0, 5.0), 45.0)
+
+
+def _student_ask_response(row: dict[str, Any]) -> dict[str, Any]:
+    status = str(row.get("answer_status") or "pending")
+    return {
+        "ask_id": int(row["id"]),
+        "answer": str(row.get("answer") or ""),
+        "status": status,
+        "needs_attention": status in {"degraded", "failed"},
+    }
 
 
 async def _handle_stop_background(
@@ -1612,9 +1623,32 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         student_id = resolve_student_id(principal, data.student_id)
         question = data.question.strip()
         session_id = (data.session_id or "").strip() or None
+        client_request_id = (
+            str(data.client_request_id) if data.client_request_id is not None else None
+        )
         if not question:
             raise HTTPException(status_code=400, detail="question is required")
-        if session_id:
+
+        reserved_row: dict[str, Any] | None = None
+        if client_request_id is not None:
+            try:
+                reserved_row, created = store.reserve_student_ask(
+                    student_id=student_id,
+                    session_id=session_id,
+                    question=question,
+                    client_request_id=client_request_id,
+                )
+            except ValueError as exc:
+                detail = str(exc)
+                if detail == "client_request_id payload conflict":
+                    raise HTTPException(status_code=409, detail=detail)
+                raise HTTPException(
+                    status_code=409,
+                    detail="session belongs to another student",
+                )
+            if not created:
+                return _student_ask_response(reserved_row)
+        elif session_id:
             try:
                 store.ensure_session_owner(session_id, student_id)
             except ValueError:
@@ -1648,20 +1682,30 @@ def create_app(context: AppContext | None = None) -> FastAPI:
                 error_code="llm_provider_error",
             )
 
-        try:
-            ask_id = store.add_student_ask(
+        if reserved_row is not None:
+            completed_row, _completed = store.complete_student_ask(
+                ask_id=int(reserved_row["id"]),
                 student_id=student_id,
-                session_id=session_id,
-                question=question,
                 answer=outcome.answer,
                 answer_status=outcome.status,
                 error_code=outcome.error_code,
             )
-        except ValueError:
-            raise HTTPException(
-                status_code=409,
-                detail="session belongs to another student",
-            )
+            ask_id = int(completed_row["id"])
+        else:
+            try:
+                ask_id = store.add_student_ask(
+                    student_id=student_id,
+                    session_id=session_id,
+                    question=question,
+                    answer=outcome.answer,
+                    answer_status=outcome.status,
+                    error_code=outcome.error_code,
+                )
+            except ValueError:
+                raise HTTPException(
+                    status_code=409,
+                    detail="session belongs to another student",
+                )
         await _project_attention_safely(
             context,
             "project_student_ask",
@@ -1684,6 +1728,22 @@ def create_app(context: AppContext | None = None) -> FastAPI:
             "status": outcome.status,
             "needs_attention": outcome.status != "answered",
         }
+
+    @app.get("/api/student/asks/by-client-request/{client_request_id}")
+    async def get_student_ask_by_client_request(
+        client_request_id: _ClientRequestId,
+        student_id: str | None = None,
+        principal: StudentPrincipal = Depends(require_student_principal),
+        store: Store = Depends(get_store),
+    ):
+        resolved_student_id = resolve_student_id(principal, student_id)
+        row = store.get_student_ask_by_client_request(
+            resolved_student_id,
+            str(client_request_id),
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="student ask not found")
+        return _student_ask_response(row)
 
     @app.post("/api/student/asks/{ask_id}/feedback")
     async def record_student_ask_feedback(

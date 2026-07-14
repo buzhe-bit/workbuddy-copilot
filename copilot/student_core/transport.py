@@ -312,6 +312,171 @@ class StudentTransport:
             limit=limit,
         )
 
+    def ask(
+        self,
+        question: str,
+        *,
+        session_id: str | None = None,
+        client_request_id: str | None = None,
+    ) -> Accepted:
+        """Submit one student question with an optional retry-safe client key."""
+        student_id = str(self.student_id or "").strip()
+        normalized_question = str(question or "").strip()
+        if not student_id or not normalized_question:
+            raise PermanentTransportError("student ask rejected")
+        payload: dict[str, Any] = {
+            "student_id": student_id,
+            "question": normalized_question,
+        }
+        normalized_session_id = str(session_id or "").strip()
+        if normalized_session_id:
+            payload["session_id"] = normalized_session_id
+        normalized_request_id = str(client_request_id or "")
+        if normalized_request_id:
+            payload["client_request_id"] = normalized_request_id
+        request = urllib.request.Request(
+            f"{self.base_url}/api/student/ask",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", **self.auth_headers},
+            method="POST",
+        )
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                status_value = getattr(response, "status", None)
+                if status_value is None:
+                    status_value = response.getcode()
+                status = int(status_value)
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            self._raise_http_error(exc)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise TemporaryNetworkError("student ask unavailable") from exc
+        parsed = self._parse_body(raw)
+        if 200 <= status < 300:
+            return Accepted(status_code=status, body=parsed)
+        if 400 <= status < 500:
+            raise PermanentTransportError("student ask rejected")
+        raise TemporaryNetworkError("student ask unavailable")
+
+    async def ask_async(
+        self,
+        question: str,
+        *,
+        session_id: str | None = None,
+        client_request_id: str | None = None,
+    ) -> Accepted:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.ask,
+            question,
+            session_id=session_id,
+            client_request_id=client_request_id,
+        )
+
+    def get_ask_by_client_request(self, client_request_id: str) -> dict[str, Any]:
+        """Recover a pending or terminal ask after an uncertain POST response."""
+        student_id = str(self.student_id or "").strip()
+        request_id = str(client_request_id or "").strip()
+        if not student_id or not request_id:
+            raise PermanentTransportError("student ask recovery rejected")
+        encoded_request_id = urllib.parse.quote(request_id, safe="")
+        query = urllib.parse.urlencode({"student_id": student_id})
+        request = urllib.request.Request(
+            f"{self.base_url}/api/student/asks/by-client-request/"
+            f"{encoded_request_id}?{query}",
+            headers=self.auth_headers,
+            method="GET",
+        )
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                status_value = getattr(response, "status", None)
+                if status_value is None:
+                    status_value = response.getcode()
+                status = int(status_value)
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            self._raise_http_error(exc)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise TemporaryNetworkError("student ask recovery unavailable") from exc
+        if 200 <= status < 300:
+            return self._parse_body(raw)
+        if 400 <= status < 500:
+            raise PermanentTransportError("student ask recovery rejected")
+        raise TemporaryNetworkError("student ask recovery unavailable")
+
+    async def get_ask_by_client_request_async(
+        self,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.get_ask_by_client_request,
+            client_request_id,
+        )
+
+    def submit_ask_feedback(
+        self,
+        ask_id: int,
+        feedback: str,
+        *,
+        note: str = "",
+    ) -> Accepted:
+        """Submit the student's explicit helpful/unresolved judgment."""
+        student_id = str(self.student_id or "").strip()
+        normalized_feedback = str(feedback or "").strip()
+        if (
+            not student_id
+            or int(ask_id) <= 0
+            or normalized_feedback not in {"helpful", "unresolved"}
+        ):
+            raise PermanentTransportError("student ask feedback rejected")
+        payload = {
+            "student_id": student_id,
+            "feedback": normalized_feedback,
+            "note": str(note or "").strip(),
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/api/student/asks/{int(ask_id)}/feedback",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", **self.auth_headers},
+            method="POST",
+        )
+        try:
+            with self._opener(request, timeout=self.timeout) as response:
+                status_value = getattr(response, "status", None)
+                if status_value is None:
+                    status_value = response.getcode()
+                status = int(status_value)
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            self._raise_http_error(exc)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise TemporaryNetworkError("student ask feedback unavailable") from exc
+        parsed = self._parse_body(raw)
+        if 200 <= status < 300:
+            return Accepted(status_code=status, body=parsed)
+        if 400 <= status < 500:
+            raise PermanentTransportError("student ask feedback rejected")
+        raise TemporaryNetworkError("student ask feedback unavailable")
+
+    async def submit_ask_feedback_async(
+        self,
+        ask_id: int,
+        feedback: str,
+        *,
+        note: str = "",
+    ) -> Accepted:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.submit_ask_feedback,
+            ask_id,
+            feedback,
+            note=note,
+        )
+
     def post_sync(self, sessions: list[Mapping[str, Any]]) -> Accepted:
         student_id = str(self.student_id or "").strip()
         if not student_id:

@@ -285,6 +285,7 @@ CREATE TABLE IF NOT EXISTS student_asks (
     session_id TEXT,
     question TEXT,
     answer TEXT,
+    client_request_id TEXT NOT NULL DEFAULT '',
     answer_status TEXT NOT NULL DEFAULT 'answered',
     error_code TEXT NOT NULL DEFAULT '',
     feedback TEXT NOT NULL DEFAULT '',
@@ -367,6 +368,7 @@ _MIGRATIONS = [
     ("student_asks", "feedback", "TEXT NOT NULL DEFAULT ''"),
     ("student_asks", "feedback_note", "TEXT NOT NULL DEFAULT ''"),
     ("student_asks", "feedback_at", "REAL"),
+    ("student_asks", "client_request_id", "TEXT NOT NULL DEFAULT ''"),
     ("mentor_messages", "client_request_id", "TEXT"),
 ]
 
@@ -414,6 +416,9 @@ _POST_MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_upload_request_sessions_status ON upload_request_sessions(request_id, analysis_status)",
     "CREATE INDEX IF NOT EXISTS idx_student_asks_student ON student_asks(student_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_student_asks_session ON student_asks(session_id, created_at)",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_student_asks_client_request_unique
+       ON student_asks(student_id, client_request_id)
+       WHERE client_request_id != ''""",
     """INSERT OR IGNORE INTO sessions
        (session_id, student_id, work_dir, title, created_at, last_activity_at)
        SELECT
@@ -3361,6 +3366,147 @@ class Store:
                 ),
             )
             return cur.lastrowid
+
+    def reserve_student_ask(
+        self,
+        *,
+        student_id: str,
+        session_id: str | None,
+        question: str,
+        client_request_id: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically reserve one retry-safe student question.
+
+        The first caller owns the model invocation. Replays receive the same
+        pending or terminal row and must never invoke a second model call.
+        Reusing a key with another session or question is a conflict.
+        """
+        request_id = str(client_request_id or "")
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+        if (
+            not request_id
+            or len(request_id) > 128
+            or any(char not in allowed for char in request_id)
+        ):
+            raise ValueError("invalid client_request_id")
+        normalized_student_id = str(student_id or "").strip()
+        normalized_session_id = str(session_id or "").strip() or None
+        normalized_question = str(question or "").strip()
+        if not normalized_student_id or not normalized_question:
+            raise ValueError("student ask identity and question are required")
+
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            existing = c.execute(
+                """SELECT * FROM student_asks
+                   WHERE student_id = ? AND client_request_id = ?""",
+                (normalized_student_id, request_id),
+            ).fetchone()
+            if existing is not None:
+                row = dict(existing)
+                identity = (
+                    str(row.get("session_id") or ""),
+                    str(row.get("question") or ""),
+                )
+                if identity != (normalized_session_id or "", normalized_question):
+                    raise ValueError("client_request_id payload conflict")
+                return row, False
+
+            now = time.time()
+            c.execute(
+                """INSERT INTO students
+                   (student_id, display_name, token_hash, created_at)
+                   VALUES (?, '', NULL, ?)
+                   ON CONFLICT(student_id) DO NOTHING""",
+                (normalized_student_id, now),
+            )
+            if normalized_session_id:
+                self._upsert_session_with_conn(
+                    c,
+                    session_id=normalized_session_id,
+                    student_id=normalized_student_id,
+                    work_dir="",
+                    title="",
+                    created_at=now,
+                    last_activity_at=now,
+                )
+            cur = c.execute(
+                """INSERT INTO student_asks
+                   (student_id, session_id, question, answer,
+                    client_request_id, answer_status, error_code, created_at)
+                   VALUES (?, ?, ?, '', ?, 'pending', '', ?)""",
+                (
+                    normalized_student_id,
+                    normalized_session_id,
+                    normalized_question,
+                    request_id,
+                    now,
+                ),
+            )
+            row = c.execute(
+                "SELECT * FROM student_asks WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            return dict(row), True
+
+    def complete_student_ask(
+        self,
+        *,
+        ask_id: int,
+        student_id: str,
+        answer: str,
+        answer_status: str,
+        error_code: str = "",
+    ) -> tuple[dict[str, Any], bool]:
+        """Commit one reserved ask exactly once and return its durable row."""
+        if answer_status not in {"answered", "degraded", "failed"}:
+            raise ValueError("invalid student ask answer status")
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            existing = c.execute(
+                "SELECT * FROM student_asks WHERE id = ?",
+                (ask_id,),
+            ).fetchone()
+            if existing is None:
+                raise LookupError("student ask not found")
+            row = dict(existing)
+            if str(row.get("student_id") or "") != str(student_id or ""):
+                raise PermissionError("student ask owner mismatch")
+            if str(row.get("answer_status") or "") != "pending":
+                terminal = (
+                    str(row.get("answer") or ""),
+                    str(row.get("answer_status") or ""),
+                    str(row.get("error_code") or ""),
+                )
+                if terminal != (str(answer), answer_status, str(error_code or "")):
+                    raise ValueError("student ask is already complete")
+                return row, False
+
+            c.execute(
+                """UPDATE student_asks
+                   SET answer = ?, answer_status = ?, error_code = ?
+                   WHERE id = ? AND answer_status = 'pending'""",
+                (str(answer), answer_status, str(error_code or ""), ask_id),
+            )
+            completed = c.execute(
+                "SELECT * FROM student_asks WHERE id = ?",
+                (ask_id,),
+            ).fetchone()
+            return dict(completed), True
+
+    def get_student_ask_by_client_request(
+        self,
+        student_id: str,
+        client_request_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one ask scoped to the authenticated student identity."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT * FROM student_asks
+                   WHERE student_id = ? AND client_request_id = ?""",
+                (str(student_id or ""), str(client_request_id or "")),
+            ).fetchone()
+            return dict(row) if row else None
 
     def record_student_ask_feedback(
         self,

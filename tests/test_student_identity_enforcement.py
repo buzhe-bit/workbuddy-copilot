@@ -125,12 +125,21 @@ def _build_identity_app(
             message_id=message_id,
         )
         message_ids[student_id] = message_id
-        ask_ids[student_id] = store.add_student_ask(
+        reserved_ask, created = store.reserve_student_ask(
             student_id=student_id,
             session_id=session_id,
             question=f"seed question from {student_id}",
-            answer="seed answer",
+            client_request_id=f"seed-ask-{student_id}",
         )
+        assert created is True
+        completed_ask, completed = store.complete_student_ask(
+            ask_id=int(reserved_ask["id"]),
+            student_id=student_id,
+            answer="seed answer",
+            answer_status="answered",
+        )
+        assert completed is True
+        ask_ids[student_id] = int(completed_ask["id"])
         report_id = store.add_report(
             student_id=student_id,
             session_id=session_id,
@@ -361,6 +370,15 @@ def _ask(client, seeded, student_id):
     )
 
 
+def _ask_by_client_request(client, seeded, student_id):
+    resolved = _resolved_student(student_id)
+    return client.get(
+        f"/api/student/asks/by-client-request/seed-ask-{resolved}",
+        headers=_mapped_headers(),
+        params=_query_with_student(student_id),
+    )
+
+
 def _feedback(client, seeded, student_id):
     resolved = _resolved_student(student_id)
     return client.post(
@@ -389,6 +407,7 @@ STUDENT_ROUTE_INVENTORY = (
     StudentRouteCase("pending-message-receipts", _pending_receipts),
     StudentRouteCase("message-ack", _ack_message),
     StudentRouteCase("student-ask", _ask),
+    StudentRouteCase("student-ask-by-client-request", _ask_by_client_request),
     StudentRouteCase("student-ask-feedback", _feedback),
 )
 
@@ -448,6 +467,10 @@ def _assert_response_is_scoped_to_student_a(
             and row["question"] == f"identity question from {STUDENT_A}"
             for row in seeded.store.list_student_asks(STUDENT_A)
         )
+    elif case.name == "student-ask-by-client-request":
+        assert body["ask_id"] == seeded.ask_ids[STUDENT_A]
+        assert body["answer"] == "seed answer"
+        assert body["status"] == "answered"
     elif case.name == "student-ask-feedback":
         own = seeded.store.get_student_ask(seeded.ask_ids[STUDENT_A])
         assert own is not None and own["feedback"] == "helpful"
