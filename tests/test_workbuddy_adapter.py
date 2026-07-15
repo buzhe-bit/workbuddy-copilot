@@ -117,6 +117,35 @@ def test_adapter_reads_sessions_and_workspaces_from_real_sqlite_fixture(
     assert sessions[1].space_name == "fixture-task"
 
 
+def test_adapter_closes_every_readonly_database_connection(
+    adapter: WorkBuddyDataAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+
+    adapter.list_sessions()
+    adapter.list_workspaces()
+
+    assert opened
+    assert all(connection.closed for connection in opened)
+
+
 def test_adapter_indexes_transcript_by_jsonl_session_id_not_cwd_encoding(
     adapter: WorkBuddyDataAdapter,
 ) -> None:

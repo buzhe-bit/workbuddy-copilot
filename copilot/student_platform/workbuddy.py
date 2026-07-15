@@ -6,6 +6,7 @@ guess an operating-system-specific WorkBuddy location.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, field
 import json
 import os
@@ -293,7 +294,7 @@ class WorkBuddyDataAdapter:
                 return self._probe_failure(
                     "not_installed", "WorkBuddy database is missing"
                 )
-            with self._connect_readonly() as connection:
+            with closing(self._connect_readonly()) as connection:
                 rows = connection.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 ).fetchall()
@@ -337,7 +338,7 @@ class WorkBuddyDataAdapter:
         if limit < 1:
             return []
         try:
-            with self._connect_readonly() as connection:
+            with closing(self._connect_readonly()) as connection:
                 where = "" if include_deleted else "WHERE deleted_at IS NULL"
                 session_rows = connection.execute(
                     f"""SELECT id, cwd, title, custom_title, created_at, last_activity_at, deleted_at
@@ -384,7 +385,7 @@ class WorkBuddyDataAdapter:
         if limit < 1:
             return []
         try:
-            with self._connect_readonly() as connection:
+            with closing(self._connect_readonly()) as connection:
                 rows = connection.execute(
                     "SELECT * FROM workspaces ORDER BY last_opened_at DESC LIMIT ?", (limit,)
                 ).fetchall()
