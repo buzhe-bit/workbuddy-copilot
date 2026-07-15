@@ -1896,6 +1896,54 @@ def test_attention_view_and_prefill_reuse_context_without_auto_send(
     expect(page.locator("#timeline .card-me")).to_have_count(1)
 
 
+def test_attention_copy_ai_review_bundle_includes_evidence_and_exact_context(
+    page,
+    static_server,
+):
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'clipboard', {
+          configurable: true,
+          value: { writeText: async (text) => { window.__copiedReview = text; } },
+        });
+    """)
+    students = [{
+        "student_id": "s1",
+        "display_name": "学员甲",
+        "session_count": 1,
+        "analysis_count": 1,
+    }]
+    sessions = {"s1": [{
+        "session_id": "sess1",
+        "session_title": "Windows 安装失败",
+        "analysis_count": 1,
+    }]}
+    item = _attention_item(
+        22,
+        evidence=["PowerShell 返回 AccessDenied"],
+        suggested_action="先确认安装目录权限",
+    )
+    open_console(
+        page,
+        static_server,
+        students=students,
+        sessions_by_student=sessions,
+        attention_items=[item],
+        transcript_by_session={"sess1": {
+            "content": "学员：执行 install_windows.ps1\nAI：AccessDenied at C:\\\\WorkBuddy",
+            "created_at": 1,
+        }},
+    )
+
+    page.locator('[data-action="copy-review"]').click()
+    expect(page.locator("#attention-feedback")).to_have_text("已复制 AI 审查包")
+    copied = page.evaluate("window.__copiedReview")
+    assert "PowerShell 返回 AccessDenied" in copied
+    assert "先确认安装目录权限" in copied
+    assert "install_windows.ps1" in copied
+    assert "AccessDenied at C:\\\\WorkBuddy" in copied
+    assert "不得编造" in copied
+
+
 def test_attention_cross_student_navigation_preserves_delivery_receipt_state(
     page,
     static_server,

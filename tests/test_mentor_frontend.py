@@ -62,6 +62,10 @@ class TestFrontendStructure:
         assert "attention_updated" in js
         assert "focusAttentionContext" in js
         assert "prefillAttentionSuggestion" in js
+        assert "copyAttentionReview" in js
+        assert "buildAttentionReviewPrompt" in js
+        assert "复制 AI 审查包" in js
+        assert "navigator.clipboard.writeText" in js
         assert "MENTOR_ID_STORAGE_KEY" in js
         assert "currentMentorId" in js
         assert "mentor_id: currentMentorId()" in js
