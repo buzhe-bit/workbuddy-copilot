@@ -8,7 +8,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from .models import HookEvent, SpoolEntry
 from .process_liveness import FileClaimStore, ProcessIdentity, ProcessLiveness
@@ -39,6 +39,60 @@ def _fsync_directory(directory: str | os.PathLike[str]) -> None:
             os.close(fd)
         except OSError:
             pass
+
+
+def _open_spool_entry(path: Path) -> TextIO:
+    """Open a spool row without blocking atomic replacement on Windows."""
+
+    if os.name != "nt":
+        return path.open("r", encoding="utf-8")
+
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    generic_read = 0x80000000
+    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    handle = create_file(
+        str(path),
+        generic_read,
+        share_read_write_delete,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    invalid_handle = wintypes.HANDLE(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except BaseException:
+        close_handle(handle)
+        raise
+    try:
+        return os.fdopen(fd, "r", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _try_lock_order_reservation(fd: int) -> bool:
@@ -636,7 +690,7 @@ class EventSpool:
                 continue
             opened_stat: os.stat_result | None = None
             try:
-                with path.open("r", encoding="utf-8") as handle:
+                with _open_spool_entry(path) as handle:
                     opened_stat = os.fstat(handle.fileno())
                     entry = SpoolEntry.from_dict(json.load(handle))
                     file_mtime_ns = opened_stat.st_mtime_ns

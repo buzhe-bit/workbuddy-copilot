@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from copilot.student_core import spool as spool_module
 from copilot.student_core.models import HookEvent
 from copilot.student_core.spool import (
     EventSpool,
@@ -181,16 +182,16 @@ def test_pending_never_quarantines_a_valid_replacement_of_the_opened_inode(
     path.write_text("", encoding="utf-8")
     opened_old_inode = threading.Event()
     replacement_committed = threading.Event()
-    real_path_open = Path.open
+    real_spool_open = spool_module._open_spool_entry
 
-    def paused_open(self: Path, *args, **kwargs):
-        handle = real_path_open(self, *args, **kwargs)
-        if self == path:
+    def paused_open(candidate: Path):
+        handle = real_spool_open(candidate)
+        if candidate == path:
             opened_old_inode.set()
             assert replacement_committed.wait(1)
         return handle
 
-    monkeypatch.setattr(Path, "open", paused_open)
+    monkeypatch.setattr(spool_module, "_open_spool_entry", paused_open)
     observed: list = []
     reader = threading.Thread(target=lambda: observed.extend(spool.pending()))
     reader.start()
