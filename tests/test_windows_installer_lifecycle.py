@@ -449,7 +449,14 @@ def test_python_preflight_fails_before_state_mutation(tmp_path: Path) -> None:
 @pytest.mark.skipif(os.name != "nt", reason="requires PowerShell Task/ACL runtime")
 def test_uninstall_changed_settings_removes_only_owned_hooks(tmp_path: Path) -> None:
     _protect_private_windows_directory(tmp_path)
-    settings_path = tmp_path / "settings.json"
+    fixture_project_root = tmp_path / "fixture-project"
+    fixture_project_root.mkdir()
+    uninstall_script = fixture_project_root / "uninstall_windows.ps1"
+    shutil.copy2(PROJECT_ROOT / "uninstall_windows.ps1", uninstall_script)
+
+    config_dir = tmp_path / "workbuddy"
+    config_dir.mkdir()
+    settings_path = config_dir / "settings.json"
     settings = {
         "theme": "user-change",
         "hooks": {
@@ -467,20 +474,41 @@ def test_uninstall_changed_settings_removes_only_owned_hooks(tmp_path: Path) -> 
         },
     }
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
-    baseline = tmp_path / "baseline.json"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    student_id = f"test-{hashlib.sha256(str(tmp_path).encode('utf-8')).hexdigest()[:16]}"
+    instance_digest = hashlib.sha256(student_id.encode("utf-8")).hexdigest()[:16]
+    install_id = hashlib.sha256(
+        f"install:{tmp_path}".encode("utf-8")
+    ).hexdigest()[:32]
+    baseline = state_dir / f"settings-baseline-{install_id}.json"
     baseline.write_text(json.dumps({"theme": "old"}), encoding="utf-8")
-    manifest = tmp_path / "installer-manifest.json"
+    baseline_sha256 = _sha256(baseline)
+    manifest = state_dir / "installer-manifest.json"
     manifest.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "owner_id": OWNER_ID,
+                "install_id": install_id,
+                "student_id": student_id,
+                "instance_digest": instance_digest,
+                "installed_at": "2026-01-01T00:00:00Z",
+                "project_root": str(fixture_project_root),
+                "config_dir": str(config_dir),
+                "workbuddy_profile": str(tmp_path / "profile.json"),
                 "settings_path": str(settings_path),
+                "settings_before_sha256": baseline_sha256,
                 "settings_after_sha256": "0" * 64,
                 "baseline_backup_path": str(baseline),
-                "baseline_backup_sha256": _sha256(baseline),
-                "task_name": "missing-task",
-                "venv_dir": str(tmp_path / "missing-venv"),
+                "baseline_backup_sha256": baseline_sha256,
+                "venv_dir": str(fixture_project_root / ".venv-win"),
+                "task_name": f"WorkBuddyCopilot-{instance_digest}",
+                "runtime_config_path": str(state_dir / "client-config.json"),
+                "token_file": str(state_dir / "student.token"),
+                "state_dir": str(state_dir),
+                "spool_dir": str(state_dir / "spool"),
+                "log_dir": str(state_dir / "logs"),
             }
         ),
         encoding="utf-8",
@@ -496,7 +524,7 @@ def test_uninstall_changed_settings_removes_only_owned_hooks(tmp_path: Path) -> 
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            str(PROJECT_ROOT / "uninstall_windows.ps1"),
+            str(uninstall_script),
             "-ManifestPath",
             str(manifest),
         ],
