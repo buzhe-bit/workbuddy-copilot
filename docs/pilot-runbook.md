@@ -76,7 +76,7 @@ PYTHON=python3.13 ./install.sh
 ./start_menubar.sh
 ```
 
-安装器强制 Python 3.13，只安装 macOS 学员端依赖，并在改 WorkBuddy settings 前将去除旧 Copilot hooks 的基线原子写入 `~/.workbuddy-copilot/`；config、备份和 manifest 仅当前用户可读。实机必验：Hook 事件上报、浮标展示一次、导师消息渲染后才送达、断网恢复、进程重启、休眠唤醒。
+安装前必须完全退出 WorkBuddy。安装器强制 Python 3.13，只安装 macOS 学员端依赖，且仅支持首次安装：会在修改 venv 或 pip 前验证配置和 WorkBuddy settings，拒绝已有 manifest、未完成事务、旧 Copilot hook 或 hook 链接。私有 transaction 会原子转为 manifest。实机必验：Hook 事件上报、浮标展示一次、导师消息渲染后才送达、断网恢复、进程重启、休眠唤醒。
 
 回滚前先停止学员端，再运行：
 
@@ -84,7 +84,7 @@ PYTHON=python3.13 ./install.sh
 ./uninstall_macos.sh
 ```
 
-卸载器只处理 manifest 拥有的 hooks 和 hook 链接；若 WorkBuddy settings 在安装后被用户修改，只移除当前 owner 条目而不覆盖其他改动。为避免误删学员证据，`config.json`、venv、spool、日志和私有备份默认保留。
+卸载前也必须完全退出 WorkBuddy。卸载器只从当前 settings 移除 manifest owner 的 hooks 和 hook 链接，绝不用旧整文件覆盖用户后续改动。只有安装器新建且删除 owner hooks 后确实为空的 settings 文件才会被删除。为避免误删学员证据，`config.json`、venv、spool、日志和私有状态默认保留。
 
 ## 6. Windows 学员端
 

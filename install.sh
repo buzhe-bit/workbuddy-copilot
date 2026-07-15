@@ -13,6 +13,11 @@ if ! command -v "$PYTHON" >/dev/null 2>&1; then
 fi
 "$PYTHON" "$PROJECT_DIR/scripts/python_preflight.py"
 
+if pgrep -x "WorkBuddy" >/dev/null 2>&1; then
+  echo "BLOCKED: WorkBuddy 正在运行；请完全退出后再安装。" >&2
+  exit 1
+fi
+
 CONFIG_PATH="$PROJECT_DIR/config.json"
 if [[ ! -f "$CONFIG_PATH" ]]; then
   umask 077
@@ -24,13 +29,6 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 chmod 600 "$CONFIG_PATH"
 
-echo "==> 创建 Python 3.13 学员端环境"
-"$PYTHON" -m venv "$PROJECT_DIR/venv"
-VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
-"$VENV_PYTHON" "$PROJECT_DIR/scripts/python_preflight.py"
-"$VENV_PYTHON" -m pip install --upgrade pip
-"$VENV_PYTHON" -m pip install -r "$PROJECT_DIR/requirements-macos.txt"
-
 WORKBUDDY_DIR="$HOME/.workbuddy"
 SETTINGS_PATH="$WORKBUDDY_DIR/settings.json"
 HOOK_LINK="$WORKBUDDY_DIR/copilot/hook.py"
@@ -40,7 +38,7 @@ STATE_DIR="$HOME/.workbuddy-copilot"
 STATE_HELPER="$PROJECT_DIR/scripts/macos_install_state.py"
 OWNER_ID="workbuddy-copilot-macos-v1"
 
-TRANSACTION="$("$VENV_PYTHON" "$STATE_HELPER" prepare \
+TRANSACTION="$("$PYTHON" "$STATE_HELPER" prepare \
   --project-root "$PROJECT_DIR" \
   --config "$CONFIG_PATH" \
   --workbuddy-root "$WORKBUDDY_DIR" \
@@ -54,7 +52,7 @@ rollback_install() {
   trap - ERR INT TERM
   if [[ -n "${TRANSACTION:-}" && -f "$TRANSACTION" ]]; then
     local rollback_output
-    if ! rollback_output="$("$VENV_PYTHON" "$STATE_HELPER" rollback \
+    if ! rollback_output="$("$PYTHON" "$STATE_HELPER" rollback \
       --state-dir "$STATE_DIR" \
       --workbuddy-root "$WORKBUDDY_DIR" 2>&1)"; then
       echo "ROLLBACK FAILED: $rollback_output" >&2
@@ -68,15 +66,16 @@ rollback_install() {
 }
 trap rollback_install ERR INT TERM
 
+echo "==> 创建 Python 3.13 学员端环境"
+"$PYTHON" -m venv "$PROJECT_DIR/venv"
+VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
+"$VENV_PYTHON" "$PROJECT_DIR/scripts/python_preflight.py"
+"$VENV_PYTHON" -m pip install --upgrade pip
+"$VENV_PYTHON" -m pip install -r "$PROJECT_DIR/requirements-macos.txt"
+
 mkdir -p "$WORKBUDDY_DIR/copilot" "$COPILOT_SPOOL_DIR"
 chmod 700 "$WORKBUDDY_DIR/copilot" "$COPILOT_SPOOL_DIR"
-if [[ -e "$HOOK_LINK" || -L "$HOOK_LINK" ]]; then
-  if [[ ! -L "$HOOK_LINK" || "$(readlink "$HOOK_LINK")" != "$HOOK_TARGET" ]]; then
-    echo "BLOCKED: $HOOK_LINK 已存在且不属于当前 release；请先用原 release 的 uninstall_macos.sh 卸载。" >&2
-    false
-  fi
-fi
-ln -sfn "$HOOK_TARGET" "$HOOK_LINK"
+ln -s "$HOOK_TARGET" "$HOOK_LINK"
 
 printf -v COPILOT_HOOK_COMMAND '%q %q || true' "$VENV_PYTHON" "$HOOK_TARGET"
 export WORKBUDDY_CONFIG_DIR="$WORKBUDDY_DIR"
@@ -88,7 +87,7 @@ export COPILOT_SPOOL_DIR COPILOT_HOOK_COMMAND
 export COPILOT_ENTRY_OWNER="$OWNER_ID"
 "$VENV_PYTHON" "$PROJECT_DIR/register_hook.py"
 
-MANIFEST="$("$VENV_PYTHON" "$STATE_HELPER" finalize \
+MANIFEST="$("$PYTHON" "$STATE_HELPER" finalize \
   --state-dir "$STATE_DIR" \
   --workbuddy-root "$WORKBUDDY_DIR")"
 trap - ERR INT TERM

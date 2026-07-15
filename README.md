@@ -77,7 +77,7 @@ PYTHON=python3.13 ./install.sh
 ./start_menubar.sh
 ```
 
-安装器会在修改 WorkBuddy hooks 前创建私有原子备份和安装 manifest。停止学员端后可运行 `./uninstall_macos.sh`：只有 manifest 拥有的 hooks 与链接会被移除；`config.json`、venv、spool、日志和备份默认保留。
+安装和卸载前必须完全退出 WorkBuddy。macOS 试点安装器仅支持首次安装：会在修改 venv、依赖或 hooks 前拒绝旧 manifest、事务、Copilot hook 或链接。运行 `./uninstall_macos.sh` 时只从当前 WorkBuddy settings 删除 manifest owner 的 hooks 与链接，不用旧整文件覆盖用户后续改动；`config.json`、venv、spool、日志和私有状态默认保留。
 
 ### 公网部署
 

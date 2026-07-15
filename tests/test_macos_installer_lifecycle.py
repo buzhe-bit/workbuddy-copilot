@@ -233,6 +233,54 @@ def test_install_script_is_student_only_and_uses_manifest_lifecycle() -> None:
     assert "COPILOT_MACOS_STATE_DIR" not in source
     assert "COPILOT_MACOS_STATE_DIR" not in uninstall
     assert "WORKBUDDY_CONFIG_DIR:-" not in source
+    assert source.index('pgrep -x "WorkBuddy"') < source.index(
+        '"$STATE_HELPER" prepare'
+    )
+    assert source.index('"$STATE_HELPER" prepare') < source.index(' -m venv ')
+    assert '"$PYTHON" "$STATE_HELPER" prepare' in source
+    assert uninstall.index('pgrep -x "WorkBuddy"') < uninstall.index(
+        '"$STATE_HELPER" uninstall'
+    )
+
+
+@pytest.mark.parametrize("script_name", ["install.sh", "uninstall_macos.sh"])
+def test_macos_scripts_block_a_running_workbuddy_before_mutation(
+    tmp_path: Path,
+    script_name: str,
+) -> None:
+    deploy = tmp_path / "release"
+    deploy.mkdir()
+    script = deploy / script_name
+    script.write_text(
+        (PROJECT_ROOT / script_name).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    script.chmod(0o755)
+    (deploy / "config.example.json").write_text("{}\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    pgrep = fake_bin / "pgrep"
+    pgrep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    pgrep.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        HOME=str(tmp_path / "home"),
+        PATH=f"{fake_bin}:{env['PATH']}",
+        PYTHON="/usr/bin/true",
+    )
+
+    completed = subprocess.run(
+        ["bash", str(script)],
+        cwd=deploy,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "BLOCKED: WorkBuddy" in completed.stderr
+    assert not (deploy / "config.json").exists()
+    assert not (deploy / "venv").exists()
 
 
 @pytest.mark.parametrize(
@@ -241,7 +289,10 @@ def test_install_script_is_student_only_and_uses_manifest_lifecycle() -> None:
         lambda cfg: cfg["service"].update(public_base_url="http://public.example.com"),
         lambda cfg: cfg["auth"].update(student_token=""),
         lambda cfg: cfg["auth"].update(mentor_token="must-not-reach-student"),
+        lambda cfg: cfg["auth"].update(token="must-not-reach-student"),
         lambda cfg: cfg["auth"].update(student_tokens={"other": "must-not-reach-student"}),
+        lambda cfg: cfg.update(token="must-not-reach-student"),
+        lambda cfg: cfg["service"].update(token="must-not-reach-student"),
         lambda cfg: cfg["llm"].update(api_key="must-not-reach-student"),
     ],
 )
@@ -278,23 +329,99 @@ def test_prepare_rejects_unsafe_student_config_before_state_mutation(
     assert paths["settings"].is_file()
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"COPILOT_ENTRY_OWNER={OWNER_ID} run-hook",
+        "python3 /old-release/copilot/hook.py",
+    ],
+)
+def test_prepare_rejects_preexisting_copilot_hooks(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    paths = _fixture(tmp_path)
+    paths["settings"].write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command": command}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = paths["settings"].read_bytes()
+
+    completed = _run_helper(
+        "prepare",
+        "--project-root",
+        paths["project_root"],
+        "--config",
+        paths["config"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--settings",
+        paths["settings"],
+        "--hook-link",
+        paths["hook_link"],
+        "--spool-dir",
+        paths["spool"],
+        "--state-dir",
+        paths["state"],
+    )
+
+    assert completed.returncode != 0
+    assert "preexisting Copilot hook" in completed.stderr
+    assert paths["settings"].read_bytes() == before
+    assert not paths["state"].exists()
+
+
+def test_prepare_rejects_preexisting_same_target_hook_link(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    paths["hook_link"].parent.mkdir(parents=True)
+    paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
+
+    completed = _run_helper(
+        "prepare",
+        "--project-root",
+        paths["project_root"],
+        "--config",
+        paths["config"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--settings",
+        paths["settings"],
+        "--hook-link",
+        paths["hook_link"],
+        "--spool-dir",
+        paths["spool"],
+        "--state-dir",
+        paths["state"],
+    )
+
+    assert completed.returncode != 0
+    assert "hook link already exists" in completed.stderr
+    assert paths["hook_link"].is_symlink()
+    assert not paths["state"].exists()
+
+
 def test_prepare_finalize_and_changed_settings_uninstall_are_manifest_scoped(
     tmp_path: Path,
 ) -> None:
     paths = _fixture(tmp_path)
     transaction = _prepare(paths)
-    transaction_payload = json.loads(transaction.read_text(encoding="utf-8"))
-    baseline = Path(transaction_payload["baseline_backup_path"])
-    rollback = Path(transaction_payload["rollback_path"])
 
     assert _mode(paths["config"]) == 0o600
     assert _mode(paths["state"]) == 0o700
-    assert _mode(transaction) == _mode(baseline) == _mode(rollback) == 0o600
+    assert _mode(transaction) == 0o600
     assert not (paths["state"] / "installer-manifest.json").exists()
 
-    paths["settings"].write_text(
-        json.dumps(_installed_settings(), ensure_ascii=False), encoding="utf-8"
-    )
+    installed = _installed_settings()
+    installed["user_change_during_install"] = True
+    paths["settings"].write_text(json.dumps(installed, ensure_ascii=False), encoding="utf-8")
     paths["hook_link"].parent.mkdir(parents=True, exist_ok=True)
     paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
     finalized = _run_helper(
@@ -311,10 +438,10 @@ def test_prepare_finalize_and_changed_settings_uninstall_are_manifest_scoped(
     assert manifest["owner_id"] == OWNER_ID
     assert _mode(manifest_path) == 0o600
     assert not transaction.exists()
-    assert not rollback.exists()
     assert "student-secret-for-test" not in manifest_path.read_text(encoding="utf-8")
 
     changed = _installed_settings()
+    changed["user_change_during_install"] = True
     changed["user_change_after_install"] = True
     paths["settings"].write_text(json.dumps(changed, ensure_ascii=False), encoding="utf-8")
 
@@ -337,23 +464,124 @@ def test_prepare_finalize_and_changed_settings_uninstall_are_manifest_scoped(
     ]
     assert "echo unrelated" in commands
     assert not any(OWNER_ID in command for command in commands)
+    assert restored["user_change_during_install"] is True
     assert restored["user_change_after_install"] is True
     assert not paths["hook_link"].exists()
-    assert baseline.is_file() and _mode(baseline) == 0o600
+    assert not list(paths["state"].glob("*baseline*"))
+    assert not list(paths["state"].glob(".settings-rollback-*"))
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["uninstalled_at"]
 
 
-def test_install_failure_rollback_restores_exact_settings_and_owned_link(
+def test_uninstall_preserves_change_made_between_prepare_and_finalize(
     tmp_path: Path,
 ) -> None:
     paths = _fixture(tmp_path)
-    before = paths["settings"].read_bytes()
-    transaction = _prepare(paths)
-    transaction_payload = json.loads(transaction.read_text(encoding="utf-8"))
-    baseline = Path(transaction_payload["baseline_backup_path"])
-    rollback = Path(transaction_payload["rollback_path"])
+    _prepare(paths)
+    installed = _installed_settings()
+    installed["added_between_prepare_and_finalize"] = True
+    paths["settings"].write_text(json.dumps(installed), encoding="utf-8")
+    paths["hook_link"].parent.mkdir(parents=True, exist_ok=True)
+    paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
+    finalized = _run_helper(
+        "finalize",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+    )
+    assert finalized.returncode == 0, finalized.stderr
 
+    uninstalled = _run_helper(
+        "uninstall",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--project-root",
+        paths["project_root"],
+    )
+
+    assert uninstalled.returncode == 0, uninstalled.stderr
+    restored = json.loads(paths["settings"].read_text(encoding="utf-8"))
+    assert restored["added_between_prepare_and_finalize"] is True
+
+
+def test_uninstall_keeps_new_settings_file_when_it_contains_unrelated_data(
+    tmp_path: Path,
+) -> None:
+    paths = _fixture(tmp_path)
+    paths["settings"].unlink()
+    _prepare(paths)
     paths["settings"].write_text(json.dumps(_installed_settings()), encoding="utf-8")
+    paths["hook_link"].parent.mkdir(parents=True, exist_ok=True)
+    paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
+    finalized = _run_helper(
+        "finalize",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+    )
+    assert finalized.returncode == 0, finalized.stderr
+
+    uninstalled = _run_helper(
+        "uninstall",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--project-root",
+        paths["project_root"],
+    )
+
+    assert uninstalled.returncode == 0, uninstalled.stderr
+    restored = json.loads(paths["settings"].read_text(encoding="utf-8"))
+    assert restored["theme"] == "dark"
+    commands = [
+        hook["command"]
+        for blocks in restored.get("hooks", {}).values()
+        for block in blocks
+        for hook in block.get("hooks", [])
+    ]
+    assert commands == ["echo unrelated"]
+
+
+@pytest.mark.parametrize("missing_event", ["Stop", "UserPromptSubmit"])
+def test_finalize_requires_owned_hook_for_both_events(
+    tmp_path: Path,
+    missing_event: str,
+) -> None:
+    paths = _fixture(tmp_path)
+    transaction = _prepare(paths)
+    installed = _installed_settings()
+    installed["hooks"].pop(missing_event)
+    paths["settings"].write_text(json.dumps(installed), encoding="utf-8")
+    paths["hook_link"].parent.mkdir(parents=True, exist_ok=True)
+    paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
+
+    completed = _run_helper(
+        "finalize",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+    )
+
+    assert completed.returncode != 0
+    assert missing_event in completed.stderr
+    assert transaction.is_file()
+    assert not (paths["state"] / "installer-manifest.json").exists()
+
+
+def test_install_failure_rollback_removes_only_owned_state(
+    tmp_path: Path,
+) -> None:
+    paths = _fixture(tmp_path)
+    transaction = _prepare(paths)
+
+    changed = _installed_settings()
+    changed["user_change_during_install"] = True
+    paths["settings"].write_text(json.dumps(changed), encoding="utf-8")
     paths["hook_link"].parent.mkdir(parents=True, exist_ok=True)
     paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
 
@@ -366,11 +594,20 @@ def test_install_failure_rollback_restores_exact_settings_and_owned_link(
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert paths["settings"].read_bytes() == before
+    restored = json.loads(paths["settings"].read_text(encoding="utf-8"))
+    commands = [
+        hook["command"]
+        for blocks in restored.get("hooks", {}).values()
+        for block in blocks
+        for hook in block.get("hooks", [])
+    ]
+    assert restored["user_change_during_install"] is True
+    assert "echo unrelated" in commands
+    assert not any(OWNER_ID in command for command in commands)
     assert not paths["hook_link"].exists()
     assert not transaction.exists()
-    assert not rollback.exists()
-    assert not baseline.exists()
+    assert not list(paths["state"].glob("*baseline*"))
+    assert not list(paths["state"].glob(".settings-rollback-*"))
 
 
 def test_uninstall_rejects_manifest_from_another_project(tmp_path: Path) -> None:
@@ -464,6 +701,65 @@ def test_prepare_rejects_workbuddy_hook_directory_symlink(tmp_path: Path) -> Non
     assert not paths["state"].exists()
 
 
+def test_prepare_rejects_project_copilot_directory_symlink(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    copilot_dir = paths["project_root"] / "copilot"
+    external = tmp_path / "external-copilot"
+    copilot_dir.rename(external)
+    copilot_dir.symlink_to(external, target_is_directory=True)
+
+    completed = _run_helper(
+        "prepare",
+        "--project-root",
+        paths["project_root"],
+        "--config",
+        paths["config"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--settings",
+        paths["settings"],
+        "--hook-link",
+        paths["hook_link"],
+        "--spool-dir",
+        paths["spool"],
+        "--state-dir",
+        paths["state"],
+    )
+
+    assert completed.returncode != 0
+    assert "copilot/hook.py" in completed.stderr
+    assert "symlink" in completed.stderr.lower()
+    assert not paths["state"].exists()
+
+
+def test_finalize_rejects_project_copilot_directory_replaced_by_symlink(
+    tmp_path: Path,
+) -> None:
+    paths = _fixture(tmp_path)
+    transaction = _prepare(paths)
+    copilot_dir = paths["project_root"] / "copilot"
+    external = tmp_path / "external-copilot"
+    copilot_dir.rename(external)
+    copilot_dir.symlink_to(external, target_is_directory=True)
+    paths["settings"].write_text(json.dumps(_installed_settings()), encoding="utf-8")
+    paths["hook_link"].parent.mkdir(parents=True, exist_ok=True)
+    paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
+
+    completed = _run_helper(
+        "finalize",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+    )
+
+    assert completed.returncode != 0
+    assert "hook_target_path" in completed.stderr
+    assert "symlink" in completed.stderr.lower()
+    assert transaction.is_file()
+    assert not (paths["state"] / "installer-manifest.json").exists()
+
+
 def test_prepare_blocks_reinstall_until_the_installed_release_is_uninstalled(
     tmp_path: Path,
 ) -> None:
@@ -506,6 +802,54 @@ def test_prepare_blocks_reinstall_until_the_installed_release_is_uninstalled(
     assert paths["hook_link"].is_symlink()
     assert Path(os.readlink(paths["hook_link"])) == paths["project_root"] / "copilot" / "hook.py"
     assert not transaction.exists()
+
+
+def test_prepare_rejects_even_an_uninstalled_manifest(tmp_path: Path) -> None:
+    paths = _fixture(tmp_path)
+    _prepare(paths)
+    paths["settings"].write_text(json.dumps(_installed_settings()), encoding="utf-8")
+    paths["hook_link"].parent.mkdir(parents=True, exist_ok=True)
+    paths["hook_link"].symlink_to(paths["project_root"] / "copilot" / "hook.py")
+    finalized = _run_helper(
+        "finalize",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+    )
+    assert finalized.returncode == 0, finalized.stderr
+    uninstalled = _run_helper(
+        "uninstall",
+        "--state-dir",
+        paths["state"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--project-root",
+        paths["project_root"],
+    )
+    assert uninstalled.returncode == 0, uninstalled.stderr
+
+    completed = _run_helper(
+        "prepare",
+        "--project-root",
+        paths["project_root"],
+        "--config",
+        paths["config"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--settings",
+        paths["settings"],
+        "--hook-link",
+        paths["hook_link"],
+        "--spool-dir",
+        paths["spool"],
+        "--state-dir",
+        paths["state"],
+    )
+
+    assert completed.returncode != 0
+    assert "fresh-install-only" in completed.stderr
+    assert not (paths["state"] / ".install-transaction.json").exists()
 
 
 def test_uninstall_rejects_manifest_paths_outside_trusted_workbuddy_root(

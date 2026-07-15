@@ -12,6 +12,11 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 
+if pgrep -x "WorkBuddy" >/dev/null 2>&1; then
+  echo "BLOCKED: WorkBuddy 正在运行；请完全退出后再卸载。" >&2
+  exit 1
+fi
+
 if [[ -x "$PROJECT_DIR/venv/bin/python" ]]; then
   PYTHON="$PROJECT_DIR/venv/bin/python"
 else

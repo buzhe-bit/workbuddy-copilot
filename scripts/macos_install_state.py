@@ -58,6 +58,16 @@ def _inside(child: Path, parent: Path) -> bool:
     return True
 
 
+def _assert_real_child(child: Path, parent: Path, name: str) -> None:
+    try:
+        resolved_child = child.resolve(strict=True)
+        resolved_parent = parent.resolve(strict=True)
+    except OSError as exc:
+        raise InstallStateError(f"{name} cannot be resolved safely") from exc
+    if not _inside(resolved_child, resolved_parent):
+        raise InstallStateError(f"{name} escapes its trusted root")
+
+
 def _assert_private(path: Path, name: str) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
@@ -119,23 +129,24 @@ def _write_json_atomically(path: Path, payload: Mapping[str, Any]) -> None:
     _write_bytes_atomically(path, _json_bytes(payload), mode=0o600)
 
 
-def _read_mapping(path: Path, name: str) -> dict[str, Any]:
+def _read_mapping_snapshot(path: Path, name: str) -> tuple[dict[str, Any], bytes]:
     _require_file(path, name)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise InstallStateError(f"{name} is unreadable or invalid JSON") from exc
     if not isinstance(payload, dict):
         raise InstallStateError(f"{name} must contain a JSON object")
-    return payload
+    return payload, raw
+
+
+def _read_mapping(path: Path, name: str) -> dict[str, Any]:
+    return _read_mapping_snapshot(path, name)[0]
 
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
-
-
-def _sha256_file(path: Path) -> str:
-    return _sha256_bytes(path.read_bytes())
 
 
 def _validate_student_config(path: Path, project_root: Path) -> None:
@@ -163,6 +174,8 @@ def _validate_student_config(path: Path, project_root: Path) -> None:
         raise InstallStateError(
             "student service.public_base_url must be a credential-free HTTPS URL"
         )
+    if str(service.get("token") or "").strip():
+        raise InstallStateError("legacy service.token must not be sent to a student")
 
     auth = config.get("auth")
     if not isinstance(auth, dict) or str(auth.get("mode") or "").lower() != "pilot":
@@ -176,6 +189,8 @@ def _validate_student_config(path: Path, project_root: Path) -> None:
         auth.get("token") or ""
     ).strip():
         raise InstallStateError("mentor or legacy shared tokens must not be sent to a student")
+    if str(config.get("token") or "").strip():
+        raise InstallStateError("legacy root token must not be sent to a student")
     mapped_tokens = auth.get("student_tokens", {})
     if not isinstance(mapped_tokens, dict) or mapped_tokens:
         raise InstallStateError("server-side student token mappings must not be sent to a student")
@@ -227,6 +242,21 @@ def _remove_owned_hooks(
     return cleaned
 
 
+def _require_owned_hooks(settings: Mapping[str, Any]) -> None:
+    _remove_owned_hooks(settings, include_legacy=False)
+    hooks = settings.get("hooks")
+    marker = f"COPILOT_ENTRY_OWNER={OWNER_ID}"
+    for event in ("UserPromptSubmit", "Stop"):
+        blocks = hooks.get(event, []) if isinstance(hooks, dict) else []
+        found = any(
+            marker in str(entry.get("command") or "")
+            for block in blocks
+            for entry in block.get("hooks", [])
+        )
+        if not found:
+            raise InstallStateError(f"required owned {event} hook is missing")
+
+
 def _validate_layout(
     payload: Mapping[str, Any],
     *,
@@ -245,7 +275,6 @@ def _validate_layout(
                 "hook_target_path",
                 "spool_dir",
                 "state_dir",
-                "baseline_backup_path",
                 "manifest_path",
                 "transaction_path",
             )
@@ -253,6 +282,7 @@ def _validate_layout(
     except KeyError as exc:
         raise InstallStateError("installer state is missing a required path") from exc
     _require_directory(paths["project_root"], "project_root")
+    _assert_no_symlink_chain(paths["project_root"], "project_root")
     if paths["state_dir"] != trusted_state_dir:
         raise InstallStateError("installer state directory does not match the CLI path")
     if paths["workbuddy_root"] != trusted_workbuddy_root:
@@ -261,12 +291,16 @@ def _validate_layout(
     _assert_no_symlink_chain(paths["workbuddy_root"], "trusted WorkBuddy root")
     _assert_no_symlink_chain(paths["hook_link_path"].parent, "WorkBuddy hook directory")
     _assert_no_symlink_chain(paths["spool_dir"], "WorkBuddy spool directory")
+    _assert_no_symlink_chain(paths["hook_target_path"], "hook_target_path")
     _require_file(paths["config_path"], "config_path")
     _require_file(paths["hook_target_path"], "hook_target_path")
     if not _inside(paths["config_path"], paths["project_root"]):
         raise InstallStateError("config_path escapes project_root")
     if paths["hook_target_path"] != paths["project_root"] / "copilot" / "hook.py":
         raise InstallStateError("hook_target_path is not owned by this release")
+    _assert_real_child(
+        paths["hook_target_path"], paths["project_root"], "hook_target_path"
+    )
     expected_workbuddy = paths["workbuddy_root"]
     if paths["settings_path"] != expected_workbuddy / "settings.json":
         raise InstallStateError("settings_path escapes the trusted WorkBuddy root")
@@ -274,16 +308,11 @@ def _validate_layout(
         raise InstallStateError("hook_link_path is not the owned WorkBuddy link")
     if paths["spool_dir"] != expected_workbuddy / "copilot" / "spool":
         raise InstallStateError("spool_dir is not the owned WorkBuddy spool")
-    if paths["baseline_backup_path"].parent != paths["state_dir"]:
-        raise InstallStateError("baseline backup escapes state_dir")
     install_id = str(payload.get("install_id") or "")
     if len(install_id) != 32 or any(
         character not in "0123456789abcdef" for character in install_id
     ):
         raise InstallStateError("installer state has an invalid install_id")
-    expected_baseline = paths["state_dir"] / f"settings-baseline-{install_id}.json"
-    if paths["baseline_backup_path"] != expected_baseline:
-        raise InstallStateError("baseline backup is not owned by this install")
     if paths["manifest_path"] != paths["state_dir"] / "installer-manifest.json":
         raise InstallStateError("manifest_path is not owned by state_dir")
     if paths["transaction_path"] != paths["state_dir"] / ".install-transaction.json":
@@ -300,10 +329,12 @@ def _prepare(args: argparse.Namespace) -> int:
     spool_dir = _require_absolute(args.spool_dir, "spool_dir")
     state_dir = _require_absolute(args.state_dir, "state_dir")
     _require_directory(project_root, "project_root")
-    hook_target_path = project_root / "copilot" / "hook.py"
-    _require_file(hook_target_path, "copilot/hook.py")
-    _validate_student_config(config_path, project_root)
     _assert_no_symlink_chain(project_root, "project_root")
+    hook_target_path = project_root / "copilot" / "hook.py"
+    _assert_no_symlink_chain(hook_target_path, "copilot/hook.py")
+    _require_file(hook_target_path, "copilot/hook.py")
+    _assert_real_child(hook_target_path, project_root, "copilot/hook.py")
+    _validate_student_config(config_path, project_root)
     _assert_no_symlink_chain(workbuddy_root, "trusted WorkBuddy root")
     _assert_no_symlink_chain(hook_link_path.parent, "WorkBuddy hook directory")
     _assert_no_symlink_chain(spool_dir, "WorkBuddy spool directory")
@@ -318,50 +349,36 @@ def _prepare(args: argparse.Namespace) -> int:
         raise InstallStateError("hook link must stay under the WorkBuddy config directory")
     if spool_dir != workbuddy_root / "copilot" / "spool":
         raise InstallStateError("spool directory must stay under the WorkBuddy config directory")
-    if state_dir.is_symlink():
-        raise InstallStateError("private state directory must not be a symlink")
+    if state_dir.exists() and not state_dir.is_dir():
+        raise InstallStateError("private state path must be a directory")
+    manifest_path = state_dir / "installer-manifest.json"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        raise InstallStateError(
+            "fresh-install-only: installer manifest already exists; run the old "
+            "release's uninstall_macos.sh if installed, then archive its state"
+        )
+    transaction_path = state_dir / ".install-transaction.json"
+    if transaction_path.exists() or transaction_path.is_symlink():
+        raise InstallStateError("an unfinished macOS install transaction already exists")
+    if hook_link_path.exists() or hook_link_path.is_symlink():
+        raise InstallStateError("fresh-install-only: WorkBuddy hook link already exists")
+
+    settings_existed = settings_path.exists()
+    settings_payload = (
+        _read_mapping(settings_path, "WorkBuddy settings") if settings_existed else {}
+    )
+    if _remove_owned_hooks(settings_payload, include_legacy=True) != settings_payload:
+        raise InstallStateError(
+            "fresh-install-only: preexisting Copilot hook must be removed first"
+        )
 
     os.chmod(config_path, 0o600)
     _assert_private(config_path, "config.json")
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(state_dir, 0o700)
     _assert_private(state_dir, "private state directory")
-    manifest_path = state_dir / "installer-manifest.json"
-    if manifest_path.exists() or manifest_path.is_symlink():
-        existing_manifest = _read_owned_state(
-            manifest_path,
-            "installer manifest",
-            path_field="manifest_path",
-        )
-        if existing_manifest.get("status") == "installed":
-            raise InstallStateError(
-                "this Mac already has an installed release; run that release's "
-                "uninstall_macos.sh before installing again"
-            )
-        if existing_manifest.get("status") != "uninstalled":
-            raise InstallStateError("installer manifest status is unsupported")
-    transaction_path = state_dir / ".install-transaction.json"
-    if transaction_path.exists() or transaction_path.is_symlink():
-        raise InstallStateError("an unfinished macOS install transaction already exists")
-
-    settings_existed = settings_path.exists()
-    settings_bytes = settings_path.read_bytes() if settings_existed else b"{}\n"
-    settings_mode = (
-        stat.S_IMODE(settings_path.stat().st_mode) if settings_existed else 0o600
-    )
-    try:
-        settings_payload = json.loads(settings_bytes.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise InstallStateError("WorkBuddy settings are not valid UTF-8 JSON") from exc
-    if not isinstance(settings_payload, dict):
-        raise InstallStateError("WorkBuddy settings must contain a JSON object")
-    baseline_payload = _remove_owned_hooks(settings_payload, include_legacy=True)
 
     install_id = uuid.uuid4().hex
-    baseline_path = state_dir / f"settings-baseline-{install_id}.json"
-    rollback_path = state_dir / f".settings-rollback-{install_id}.json"
-    _write_json_atomically(baseline_path, baseline_payload)
-    _write_bytes_atomically(rollback_path, settings_bytes, mode=0o600)
     transaction = {
         "schema_version": SCHEMA_VERSION,
         "owner_id": OWNER_ID,
@@ -372,17 +389,10 @@ def _prepare(args: argparse.Namespace) -> int:
         "workbuddy_root": str(workbuddy_root),
         "settings_path": str(settings_path),
         "settings_existed": settings_existed,
-        "settings_mode": settings_mode,
-        "settings_before_sha256": (
-            _sha256_bytes(settings_bytes) if settings_existed else None
-        ),
         "hook_link_path": str(hook_link_path),
         "hook_target_path": str(hook_target_path),
         "spool_dir": str(spool_dir),
         "state_dir": str(state_dir),
-        "baseline_backup_path": str(baseline_path),
-        "baseline_backup_sha256": _sha256_file(baseline_path),
-        "rollback_path": str(rollback_path),
         "manifest_path": str(manifest_path),
         "transaction_path": str(transaction_path),
     }
@@ -432,22 +442,10 @@ def _finalize(args: argparse.Namespace) -> int:
         trusted_state_dir=state_dir,
         trusted_workbuddy_root=workbuddy_root,
     )
-    rollback_path = _require_absolute(str(transaction.get("rollback_path")), "rollback_path")
-    if rollback_path.parent != paths["state_dir"]:
-        raise InstallStateError("rollback path escapes state_dir")
-    expected_rollback = (
-        paths["state_dir"]
-        / f'.settings-rollback-{transaction["install_id"]}.json'
+    settings, settings_bytes = _read_mapping_snapshot(
+        paths["settings_path"], "installed WorkBuddy settings"
     )
-    if rollback_path != expected_rollback:
-        raise InstallStateError("rollback backup is not owned by this install")
-    _require_file(paths["settings_path"], "installed WorkBuddy settings")
-    _require_file(paths["baseline_backup_path"], "baseline backup")
-    _assert_private(paths["baseline_backup_path"], "baseline backup")
-    if _sha256_file(paths["baseline_backup_path"]) != transaction.get(
-        "baseline_backup_sha256"
-    ):
-        raise InstallStateError("baseline backup hash mismatch")
+    _require_owned_hooks(settings)
     if not _owned_link_matches(paths["hook_link_path"], paths["hook_target_path"]):
         raise InstallStateError("owned WorkBuddy hook link is missing or changed")
     manifest = {key: value for key, value in transaction.items() if key != "prepared_at"}
@@ -455,7 +453,7 @@ def _finalize(args: argparse.Namespace) -> int:
         {
             "status": "installed",
             "installed_at": _utc_now(),
-            "settings_after_sha256": _sha256_file(paths["settings_path"]),
+            "settings_after_sha256": _sha256_bytes(settings_bytes),
         }
     )
     # Transform the one transaction file into the installed manifest with a
@@ -464,7 +462,6 @@ def _finalize(args: argparse.Namespace) -> int:
     os.replace(transaction_path, paths["manifest_path"])
     os.chmod(paths["manifest_path"], 0o600)
     _fsync_directory(paths["state_dir"])
-    rollback_path.unlink(missing_ok=True)
     print(paths["manifest_path"])
     return 0
 
@@ -475,6 +472,22 @@ def _remove_owned_link(link: Path, target: Path) -> bool:
         _fsync_directory(link.parent)
         return True
     return False
+
+
+def _remove_owned_settings(path: Path, *, settings_existed: bool) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "settings_missing"
+    current = _read_mapping(path, "WorkBuddy settings")
+    cleaned = _remove_owned_hooks(current, include_legacy=False)
+    if not settings_existed and not cleaned:
+        path.unlink()
+        _fsync_directory(path.parent)
+        return "created_empty_settings_removed"
+    if cleaned == current:
+        return "owned_hooks_absent"
+    mode = stat.S_IMODE(path.stat().st_mode)
+    _write_bytes_atomically(path, _json_bytes(cleaned), mode=mode)
+    return "owned_hooks_removed"
 
 
 def _rollback(args: argparse.Namespace) -> int:
@@ -491,46 +504,11 @@ def _rollback(args: argparse.Namespace) -> int:
         trusted_state_dir=state_dir,
         trusted_workbuddy_root=workbuddy_root,
     )
-    rollback_path = _require_absolute(str(transaction.get("rollback_path")), "rollback_path")
-    if rollback_path.parent != paths["state_dir"]:
-        raise InstallStateError("rollback path escapes state_dir")
-    expected_rollback = (
-        paths["state_dir"]
-        / f'.settings-rollback-{transaction["install_id"]}.json'
+    _remove_owned_settings(
+        paths["settings_path"],
+        settings_existed=bool(transaction.get("settings_existed")),
     )
-    if rollback_path != expected_rollback:
-        raise InstallStateError("rollback backup is not owned by this install")
-    _require_file(rollback_path, "rollback backup")
-    _assert_private(rollback_path, "rollback backup")
-    _require_file(paths["baseline_backup_path"], "baseline backup")
-    _assert_private(paths["baseline_backup_path"], "baseline backup")
-    if _sha256_file(paths["baseline_backup_path"]) != transaction.get(
-        "baseline_backup_sha256"
-    ):
-        raise InstallStateError("baseline backup hash mismatch")
-    if paths["settings_path"].exists():
-        current = _read_mapping(paths["settings_path"], "WorkBuddy settings")
-        cleaned = _remove_owned_hooks(current, include_legacy=False)
-        baseline = _read_mapping(paths["baseline_backup_path"], "baseline backup")
-        if _json_bytes(cleaned) == _json_bytes(baseline):
-            if bool(transaction.get("settings_existed")):
-                _write_bytes_atomically(
-                    paths["settings_path"],
-                    rollback_path.read_bytes(),
-                    mode=int(transaction.get("settings_mode", 0o600)),
-                )
-            else:
-                paths["settings_path"].unlink(missing_ok=True)
-                _fsync_directory(paths["settings_path"].parent)
-        else:
-            _write_bytes_atomically(
-                paths["settings_path"],
-                _json_bytes(cleaned),
-                mode=stat.S_IMODE(paths["settings_path"].stat().st_mode),
-            )
     _remove_owned_link(paths["hook_link_path"], paths["hook_target_path"])
-    paths["baseline_backup_path"].unlink(missing_ok=True)
-    rollback_path.unlink(missing_ok=True)
     transaction_path.unlink(missing_ok=True)
     _fsync_directory(paths["state_dir"])
     print("macOS install transaction rolled back")
@@ -559,38 +537,10 @@ def _uninstall(args: argparse.Namespace) -> int:
         return 0
     if manifest.get("status") != "installed":
         raise InstallStateError("installer manifest status is unsupported")
-    _require_file(paths["baseline_backup_path"], "baseline backup")
-    _assert_private(paths["baseline_backup_path"], "baseline backup")
-    if _sha256_file(paths["baseline_backup_path"]) != manifest.get(
-        "baseline_backup_sha256"
-    ):
-        raise InstallStateError("baseline backup hash mismatch")
-
-    rollback_result = "settings_missing"
-    if paths["settings_path"].exists():
-        _require_file(paths["settings_path"], "WorkBuddy settings")
-        current_hash = _sha256_file(paths["settings_path"])
-        if current_hash == manifest.get("settings_after_sha256"):
-            if bool(manifest.get("settings_existed")):
-                _write_bytes_atomically(
-                    paths["settings_path"],
-                    paths["baseline_backup_path"].read_bytes(),
-                    mode=int(manifest.get("settings_mode", 0o600)),
-                )
-                rollback_result = "baseline_restored"
-            else:
-                paths["settings_path"].unlink()
-                _fsync_directory(paths["settings_path"].parent)
-                rollback_result = "created_settings_removed"
-        else:
-            current = _read_mapping(paths["settings_path"], "WorkBuddy settings")
-            cleaned = _remove_owned_hooks(current, include_legacy=False)
-            _write_bytes_atomically(
-                paths["settings_path"],
-                _json_bytes(cleaned),
-                mode=stat.S_IMODE(paths["settings_path"].stat().st_mode),
-            )
-            rollback_result = "owned_hooks_removed"
+    rollback_result = _remove_owned_settings(
+        paths["settings_path"],
+        settings_existed=bool(manifest.get("settings_existed")),
+    )
 
     hook_link_removed = _remove_owned_link(
         paths["hook_link_path"], paths["hook_target_path"]
