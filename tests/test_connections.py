@@ -148,3 +148,31 @@ def test_send_timeout_and_exception_remove_dead_sockets_without_blocking_others(
         assert ok_float in registry.floats["student-a"]
 
     asyncio.run(scenario())
+
+
+def test_pilot_capacity_routes_50_students_to_25_mentors_without_cross_delivery():
+    async def scenario():
+        registry = WSRegistry(send_timeout=0.1)
+        mentors = [FakeWebSocket() for _ in range(25)]
+        floats = {f"student-{index}": FakeWebSocket() for index in range(50)}
+        for mentor in mentors:
+            registry.register_mentor(mentor)
+        for student_id, socket in floats.items():
+            registry.register_float(student_id, socket)
+
+        payloads = [
+            {
+                "type": "analysis",
+                "student_id": student_id,
+                "report_id": index + 1,
+            }
+            for index, student_id in enumerate(floats)
+        ]
+        await asyncio.gather(*(registry.handle_event(payload) for payload in payloads))
+
+        assert registry.connection_counts() == (50, 25)
+        assert all(len(mentor.sent) == 50 for mentor in mentors)
+        for student_id, socket in floats.items():
+            assert [item["student_id"] for item in socket.sent] == [student_id]
+
+    asyncio.run(scenario())

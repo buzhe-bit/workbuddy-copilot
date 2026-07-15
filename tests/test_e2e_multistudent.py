@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
+import httpx
 from fastapi.testclient import TestClient
 
 from copilot.app_context import AppContext
@@ -270,3 +272,47 @@ def test_report_flow_keeps_students_sessions_and_delete_cascade_isolated(tmp_pat
             headers=_auth_headers(),
         ).json()["items"]
         assert any(item["content"] == "diagnosis-b" for item in remaining_timeline)
+
+
+def test_pilot_capacity_accepts_50_students_while_25_mentors_read(tmp_path):
+    async def scenario():
+        app, store = _build_test_app(tmp_path)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=_auth_headers(),
+        ) as client:
+            reports = [
+                client.post(
+                    "/report",
+                    json={
+                        "student_id": f"student-{index:02d}",
+                        "session_id": f"session-{index:02d}",
+                        "event": "UserPromptSubmit",
+                        "event_id": f"capacity-event-{index:02d}",
+                        "prompt": f"capacity prompt {index:02d}",
+                    },
+                )
+                for index in range(50)
+            ]
+            mentor_reads = [client.get("/api/mentor/students") for _ in range(25)]
+            responses = await asyncio.gather(*reports, *mentor_reads)
+
+            assert all(response.status_code in {200, 202} for response in responses)
+            final_reads = await asyncio.gather(
+                *(client.get("/api/mentor/students") for _ in range(25))
+            )
+
+        assert all(response.status_code == 200 for response in final_reads)
+        expected_ids = {f"student-{index:02d}" for index in range(50)}
+        assert all(
+            {item["student_id"] for item in response.json()["items"]} == expected_ids
+            for response in final_reads
+        )
+        with store._conn() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 50
+            assert conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0] == 50
+            assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 50
+
+    asyncio.run(scenario())
