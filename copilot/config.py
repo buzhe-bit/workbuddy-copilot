@@ -62,7 +62,7 @@ def load_config(path: Path | str | None = None) -> dict:
     with cfg_path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
     cfg = _resolve_env(_expand(raw))
-    cfg.setdefault("llm", {}).setdefault("summary_model", "deepseek-v3-0324")
+    cfg.setdefault("llm", {}).setdefault("summary_model", "deepseek-chat")
     auth_cfg = cfg.setdefault("auth", {})
     auth_mode = str(auth_cfg.get("mode", "") or "").lower()
     if auth_mode in {"", "local", "demo"}:

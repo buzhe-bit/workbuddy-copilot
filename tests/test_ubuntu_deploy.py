@@ -105,3 +105,37 @@ def test_runbook_has_backup_health_gate_and_rollback():
     assert "Connection.backup" in runbook
     assert "curl --fail" in runbook
     assert "PREVIOUS_RELEASE" in runbook
+
+
+def test_first_deploy_installs_systemd_unit_before_starting_service():
+    runbook = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    assert runbook.index("deploy/workbuddy-copilot.service") < runbook.index(
+        "sudo systemctl start workbuddy-copilot"
+    )
+
+
+def test_manual_preflight_runs_as_service_account():
+    runbook = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+    preflight_block = runbook.rsplit('"$DEST/deploy/preflight.sh"', 1)[0].rsplit(
+        "\n\n", 1
+    )[-1]
+
+    assert "sudo -u workbuddy-copilot" in preflight_block
+
+
+def test_runbook_warns_about_nginx_prefix_shadowing_and_requires_real_llm_smoke():
+    runbook = (DEPLOY_DIR / "README.md").read_text(encoding="utf-8")
+
+    assert "location ^~ /" in runbook
+    assert "model" in runbook
+    assert "fallback" in runbook
+
+
+def test_pilot_runbook_uses_systemd_writable_database_path():
+    runbook = (PROJECT_ROOT / "docs" / "pilot-runbook.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"db_path": "/var/lib/workbuddy-copilot/copilot.db"' in runbook
+    assert '"db_path": "/srv/workbuddy-copilot/data/copilot.db"' not in runbook

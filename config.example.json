@@ -22,7 +22,7 @@
     "provider": "deepseek",
     "api_base": "https://api.deepseek.com/v1",
     "model": "deepseek-chat",
-    "summary_model": "deepseek-v3-0324",
+    "summary_model": "deepseek-chat",
     "api_key_env": "DEEPSEEK_API_KEY",
     "timeout": 30,
     "max_tokens": 600

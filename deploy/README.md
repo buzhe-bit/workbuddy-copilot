@@ -27,10 +27,14 @@ git archive "$RELEASE" | sudo tar -x -C "$DEST"
 sudo python3.13 -m venv "$DEST/venv"
 sudo "$DEST/venv/bin/pip" install --requirement "$DEST/requirements-server.txt"
 sudo chmod +x "$DEST/start_service.sh" "$DEST/deploy/preflight.sh"
-sudo env COPILOT_CONFIG=/etc/workbuddy-copilot/config.json \
+sudo -u workbuddy-copilot env COPILOT_CONFIG=/etc/workbuddy-copilot/config.json \
   PYTHON_BIN="$DEST/venv/bin/python" \
   WORKBUDDY_RELEASES_DIR=/srv/workbuddy-copilot/releases \
   "$DEST/deploy/preflight.sh"
+
+sudo install -m 0644 "$DEST/deploy/workbuddy-copilot.service" /etc/systemd/system/workbuddy-copilot.service
+sudo systemctl daemon-reload
+sudo systemctl enable workbuddy-copilot
 ```
 
 ## 3. 备份、切换与健康门禁
@@ -79,13 +83,7 @@ PY
 sudo systemctl start workbuddy-copilot
 ```
 
-## 4. systemd 与现有 Nginx 站点
-
-```bash
-sudo install -m 0644 "$DEST/deploy/workbuddy-copilot.service" /etc/systemd/system/workbuddy-copilot.service
-sudo systemctl daemon-reload
-sudo systemctl enable workbuddy-copilot
-```
+## 4. 现有 Nginx 站点
 
 在现有 HTTPS `server {}` 中加入：
 
@@ -93,10 +91,12 @@ sudo systemctl enable workbuddy-copilot
 include /srv/workbuddy-copilot/current/deploy/nginx-server.inc;
 ```
 
-该 include 仅代理 Copilot 路由，不接管 `/`、`/developer-guide` 和 `/images`。最后执行：
+该 include 仅代理 Copilot 路由，不接管 `/`、`/developer-guide` 和 `/images`。先用 `sudo nginx -T` 检查原站点；如果已有 `location ^~ /`，它会遮蔽 include 中的正则路由，不能盲目 reload。最后执行：
 
 ```bash
 sudo nginx -t
 sudo systemctl reload nginx
 curl --fail https://workbuddy-copilot.superbrain-ai.com/health
 ```
+
+`/health` 只证明进程存活，不证明真实 LLM 可用。正式交给学员前，用一个试点 student token 提交脱敏 `Stop` 事件，再用同一 token 轮询 `/recent`；诊断必须完成，`model` 不能是 `fallback`，且应有 `prompt_hash` 和 `latency_ms`。token 不得写入命令历史或日志。

@@ -51,7 +51,7 @@ class TestLoadConfig:
         }))
         cfg = load_config(cfg_file)
         assert cfg["student_id"] == "test"
-        assert cfg["llm"]["summary_model"] == "deepseek-v3-0324"
+        assert cfg["llm"]["summary_model"] == "deepseek-chat"
         assert cfg["service"]["analysis_max_concurrency"] == 2
         # 相对路径相对于 config 文件所在目录
         assert os.path.isabs(cfg["store"]["db_path"])

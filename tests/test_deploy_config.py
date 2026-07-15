@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from copilot.llm import DEFAULT_SUMMARY_MODEL
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -189,3 +191,8 @@ def test_example_config_documents_public_auth_shape():
     assert cfg["auth"]["student_tokens"] == {}
     assert "mentor_token" in cfg["auth"]
     assert cfg["service"]["public_base_url"] == ""
+    assert cfg["llm"]["summary_model"] == cfg["llm"]["model"] == "deepseek-chat"
+
+
+def test_deepseek_summary_fallback_uses_supported_chat_model():
+    assert DEFAULT_SUMMARY_MODEL == "deepseek-chat"

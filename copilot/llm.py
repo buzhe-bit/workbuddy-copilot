@@ -103,7 +103,7 @@ REPLY_SUMMARY_SYSTEM_PROMPT = (
     "说明AI主要做了什么/给了什么答案，不含代码/工具细节，中文。"
 )
 
-DEFAULT_SUMMARY_MODEL = "deepseek-v3-0324"
+DEFAULT_SUMMARY_MODEL = "deepseek-chat"
 
 STUDENT_ASK_FALLBACK = (
     "我已经记录你的问题。当前 Copilot 的 LLM 未启用或暂时不可用，"

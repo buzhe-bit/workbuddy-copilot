@@ -30,7 +30,7 @@
     "mentor_token": "<independent-mentor-token>"
   },
   "store": {
-    "db_path": "/srv/workbuddy-copilot/data/copilot.db"
+    "db_path": "/var/lib/workbuddy-copilot/copilot.db"
   }
 }
 ```
