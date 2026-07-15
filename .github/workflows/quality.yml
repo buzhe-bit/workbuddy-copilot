@@ -245,6 +245,7 @@ jobs:
             throw 'hosted W1 status was not derived as blocked'
           }
           Write-Host "::warning::BLOCKED: Windows W0/W1 real-machine evidence is still missing. Hosted green is only an implementation candidate."
+          exit 0
       - name: Upload W1 gate status
         uses: actions/upload-artifact@v4
         with:

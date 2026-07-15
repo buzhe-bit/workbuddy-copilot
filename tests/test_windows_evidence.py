@@ -541,6 +541,7 @@ def test_windows_quality_lane_packages_schema_and_derives_hosted_blocked_status(
     assert "validate_windows_evidence.py" in blocked
     assert "--hosted-ci" in blocked
     assert "$validationStatus -ne 2" in blocked
+    assert "exit 0" in blocked
     assert 'status = "BLOCKED"' not in blocked
     assert blocked.count("[System.IO.File]::WriteAllText(") == 1
 
