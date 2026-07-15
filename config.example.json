@@ -42,5 +42,11 @@
   },
   "store": {
     "db_path": "~/.workbuddy-copilot/copilot.db"
+  },
+  "windows_rollout": {
+    "evidence_path": "~/.workbuddy-copilot/windows-w1-evidence.json",
+    "expected_commit": "",
+    "expected_build": "",
+    "expected_runner_id": ""
   }
 }
