@@ -80,19 +80,19 @@ def browser():
 def page(browser):
     ctx = browser.new_context()
     pg = ctx.new_page()
+
+    def asset_handler(body, content_type):
+        def handle(route):
+            route.fulfill(body=body, content_type=content_type)
+        return handle
+
     for name, content_type in {
         "index.html": "text/html; charset=utf-8",
         "app.js": "application/javascript; charset=utf-8",
         "style.css": "text/css; charset=utf-8",
     }.items():
         body = (MENTOR_DIR / name).read_text(encoding="utf-8")
-        pg.route(
-            f"{STATIC_ORIGIN}/{name}*",
-            lambda route, body=body, content_type=content_type: route.fulfill(
-                body=body,
-                content_type=content_type,
-            ),
-        )
+        pg.route(f"{STATIC_ORIGIN}/{name}*", asset_handler(body, content_type))
     # 收集页面报错（如 XSS 脚本注入执行会在此暴露）
     pg._console_errors = []
     pg.on("pageerror", lambda exc: pg._console_errors.append(str(exc)))
