@@ -213,6 +213,10 @@ def test_register_hook_accepts_an_explicit_windows_config_and_verified_command(
             "COPILOT_HOOK_COMMAND": command,
             "COPILOT_STUDENT_ID": "student-9",
             "COPILOT_SPOOL_DIR": str(tmp_path / "spool"),
+            # Windows PowerShell 5.1 launches this helper with a legacy
+            # console encoding.  All status output must remain best-effort;
+            # registration itself must not fail on Chinese messages.
+            "PYTHONIOENCODING": "cp1252",
         }
     )
 

@@ -15,6 +15,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+
+def _make_status_output_best_effort() -> None:
+    """Keep registration working when the Windows console cannot encode status text."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(errors="backslashreplace")
+
+
+_make_status_output_best_effort()
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 HOOK_SCRIPT = PROJECT_ROOT / "copilot" / "hook.py"
 
