@@ -48,7 +48,7 @@ async def _fake_llm(config, snap, event, latest_prompt):
     }
 
 
-def _build_test_app(tmp_path):
+def _build_test_app(tmp_path, *, llm_analyzer=_fake_llm, analysis_max_concurrency=2):
     store = Store(tmp_path / "copilot.db")
     bus = EventBus()
     registry = WSRegistry(send_timeout=0.05)
@@ -57,11 +57,12 @@ def _build_test_app(tmp_path):
         "student_id": "mentor-host",
         "student_name": "Mentor Host",
         "auth": {"token": TOKEN},
+        "service": {"analysis_max_concurrency": analysis_max_concurrency},
     }
     context = AppContext(
         config=config,
         store=store,
-        analysis_svc=AnalysisService(store, _fake_llm, config, bus),
+        analysis_svc=AnalysisService(store, llm_analyzer, config, bus),
         session_svc=SessionQueryService(store, config),
         message_svc=MessageService(store, bus),
         bus=bus,
@@ -314,5 +315,72 @@ def test_pilot_capacity_accepts_50_students_while_25_mentors_read(tmp_path):
             assert conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0] == 50
             assert conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0] == 50
             assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 50
+
+    asyncio.run(scenario())
+
+
+def test_pilot_capacity_completes_50_stop_analyses_with_bounded_llm_concurrency(
+    tmp_path,
+):
+    async def scenario():
+        active = 0
+        max_active = 0
+
+        async def bounded_llm(_config, _snap, _event, latest_prompt):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.002)
+                return {
+                    "topic": latest_prompt,
+                    "understanding": "high",
+                    "severity": "info",
+                    "diagnosis": "capacity diagnosis",
+                    "suggestion": "continue",
+                }
+            finally:
+                active -= 1
+
+        app, store = _build_test_app(
+            tmp_path,
+            llm_analyzer=bounded_llm,
+            analysis_max_concurrency=4,
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=_auth_headers(),
+        ) as client:
+            responses = await asyncio.gather(*(
+                client.post(
+                    "/report",
+                    json={
+                        "student_id": f"student-{index:02d}",
+                        "session_id": f"session-{index:02d}",
+                        "event": "Stop",
+                        "event_id": f"capacity-stop-{index:02d}",
+                        "prompt": f"capacity stop {index:02d}",
+                        "transcript_tail": _line({
+                            "type": "message",
+                            "role": "user",
+                            "content": f"student-{index:02d} context",
+                        }),
+                    },
+                )
+                for index in range(50)
+            ))
+
+        assert all(response.status_code == 202 for response in responses)
+        assert max_active == 4
+        with store._conn() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM analyses").fetchone()[0] == 50
+            assert conn.execute(
+                "SELECT COUNT(*) FROM reports WHERE analysis_status = 'done'"
+            ).fetchone()[0] == 50
+            assert conn.execute(
+                "SELECT COUNT(*) FROM reports WHERE analysis_status != 'done'"
+            ).fetchone()[0] == 0
 
     asyncio.run(scenario())
