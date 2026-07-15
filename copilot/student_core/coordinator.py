@@ -682,13 +682,16 @@ class StudentCoordinator:
             raise ValueError("upload command lock must not be a symlink")
         try:
             connection = sqlite3.connect(lock_db, timeout=0, isolation_level=None)
+            # The schema creation must be inside the same transaction as the
+            # mutex.  Two first-use Windows processes can otherwise race in
+            # autocommit DDL and both abandon the claim attempt.
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS completed_commands (
                    request_key TEXT PRIMARY KEY,
                    completed_at_ns INTEGER NOT NULL
                 )"""
             )
-            connection.execute("BEGIN IMMEDIATE")
             return connection
         except sqlite3.Error:
             if "connection" in locals():

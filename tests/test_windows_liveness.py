@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import start_student_agent
 
+from copilot.student_core import process_liveness as process_liveness_module
 from copilot.student_core.models import HookEvent
 from copilot.student_core.process_liveness import (
     FileClaimStore,
@@ -370,6 +371,55 @@ def test_concurrent_agents_have_exactly_one_claim_winner(tmp_path: Path) -> None
     assert sorted(results) == [False, True]
     claim = json.loads((tmp_path / ".race.claim").read_text())
     assert claim["identity"]["owner_token"] in {"agent-a", "agent-b"}
+
+
+def test_failed_claim_write_closes_handle_before_windows_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FileClaimStore(
+        tmp_path,
+        process_identity=_identity("writer"),
+        process_liveness=_FixedLiveness(),
+    )
+    claim_path = store.path_for("failed-write")
+    open_claim_fds: set[int] = set()
+    real_open = os.open
+    real_close = os.close
+    real_fsync = os.fsync
+    real_unlink = Path.unlink
+
+    def tracked_open(path, flags, mode=0o777):
+        fd = real_open(path, flags, mode)
+        if Path(path) == claim_path:
+            open_claim_fds.add(fd)
+        return fd
+
+    def tracked_close(fd: int) -> None:
+        try:
+            real_close(fd)
+        finally:
+            open_claim_fds.discard(fd)
+
+    def fail_claim_fsync(fd: int) -> None:
+        if fd in open_claim_fds:
+            raise OSError("simulated claim fsync failure")
+        real_fsync(fd)
+
+    def windows_unlink(self: Path, *args, **kwargs):
+        if self == claim_path and open_claim_fds:
+            raise PermissionError("Windows denies deletion while the claim handle is open")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(process_liveness_module.os, "open", tracked_open)
+    monkeypatch.setattr(process_liveness_module.os, "close", tracked_close)
+    monkeypatch.setattr(process_liveness_module.os, "fsync", fail_claim_fsync)
+    monkeypatch.setattr(Path, "unlink", windows_unlink)
+
+    with pytest.raises(OSError, match="claim fsync"):
+        store._write_claim(claim_path)
+
+    assert claim_path.exists() is False
 
 
 def test_repair_requires_exact_identity_owner_and_nonempty_reason(tmp_path: Path) -> None:

@@ -701,18 +701,27 @@ class FileClaimStore:
         ).encode("ascii")
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         created_stat = os.fstat(fd)
+        write_failed = False
         try:
             _write_all(fd, payload)
             os.fsync(fd)
         except BaseException:
-            try:
-                if os.path.samestat(created_stat, path.lstat()):
-                    path.unlink()
-            except OSError:
-                pass
+            write_failed = True
             raise
         finally:
-            os.close(fd)
+            try:
+                os.close(fd)
+            finally:
+                # Windows does not allow deleting a CRT-opened file.  Close
+                # first, then revalidate the named inode before removing a
+                # partially written claim.
+                if write_failed:
+                    try:
+                        if os.path.samestat(created_stat, path.lstat()):
+                            path.unlink()
+                            _fsync_directory(self.directory)
+                    except OSError:
+                        pass
         _fsync_directory(self.directory)
 
     def _still_matches(self, path: Path, observed: _ObservedClaim) -> bool:
