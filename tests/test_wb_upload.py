@@ -6,6 +6,7 @@ import sqlite3
 
 from copilot import wb_upload
 from copilot.student_platform.workbuddy import TranscriptReadResult, WorkBuddySession
+from copilot.student_platform.windows import WindowsTranscriptScanner
 from copilot.models import UploadOutcome
 
 
@@ -129,8 +130,20 @@ def test_filter_jsonl_keeps_legacy_user_home_expansion(monkeypatch, tmp_path):
     jsonl = tmp_path / "legacy.jsonl"
     message = _line({"type": "message", "content": "still expands home"})
     jsonl.write_text(message, encoding="utf-8")
+    monkeypatch.setattr(
+        wb_upload.Path,
+        "expanduser",
+        lambda self: tmp_path / "windows-userprofile" / self.name,
+    )
 
     assert wb_upload.filter_message_jsonl("~/legacy.jsonl") == message
+
+
+def test_default_transcript_scanner_selects_windows_safe_backend() -> None:
+    scanner = wb_upload._transcript_scanner_for_platform("nt")
+
+    assert isinstance(scanner, WindowsTranscriptScanner)
+    assert wb_upload._transcript_scanner_for_platform("posix") is None
 
 
 def test_content_sha256_is_deterministic_for_filtered_content():

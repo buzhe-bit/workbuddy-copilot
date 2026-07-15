@@ -22,6 +22,7 @@ from typing import Any
 from . import wb_sync
 from .models import UploadOutcome, normalize_event_id
 from .student_platform.workbuddy import (
+    TranscriptScanner,
     WorkBuddyDataAdapter,
     filter_message_jsonl as _filter_message_jsonl,
     filter_message_jsonl_text,
@@ -73,6 +74,14 @@ def transcript_path_for_session(
 def filter_message_jsonl(path: str | os.PathLike[str]) -> str:
     """Compatibility wrapper over the platform adapter's JSONL filter."""
     return _filter_message_jsonl(path)
+
+
+def _transcript_scanner_for_platform(platform_name: str) -> TranscriptScanner | None:
+    if platform_name != "nt":
+        return None
+    from .student_platform.windows import WindowsTranscriptScanner
+
+    return WindowsTranscriptScanner()
 
 
 def content_sha256(content: str | bytes | bytearray) -> str:
@@ -233,6 +242,7 @@ def upload_conversations(
             Path(db_path).expanduser().parent,
             database_path=db_path,
             projects_dir=projects_dir,
+            transcript_scanner=_transcript_scanner_for_platform(os.name),
         )
         sessions = read_sessions(db_path)
     else:

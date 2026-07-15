@@ -190,9 +190,26 @@ def _workspace_name(workspace: dict[str, Any]) -> str:
     return _directory_name(str(workspace.get("path") or ""))
 
 
+def _expand_legacy_user_path(path: str | os.PathLike[str]) -> Path:
+    """Honor the legacy HOME contract even when Windows prefers USERPROFILE."""
+
+    raw_path = os.fspath(path)
+    home = os.environ.get("HOME")
+    if isinstance(raw_path, str) and home:
+        if raw_path == "~":
+            return Path(home)
+        if raw_path.startswith(("~/", "~\\")):
+            return Path(home) / raw_path[2:]
+    return Path(path).expanduser()
+
+
 def filter_message_jsonl(path: str | os.PathLike[str]) -> str:
     """Keep only original top-level ``message`` lines from a transcript."""
-    with Path(path).expanduser().open("r", encoding="utf-8", errors="replace") as handle:
+    with _expand_legacy_user_path(path).open(
+        "r",
+        encoding="utf-8",
+        errors="replace",
+    ) as handle:
         return filter_message_jsonl_text(handle.read())
 
 
