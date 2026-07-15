@@ -20,6 +20,13 @@ def test_start_service_allows_public_host_override_without_editing_script():
     assert "--host 127.0.0.1" not in script
 
 
+def test_start_service_reads_llm_label_from_effective_config():
+    script = (PROJECT_ROOT / "start_service.sh").read_text(encoding="utf-8")
+
+    assert "from copilot.config import load_config" in script
+    assert 'open("config.json")' not in script
+
+
 def _run_start_service(tmp_path: Path, worker_env: dict[str, str]):
     deploy_dir = tmp_path / "deploy"
     deploy_dir.mkdir()

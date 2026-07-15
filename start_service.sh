@@ -29,7 +29,7 @@ COPILOT_HOST="${COPILOT_HOST:-127.0.0.1}"
 COPILOT_PORT="${COPILOT_PORT:-8765}"
 
 echo "启动 Copilot 分析服务 http://$COPILOT_HOST:$COPILOT_PORT"
-echo "  LLM: $(python3 -c 'import json; c=json.load(open("config.json")); print(c["llm"]["provider"], c["llm"]["model"])')"
+echo "  LLM: $(python3 -c 'from copilot.config import load_config; c=load_config(); print(c["llm"]["provider"], c["llm"]["model"])')"
 if [ "${COPILOT_PUBLIC:-}" = "1" ]; then
   echo "  公网模式: 请确认已设置 COPILOT_STUDENT_TOKEN 和 COPILOT_MENTOR_TOKEN，并在反向代理上启用 HTTPS/WSS"
 fi
