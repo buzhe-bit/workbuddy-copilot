@@ -431,6 +431,9 @@ def test_cli_can_seal_runner_output_before_validating(tmp_path: Path) -> None:
     payload["evidence_sha256"] = "0" * 64
     path.write_text(json.dumps(payload), encoding="utf-8")
     script = PROJECT_ROOT / "scripts" / "validate_windows_evidence.py"
+    env = os.environ.copy()
+    env.pop("GITHUB_ACTIONS", None)
+    env.pop("RUNNER_ENVIRONMENT", None)
 
     completed = subprocess.run(
         [
@@ -449,6 +452,7 @@ def test_cli_can_seal_runner_output_before_validating(tmp_path: Path) -> None:
             "--seal",
         ],
         cwd=PROJECT_ROOT,
+        env=env,
         text=True,
         capture_output=True,
         check=False,
