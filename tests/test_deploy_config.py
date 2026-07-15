@@ -127,9 +127,10 @@ def test_hook_installation_injects_local_spool_and_short_deadline():
     install = (PROJECT_ROOT / "install.sh").read_text(encoding="utf-8")
     register = (PROJECT_ROOT / "register_hook.py").read_text(encoding="utf-8")
 
-    for script in (install, register):
-        assert "COPILOT_SPOOL_DIR" in script
-        assert '"timeout": 2' in script
+    assert "COPILOT_SPOOL_DIR" in install
+    assert "register_hook.py" in install
+    assert "COPILOT_SPOOL_DIR" in register
+    assert '"timeout": 2' in register
 
 
 def test_hook_is_standalone_and_does_not_import_core_or_network():

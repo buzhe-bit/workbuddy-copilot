@@ -56,16 +56,28 @@ Windows: Tk UI + Windows adapter (implementation candidate; W0/W1 rollout blocke
 python3.13 -m venv venv
 venv/bin/python scripts/python_preflight.py
 venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
-./install.sh
 ./start_service.sh
-./start_menubar.sh  # macOS 原生浮标 + 常驻 Hook spool 投递
 ```
 
 release Python 合同由 [`pyproject.toml`](pyproject.toml) 固定为 `>=3.13,<3.14`，
 [`.python-version`](.python-version) 提供 3.13 选择提示；测试与浏览器工具统一由
 [`requirements-dev.txt`](requirements-dev.txt) 安装。
 
-本地导师台地址为 `http://127.0.0.1:8765/mentor/`。`install.sh` 在 macOS 上安装 hook 并把 Hook spool 放在学员本机；它不把 WorkBuddy 数据位置配置给服务端。
+本地导师台地址为 `http://127.0.0.1:8765/mentor/`。
+
+### macOS 学员端试点
+
+`install.sh` 是学员端安装器：强制 Python 3.13，只安装 `requirements-macos.txt`，不会启动本地服务或要求 LLM 密钥。先复制并填写 `config.json`：只写入本学员的 `student_id`、HTTPS `service.public_base_url` 和 `auth.student_token`，设置 `auth.mode=pilot`、`allow_shared_student_token=false`，保持 `mentor_token`、`student_tokens` 和 `llm.api_key` 为空。
+
+```bash
+cp config.example.json config.json
+chmod 600 config.json
+# 填写上述学员字段
+PYTHON=python3.13 ./install.sh
+./start_menubar.sh
+```
+
+安装器会在修改 WorkBuddy hooks 前创建私有原子备份和安装 manifest。停止学员端后可运行 `./uninstall_macos.sh`：只有 manifest 拥有的 hooks 与链接会被移除；`config.json`、venv、spool、日志和备份默认保留。
 
 ### 公网部署
 
@@ -75,7 +87,7 @@ release Python 合同由 [`pyproject.toml`](pyproject.toml) 固定为 `>=3.13,<3
 - 示例：`COPILOT_PUBLIC=1 COPILOT_HOST=0.0.0.0 ./start_service.sh`。真实公网运行仍需要外部反向代理提供 TLS。
 - 导师使用受保护的 `GET /api/mentor/system-status` 观察待分析、失败分析、未处理关注项和 WS 连接数。
 
-Windows 不应执行 macOS 安装或浮标命令。安装、卸载、W0/W1 取证和回滚命令见 [试点运行手册](docs/pilot-runbook.md)。
+Windows 不应执行 macOS 安装或浮标命令。两端安装、卸载、W0/W1 取证和回滚命令见 [试点运行手册](docs/pilot-runbook.md)。
 
 ## 主要接口
 

@@ -66,14 +66,25 @@
 
 ## 5. macOS 学员端
 
+安装前由运营方为每位学员准备唯一 `student_id`、HTTPS `service.public_base_url` 和对应的唯一 student token。学员机 `config.json` 设置 `auth.mode=pilot`、`allow_shared_student_token=false`，只填写本学员的 `auth.student_token`；`mentor_token`、`student_tokens`、旧 `auth.token` 和 `llm.api_key` 必须为空。
+
 ```bash
-python3.13 -m venv venv
-venv/bin/python -m pip install -r requirements.txt
-./install.sh
+cp config.example.json config.json
+chmod 600 config.json
+# 填写上面的学员字段，不写导师 token 或 LLM key
+PYTHON=python3.13 ./install.sh
 ./start_menubar.sh
 ```
 
-实机必验：Hook 事件上报、浮标展示一次、导师消息渲染后才送达、断网恢复、进程重启、休眠唤醒。回滚前先停止学员端，再用安装前备份恢复 WorkBuddy hook 配置。
+安装器强制 Python 3.13，只安装 macOS 学员端依赖，并在改 WorkBuddy settings 前将去除旧 Copilot hooks 的基线原子写入 `~/.workbuddy-copilot/`；config、备份和 manifest 仅当前用户可读。实机必验：Hook 事件上报、浮标展示一次、导师消息渲染后才送达、断网恢复、进程重启、休眠唤醒。
+
+回滚前先停止学员端，再运行：
+
+```bash
+./uninstall_macos.sh
+```
+
+卸载器只处理 manifest 拥有的 hooks 和 hook 链接；若 WorkBuddy settings 在安装后被用户修改，只移除当前 owner 条目而不覆盖其他改动。为避免误删学员证据，`config.json`、venv、spool、日志和私有备份默认保留。
 
 ## 6. Windows 学员端
 
