@@ -330,6 +330,11 @@ def _prepare(args: argparse.Namespace) -> int:
     state_dir = _require_absolute(args.state_dir, "state_dir")
     _require_directory(project_root, "project_root")
     _assert_no_symlink_chain(project_root, "project_root")
+    venv_path = project_root / "venv"
+    if venv_path.exists() or venv_path.is_symlink():
+        raise InstallStateError(
+            "fresh-install-only: project venv already exists and will not be reused"
+        )
     hook_target_path = project_root / "copilot" / "hook.py"
     _assert_no_symlink_chain(hook_target_path, "copilot/hook.py")
     _require_file(hook_target_path, "copilot/hook.py")

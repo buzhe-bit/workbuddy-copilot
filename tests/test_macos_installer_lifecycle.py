@@ -233,20 +233,32 @@ def test_install_script_is_student_only_and_uses_manifest_lifecycle() -> None:
     assert "COPILOT_MACOS_STATE_DIR" not in source
     assert "COPILOT_MACOS_STATE_DIR" not in uninstall
     assert "WORKBUDDY_CONFIG_DIR:-" not in source
-    assert source.index('pgrep -x "WorkBuddy"') < source.index(
+    assert "pgrep" not in source
+    assert "pgrep" not in uninstall
+    assert 'application "WorkBuddy" is running' in source
+    assert 'application "WorkBuddy" is running' in uninstall
+    assert source.index("osascript") < source.index(
         '"$STATE_HELPER" prepare'
     )
     assert source.index('"$STATE_HELPER" prepare') < source.index(' -m venv ')
+    assert source.index(' -m venv ') < source.index(' -m pip ')
     assert '"$PYTHON" "$STATE_HELPER" prepare' in source
-    assert uninstall.index('pgrep -x "WorkBuddy"') < uninstall.index(
+    assert uninstall.index("osascript") < uninstall.index(
         '"$STATE_HELPER" uninstall'
     )
 
 
 @pytest.mark.parametrize("script_name", ["install.sh", "uninstall_macos.sh"])
-def test_macos_scripts_block_a_running_workbuddy_before_mutation(
+@pytest.mark.parametrize(
+    ("probe_output", "probe_exit", "blocked"),
+    [("true", 0, True), ("false", 0, False), ("probe error", 23, True)],
+)
+def test_macos_scripts_use_bundle_aware_workbuddy_gate(
     tmp_path: Path,
     script_name: str,
+    probe_output: str,
+    probe_exit: int,
+    blocked: bool,
 ) -> None:
     deploy = tmp_path / "release"
     deploy.mkdir()
@@ -258,13 +270,18 @@ def test_macos_scripts_block_a_running_workbuddy_before_mutation(
     (deploy / "config.example.json").write_text("{}\n", encoding="utf-8")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    pgrep = fake_bin / "pgrep"
-    pgrep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    pgrep.chmod(0o755)
+    osascript = fake_bin / "osascript"
+    osascript.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$PROBE_OUTPUT\"\nexit \"$PROBE_EXIT\"\n",
+        encoding="utf-8",
+    )
+    osascript.chmod(0o755)
     env = os.environ.copy()
     env.update(
         HOME=str(tmp_path / "home"),
         PATH=f"{fake_bin}:{env['PATH']}",
+        PROBE_EXIT=str(probe_exit),
+        PROBE_OUTPUT=probe_output,
         PYTHON="/usr/bin/true",
     )
 
@@ -277,9 +294,17 @@ def test_macos_scripts_block_a_running_workbuddy_before_mutation(
         check=False,
     )
 
-    assert completed.returncode != 0
-    assert "BLOCKED: WorkBuddy" in completed.stderr
-    assert not (deploy / "config.json").exists()
+    if blocked:
+        assert completed.returncode != 0
+        assert "BLOCKED: WorkBuddy" in completed.stderr
+        assert not (deploy / "config.json").exists()
+    else:
+        assert "BLOCKED: WorkBuddy" not in completed.stderr
+        if script_name == "install.sh":
+            assert completed.returncode == 2
+            assert (deploy / "config.json").is_file()
+        else:
+            assert completed.returncode == 0
     assert not (deploy / "venv").exists()
 
 
@@ -406,6 +431,57 @@ def test_prepare_rejects_preexisting_same_target_hook_link(tmp_path: Path) -> No
     assert "hook link already exists" in completed.stderr
     assert paths["hook_link"].is_symlink()
     assert not paths["state"].exists()
+
+
+@pytest.mark.parametrize(
+    "artifact_kind",
+    ["directory", "file", "symlink", "broken_symlink"],
+)
+def test_prepare_rejects_and_preserves_any_preexisting_venv(
+    tmp_path: Path,
+    artifact_kind: str,
+) -> None:
+    paths = _fixture(tmp_path)
+    venv = paths["project_root"] / "venv"
+    if artifact_kind == "directory":
+        venv.mkdir()
+    elif artifact_kind == "file":
+        venv.write_bytes(b"must-survive")
+    elif artifact_kind == "symlink":
+        venv.symlink_to(paths["project_root"] / "copilot", target_is_directory=True)
+    else:
+        venv.symlink_to(paths["project_root"] / "missing-venv", target_is_directory=True)
+    symlink_target = os.readlink(venv) if venv.is_symlink() else None
+
+    completed = _run_helper(
+        "prepare",
+        "--project-root",
+        paths["project_root"],
+        "--config",
+        paths["config"],
+        "--workbuddy-root",
+        paths["workbuddy"],
+        "--settings",
+        paths["settings"],
+        "--hook-link",
+        paths["hook_link"],
+        "--spool-dir",
+        paths["spool"],
+        "--state-dir",
+        paths["state"],
+    )
+
+    assert completed.returncode != 0
+    assert "venv" in completed.stderr
+    assert _mode(paths["config"]) == 0o644
+    assert not paths["state"].exists()
+    if artifact_kind == "directory":
+        assert venv.is_dir() and not venv.is_symlink()
+    elif artifact_kind == "file":
+        assert venv.read_bytes() == b"must-survive"
+    else:
+        assert venv.is_symlink()
+        assert os.readlink(venv) == symlink_target
 
 
 def test_prepare_finalize_and_changed_settings_uninstall_are_manifest_scoped(

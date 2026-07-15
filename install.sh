@@ -13,10 +13,21 @@ if ! command -v "$PYTHON" >/dev/null 2>&1; then
 fi
 "$PYTHON" "$PROJECT_DIR/scripts/python_preflight.py"
 
-if pgrep -x "WorkBuddy" >/dev/null 2>&1; then
-  echo "BLOCKED: WorkBuddy 正在运行；请完全退出后再安装。" >&2
+if ! WORKBUDDY_RUNNING="$(osascript -e 'application "WorkBuddy" is running' 2>/dev/null)"; then
+  echo "BLOCKED: WorkBuddy 运行状态探测失败；已按安全默认停止安装。" >&2
   exit 1
 fi
+case "$WORKBUDDY_RUNNING" in
+  true)
+    echo "BLOCKED: WorkBuddy 正在运行；请完全退出后再安装。" >&2
+    exit 1
+    ;;
+  false) ;;
+  *)
+    echo "BLOCKED: WorkBuddy 运行状态返回未知结果；已按安全默认停止安装。" >&2
+    exit 1
+    ;;
+esac
 
 CONFIG_PATH="$PROJECT_DIR/config.json"
 if [[ ! -f "$CONFIG_PATH" ]]; then

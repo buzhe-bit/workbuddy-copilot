@@ -12,10 +12,21 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 
-if pgrep -x "WorkBuddy" >/dev/null 2>&1; then
-  echo "BLOCKED: WorkBuddy 正在运行；请完全退出后再卸载。" >&2
+if ! WORKBUDDY_RUNNING="$(osascript -e 'application "WorkBuddy" is running' 2>/dev/null)"; then
+  echo "BLOCKED: WorkBuddy 运行状态探测失败；已按安全默认停止卸载。" >&2
   exit 1
 fi
+case "$WORKBUDDY_RUNNING" in
+  true)
+    echo "BLOCKED: WorkBuddy 正在运行；请完全退出后再卸载。" >&2
+    exit 1
+    ;;
+  false) ;;
+  *)
+    echo "BLOCKED: WorkBuddy 运行状态返回未知结果；已按安全默认停止卸载。" >&2
+    exit 1
+    ;;
+esac
 
 if [[ -x "$PROJECT_DIR/venv/bin/python" ]]; then
   PYTHON="$PROJECT_DIR/venv/bin/python"
