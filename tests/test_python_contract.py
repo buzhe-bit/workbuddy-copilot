@@ -5,6 +5,8 @@ import subprocess
 import sys
 import tomllib
 
+from copilot import __version__
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PREFLIGHT = PROJECT_ROOT / "scripts" / "python_preflight.py"
@@ -14,6 +16,7 @@ def test_project_metadata_declares_the_release_python_range():
     metadata = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert metadata["project"]["requires-python"] == ">=3.13,<3.14"
+    assert metadata["project"]["version"] == __version__
     assert metadata["tool"]["setuptools"]["packages"]["find"]["include"] == ["copilot*"]
 
 
