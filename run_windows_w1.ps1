@@ -89,6 +89,13 @@ $currentCommit = (& git -C $ProjectRoot rev-parse HEAD).Trim().ToLowerInvariant(
 if ($LASTEXITCODE -ne 0 -or $currentCommit -ne $ExpectedCommit) {
     throw "git rev-parse HEAD does not match ExpectedCommit"
 }
+$worktreeStatus = @(& git -C $ProjectRoot status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) {
+    throw 'git status failed while validating the W1 source tree'
+}
+if (@($worktreeStatus | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -ne 0) {
+    throw 'W1 requires a clean source tree with no tracked or untracked changes'
+}
 
 $pythonVersion = (& py -3.13 -c 'import platform; print(platform.python_version())').Trim()
 if ($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^3\.13\.[0-9]+$') {

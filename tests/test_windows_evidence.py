@@ -468,6 +468,8 @@ def test_w1_runner_and_probe_capture_verifiable_current_build_metadata() -> None
         "BuildId",
         "RunnerId",
         "git rev-parse HEAD",
+        "status --porcelain",
+        "--untracked-files=normal",
         "-3.13",
         'windows and real_machine',
         "critical_skip_count",
