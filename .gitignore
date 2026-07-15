@@ -5,6 +5,9 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.coverage
+coverage.json
+htmlcov/
 .superpowers/
 .DS_Store
 config.json

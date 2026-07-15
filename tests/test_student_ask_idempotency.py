@@ -25,6 +25,9 @@ from copilot.student_core.transport import (
 )
 
 
+pytestmark = [pytest.mark.windows, pytest.mark.critical]
+
+
 async def _unused_analysis(config, snap, event, latest_prompt):
     raise AssertionError("analysis LLM is not part of student ask recovery")
 

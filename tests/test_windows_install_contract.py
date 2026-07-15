@@ -53,15 +53,18 @@ def test_windows_installer_uses_explicit_variables_and_atomic_settings_backup() 
         "ProfilePath",
         "StudentId",
         "GitBashHookCommand",
-        "Start-Process",
+        "Register-ScheduledTask",
+        "Stop-ScheduledTask",
+        "Start-ScheduledTask",
         "requirements-windows.txt",
-        "-m venv",
-        "Move-Item -LiteralPath $temporaryBackup -Destination $backupPath",
+        "Invoke-Python313 @('-m', 'venv', $venvStagingDir)",
+        "Write-JsonAtomically $baselineBackupPath $baselineObject",
         "if ($LASTEXITCODE -ne 0)",
         "COPILOT_SPOOL_DIR",
         "COPILOT_STUDENT_ID",
     ):
         assert required in script
+    assert "Start-Process" not in script
     assert "LOCALAPPDATA\\Programs\\WorkBuddy" not in script
     assert "python3" not in script
     assert "C:\\Users\\" not in script
@@ -100,10 +103,11 @@ def test_windows_installer_passes_verified_profile_and_runtime_state_explicitly(
     assert "[Parameter(Mandatory = $true)] [string]$ProfilePath" in script
     assert "Require-File $ProfilePath 'ProfilePath'" in script
     assert "[string]$StateDir = ''" in script
-    assert "--platform', 'windows'" in script
-    assert "--state-dir', $StateDir" in script
-    assert "--workbuddy-config-dir', $ConfigDir" in script
-    assert "--workbuddy-profile', $ProfilePath" in script
+    assert "state_dir = $StateDir" in script
+    assert "workbuddy_config_dir = $ConfigDir" in script
+    assert "workbuddy_profile = $ProfilePath" in script
+    assert "'--config'" in script
+    assert "$runtimeConfigPath" in script
     assert "$env:COPILOT_WINDOWS_WORKBUDDY_PROFILE = $ProfilePath" in script
 
 
@@ -150,8 +154,10 @@ def test_windows_hosted_ci_runs_the_real_non_w1_lane_and_emits_w1_blocked_artifa
         "tests/test_windows_liveness.py",
         "tests/test_windows_runtime.py",
         "tests/test_windows_workbuddy_integration.py",
+        "tests/test_student_ask_idempotency.py",
         "tests/test_hook_subprocess.py",
         "tests/component/test_windows_student_runtime.py",
+        "tests/component/test_windows_client_runtime.py",
     ):
         assert test_path in windows_section
     for shared_core_path in (
@@ -169,7 +175,8 @@ def test_windows_hosted_ci_runs_the_real_non_w1_lane_and_emits_w1_blocked_artifa
     assert "windows-latest" in windows_section
     assert "w1-evidence.json" in w1_section
     assert "BLOCKED" in w1_section
-    assert "real-machine evidence missing" in w1_section
+    assert "validate_windows_evidence.py" in w1_section
+    assert "missing-real-machine-evidence.json" in w1_section
     assert "actions/upload-artifact@v4" in w1_section
 
 

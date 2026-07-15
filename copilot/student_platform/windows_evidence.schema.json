@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://workbuddy-copilot.local/schemas/windows-w1-evidence-v1.json",
+  "title": "WorkBuddy Copilot Windows W1 evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_level",
+    "commit_sha",
+    "build_id",
+    "generated_at",
+    "execution_environment",
+    "platform",
+    "python_version",
+    "workbuddy",
+    "critical_skip_count",
+    "tests",
+    "artifacts",
+    "evidence_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "evidence_level": {"const": "W1"},
+    "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "build_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "generated_at": {"type": "string", "minLength": 20, "maxLength": 64},
+    "execution_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "runner_id", "machine_id_sha256"],
+      "properties": {
+        "kind": {"const": "self_hosted_windows"},
+        "runner_id": {"type": "string", "minLength": 1, "maxLength": 160},
+        "machine_id_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "version", "architecture"],
+      "properties": {
+        "os": {"const": "Windows"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 160},
+        "architecture": {"enum": ["AMD64", "ARM64", "x86_64", "aarch64"]}
+      }
+    },
+    "python_version": {"type": "string", "pattern": "^3\\.13\\.[0-9]+$"},
+    "workbuddy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "build"],
+      "properties": {
+        "version": {"type": "string", "minLength": 1, "maxLength": 160},
+        "build": {"type": "string", "minLength": 1, "maxLength": 160}
+      }
+    },
+    "critical_skip_count": {"const": 0},
+    "tests": {
+      "type": "array",
+      "minItems": 11,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 160},
+          "status": {"const": "passed"}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "path", "sha256"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 160},
+          "path": {"type": "string", "minLength": 1, "maxLength": 240},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

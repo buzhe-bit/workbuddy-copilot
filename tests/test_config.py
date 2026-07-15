@@ -56,6 +56,28 @@ class TestLoadConfig:
         # 相对路径相对于 config 文件所在目录
         assert os.path.isabs(cfg["store"]["db_path"])
 
+    def test_windows_evidence_path_is_resolved_from_config_directory(self, tmp_path):
+        cfg_file = tmp_path / "deployment" / "config.json"
+        cfg_file.parent.mkdir()
+        cfg_file.write_text(json.dumps({
+            "student_id": "test",
+            "service": {"host": "127.0.0.1", "port": 8765},
+            "store": {"db_path": "data/test.db"},
+            "windows_rollout": {
+                "evidence_path": "evidence/windows-w1.json",
+                "expected_commit": "a" * 40,
+                "expected_build": "build-7",
+                "expected_runner_id": "win-pilot-01",
+            },
+            "llm": {},
+        }))
+
+        cfg = load_config(cfg_file)
+
+        assert cfg["windows_rollout"]["evidence_path"] == str(
+            cfg_file.parent / "evidence" / "windows-w1.json"
+        )
+
     def test_missing_config_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             load_config(tmp_path / "nonexistent.json")

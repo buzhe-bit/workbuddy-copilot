@@ -11,3 +11,24 @@ requires-python = ">=3.13,<3.14"
 [tool.setuptools.packages.find]
 include = ["copilot*"]
 exclude = ["tests*", "legacy*"]
+
+[tool.setuptools.package-data]
+"copilot.student_platform" = ["windows_evidence.schema.json"]
+
+[tool.coverage.run]
+branch = true
+source = ["copilot"]
+# Native UI adapters have separate platform/real-machine gates. This number
+# measures the shared production logic that every deployment executes.
+omit = [
+  "copilot/floating.py",
+  "copilot/floating_native.py",
+  "copilot/floating_windows.py",
+  "copilot/menubar.py",
+  "copilot/notifier_macos.py",
+]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_covered = true

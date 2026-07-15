@@ -7,9 +7,11 @@ from fastapi.testclient import TestClient
 from copilot.app_context import AppContext
 from copilot.connections import WSRegistry
 from copilot.eventbus import EventBus
+from copilot.mentor import routes as mentor_routes
 from copilot.service import create_app
 from copilot.services import AnalysisService, MessageService, SessionQueryService
 from copilot.store import Store
+from copilot.student_platform.windows_evidence import WindowsEvidenceResult
 
 
 MENTOR_TOKEN = "mentor-secret"
@@ -27,7 +29,7 @@ async def _fake_llm(config, snap, event, latest_prompt):
     }
 
 
-def _build_app(tmp_path):
+def _build_app(tmp_path, *, windows_rollout=None):
     store = Store(tmp_path / "copilot.db")
     bus = EventBus()
     registry = WSRegistry(send_timeout=0.05)
@@ -39,6 +41,8 @@ def _build_app(tmp_path):
         "auth": {"mode": "local", "mentor_token": MENTOR_TOKEN},
         "llm": {"enable_llm": False},
     }
+    if windows_rollout is not None:
+        config["windows_rollout"] = windows_rollout
     context = AppContext(
         config=config,
         store=store,
@@ -169,3 +173,73 @@ def test_health_response_remains_backward_compatible(tmp_path):
 
     assert response.status_code == 200
     assert response.json() == {"status": "UP", "student": "local-student"}
+
+
+def test_system_status_uses_validated_windows_evidence_for_current_build(
+    tmp_path,
+    monkeypatch,
+):
+    evidence_path = tmp_path / "windows-w1-evidence.json"
+    expected_commit = "a" * 40
+    expected_build = "pilot-build-7"
+    expected_runner = "windows-pilot-01"
+    app, _store, _registry = _build_app(
+        tmp_path,
+        windows_rollout={
+            "evidence_path": str(evidence_path),
+            "expected_commit": expected_commit,
+            "expected_build": expected_build,
+            "expected_runner_id": expected_runner,
+            # This ordinary config flag must never be authoritative.
+            "rollout_ready": False,
+        },
+    )
+    captured = {}
+
+    def fake_validate(path, expected_commit_arg, expected_build_arg, **kwargs):
+        captured.update(
+            path=str(path),
+            expected_commit=expected_commit_arg,
+            expected_build=expected_build_arg,
+            expected_runner_id=kwargs.get("expected_runner_id"),
+        )
+        return WindowsEvidenceResult(
+            status="rollout_ready",
+            verdict="rollout_ready",
+            rollout_ready=True,
+            evidence_sha256="b" * 64,
+        )
+
+    monkeypatch.setattr(mentor_routes, "validate_windows_evidence", fake_validate)
+
+    response = TestClient(app).get(
+        "/api/mentor/system-status",
+        headers={"Authorization": f"Bearer {MENTOR_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["windows_rollout_status"] == "rollout_ready"
+    assert captured == {
+        "path": str(evidence_path),
+        "expected_commit": expected_commit,
+        "expected_build": expected_build,
+        "expected_runner_id": expected_runner,
+    }
+
+
+def test_system_status_cannot_be_promoted_by_an_ordinary_config_boolean(tmp_path):
+    app, _store, _registry = _build_app(
+        tmp_path,
+        windows_rollout={"rollout_ready": True},
+    )
+
+    response = TestClient(app).get(
+        "/api/mentor/system-status",
+        headers={"Authorization": f"Bearer {MENTOR_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.json()["windows_rollout_status"]
+        == "BLOCKED: real-machine evidence missing"
+    )

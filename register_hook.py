@@ -12,6 +12,7 @@ import os
 import shlex
 import socket
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -55,12 +56,19 @@ env_parts = [
     f"COPILOT_CONFIG={shlex.quote(str(CFG_PATH))}",
     f"COPILOT_SPOOL_DIR={shlex.quote(str(Path(spool_dir).expanduser().resolve()))}",
 ]
+entry_owner = str(os.environ.get("COPILOT_ENTRY_OWNER") or "").strip()
+if entry_owner:
+    if not all(character.isalnum() or character in "_.-" for character in entry_owner):
+        print("invalid COPILOT_ENTRY_OWNER", file=sys.stderr)
+        raise SystemExit(2)
+    env_parts.append(f"COPILOT_ENTRY_OWNER={shlex.quote(entry_owner)}")
 
 verified_command = os.environ.get("COPILOT_HOOK_COMMAND")
 reserved_hook_environment = (
     "COPILOT_STUDENT_ID",
     "COPILOT_CONFIG",
     "COPILOT_SPOOL_DIR",
+    "COPILOT_ENTRY_OWNER",
 )
 if verified_command and any(
     name in verified_command for name in reserved_hook_environment
@@ -108,10 +116,24 @@ for event, blocks in new_hooks.items():
         replacement = blocks[0]["hooks"][0]
         replaced = False
         for block in existing_hooks[event]:
+            retained = []
             for hook in block.get("hooks", []):
-                if "copilot/hook.py" in hook.get("command", ""):
-                    hook.update(replacement)
-                    replaced = True
+                command = str(hook.get("command", ""))
+                owned = bool(
+                    entry_owner
+                    and f"COPILOT_ENTRY_OWNER={entry_owner}" in command
+                )
+                # One-time migration of the pre-owner Copilot command.  Never
+                # use this broad signature during uninstall; the protected
+                # installer manifest and stable owner marker own that path.
+                legacy = "copilot/hook.py" in command
+                if owned or legacy:
+                    if not replaced:
+                        retained.append(dict(replacement))
+                        replaced = True
+                    continue
+                retained.append(hook)
+            block["hooks"] = retained
         if replaced:
             print(f"  ↻ {event} hook 已升级")
         else:
@@ -120,8 +142,37 @@ for event, blocks in new_hooks.items():
 
 settings["hooks"] = existing_hooks
 
+
+def _write_settings_atomically(path: Path, payload: dict) -> None:
+    encoded = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+    fd, raw_temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(raw_temporary)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
 # 写回
-SETTINGS_PATH.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
+_write_settings_atomically(SETTINGS_PATH, settings)
 print(f"\n✅ 已写入 {SETTINGS_PATH}")
 print(f"   hook 命令: {hook_cmd}")
 print(f"\n下一步：在 WorkBuddy 中输入 /hooks 确认 hook 已启用")

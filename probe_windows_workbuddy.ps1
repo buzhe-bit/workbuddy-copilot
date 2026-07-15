@@ -1,5 +1,12 @@
 # Read-only WorkBuddy W0 discovery.  It emits redacted metadata only and never
 # changes WorkBuddy, settings.json, registry values, or local transcript data.
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)] [string]$BuildId,
+    [Parameter(Mandatory = $true)] [string]$CommitSha,
+    [string]$ProfilePath = ''
+)
+
 $ErrorActionPreference = 'SilentlyContinue'
 
 function Redact([string]$Value) {
@@ -42,6 +49,11 @@ function Cwd-Shape([string]$Value) {
 
 $out = [ordered]@{}
 $out.timestamp = (Get-Date).ToUniversalTime().ToString('o')
+$out.evidence = [ordered]@{
+    build_id = $BuildId
+    commit_sha = $CommitSha
+    architecture = $env:PROCESSOR_ARCHITECTURE
+}
 $out.os = [ordered]@{
     version = [Environment]::OSVersion.Version.ToString()
     powershell = $PSVersionTable.PSVersion.ToString()
@@ -179,5 +191,21 @@ if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
     $out.scheduled_tasks = @(Get-ScheduledTask | Where-Object { $_.TaskName -match 'WorkBuddy' -or $_.TaskPath -match 'WorkBuddy' } |
         ForEach-Object { [ordered]@{ name = $_.TaskName; path = $_.TaskPath; state = $_.State.ToString() } })
 }
+
+$blockedReasons = @()
+if ($out.running_processes.Count -eq 0 -and $out.installs.Count -eq 0) {
+    $blockedReasons += 'workbuddy_not_detected'
+}
+if ($out.config_roots.Count -eq 0) { $blockedReasons += 'config_not_detected' }
+if (-not $ProfilePath -or -not (Test-Path -LiteralPath $ProfilePath -PathType Leaf)) {
+    $blockedReasons += 'profile_missing'
+}
+$gate = [ordered]@{
+    status = 'passed'
+    blocked_reasons = $blockedReasons
+    verified_profile = Redact $ProfilePath
+}
+if ($blockedReasons.Count -gt 0) { $gate.status = 'blocked' }
+$out.gate = $gate
 
 $out | ConvertTo-Json -Depth 12

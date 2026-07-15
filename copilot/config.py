@@ -79,6 +79,11 @@ def load_config(path: Path | str | None = None) -> dict:
     db_path = cfg.get("store", {}).get("db_path", "")
     if db_path and not os.path.isabs(db_path):
         cfg["store"]["db_path"] = str(project_root / db_path)
+    windows_rollout = cfg.get("windows_rollout")
+    if isinstance(windows_rollout, dict):
+        evidence_path = str(windows_rollout.get("evidence_path") or "").strip()
+        if evidence_path and not os.path.isabs(evidence_path):
+            windows_rollout["evidence_path"] = str(project_root / evidence_path)
     return cfg
 
 

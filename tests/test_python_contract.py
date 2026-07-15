@@ -17,6 +17,18 @@ def test_project_metadata_declares_the_release_python_range():
     assert metadata["tool"]["setuptools"]["packages"]["find"]["include"] == ["copilot*"]
 
 
+def test_shared_production_coverage_gate_is_at_least_80_percent():
+    metadata = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dev_requirements = (PROJECT_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "quality.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert metadata["tool"]["coverage"]["report"]["fail_under"] >= 80
+    assert "pytest-cov" in dev_requirements
+    assert "--cov-fail-under=80" in workflow
+
+
 def test_python_preflight_enforces_both_version_bounds():
     probe = """
 from scripts.python_preflight import supports_version

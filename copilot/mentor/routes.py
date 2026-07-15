@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import re
 from typing import Any, Literal
 
@@ -25,6 +26,7 @@ from ..attention import AttentionService
 from ..connections import WSRegistry
 from ..services import SessionQueryService
 from ..store import Store
+from ..student_platform.windows_evidence import validate_windows_evidence
 
 router = APIRouter(prefix="/api/mentor", tags=["mentor"])
 log = logging.getLogger("copilot.mentor.routes")
@@ -79,6 +81,25 @@ def _rebuild_transcript_from_history(store: Store, session_id: str) -> dict[str,
     }
 
 
+def _windows_rollout_status(config: dict[str, Any]) -> str:
+    """Derive the Windows gate only from validated evidence for this build."""
+    raw_rollout = config.get("windows_rollout")
+    rollout = raw_rollout if isinstance(raw_rollout, dict) else {}
+    configured_path = str(rollout.get("evidence_path") or "").strip()
+    if configured_path:
+        evidence_path = Path(configured_path).expanduser()
+    else:
+        db_path = Path(str(config.get("store", {}).get("db_path") or "."))
+        evidence_path = db_path.parent / "windows-w1-evidence.json"
+    result = validate_windows_evidence(
+        evidence_path,
+        str(rollout.get("expected_commit") or ""),
+        str(rollout.get("expected_build") or ""),
+        expected_runner_id=str(rollout.get("expected_runner_id") or "") or None,
+    )
+    return result.verdict
+
+
 @router.get("/students")
 async def list_students(session_svc: SessionQueryService = Depends(get_session_service)):
     """返回学员列表 + 状态概览。"""
@@ -95,12 +116,13 @@ async def get_system_status(
     """Return mentor-only operational counts with no learner or provider data."""
     counts = store.get_system_status_counts()
     float_connections, mentor_connections = ws_registry.connection_counts()
+    config = request.app.state.context.config
     return {
         "version": request.app.version,
         **counts,
         "float_connections": float_connections,
         "mentor_connections": mentor_connections,
-        "windows_rollout_status": "BLOCKED: real-machine evidence missing",
+        "windows_rollout_status": _windows_rollout_status(config),
     }
 
 
