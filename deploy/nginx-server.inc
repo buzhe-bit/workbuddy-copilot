@@ -19,6 +19,7 @@ location ~ ^/(?:alerts|api|mentor)(?:/|$) {
 }
 
 location ~ ^/ws(?:/mentor)?$ {
+    access_log off;
     proxy_pass http://127.0.0.1:8765;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;

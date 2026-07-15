@@ -42,6 +42,8 @@ def test_nginx_include_preserves_root_and_proxies_all_copilot_routes():
     assert "proxy_set_header Upgrade $http_upgrade" in nginx
     assert 'proxy_set_header Connection "upgrade"' in nginx
     assert "^/ws" in nginx
+    ws_location = nginx.split("location ~ ^/ws", 1)[1]
+    assert "access_log off;" in ws_location
 
 
 def _fake_python(tmp_path: Path) -> Path:
