@@ -3434,6 +3434,16 @@ def test_responsive_breakpoint_changes_keep_keyboard_focus_visible_and_semantics
     page,
     static_server,
 ):
+    # Chromium may blur a control hidden by the new media-query layout before
+    # app.js receives its own `change` callback. Reproduce that valid ordering
+    # deterministically so the last workspace focus must be restored from state.
+    page.add_init_script("""
+      matchMedia('(max-width: 599px)').addEventListener('change', () => {
+        if (document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
+      });
+    """)
     messages = []
     _open_responsive_console(page, static_server, 700, 570, messages)
     page.locator('.student-item[data-student-id="s1"]').click()
@@ -3451,6 +3461,7 @@ def test_responsive_breakpoint_changes_keep_keyboard_focus_visible_and_semantics
           !active.closest('[aria-hidden="true"]');
       }
     """)
+    expect(student).to_be_focused()
 
     selected_tab = page.locator('[role="tab"][aria-selected="true"]')
     expect(selected_tab).to_be_visible()

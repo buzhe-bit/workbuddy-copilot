@@ -385,7 +385,9 @@ function syncResponsiveMode() {
     lastMobileFocusWasTab = false;
   } else if (enteringMobile && enteringFocusView && hadWorkspaceFocus) {
     window.requestAnimationFrame(() => {
-      if (!elementIsRendered(document.activeElement)) focusWorkspaceEntry(enteringFocusView);
+      if (document.activeElement === document.body || !elementIsRendered(document.activeElement)) {
+        focusWorkspaceEntry(enteringFocusView);
+      }
     });
   } else if (
     mobile &&
