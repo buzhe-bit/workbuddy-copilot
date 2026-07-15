@@ -58,7 +58,7 @@ venv/bin/python scripts/python_preflight.py
 venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 ./install.sh
 ./start_service.sh
-./start_menubar.sh  # 仅 macOS 原生浮标
+./start_menubar.sh  # macOS 原生浮标 + 常驻 Hook spool 投递
 ```
 
 release Python 合同由 [`pyproject.toml`](pyproject.toml) 固定为 `>=3.13,<3.14`，

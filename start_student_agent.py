@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 from pathlib import Path
 import sqlite3
 import sys
 
+from copilot.config import load_config, service_url
 from copilot.student_core.agent import StudentAgent
 from copilot.student_core.coordinator import StudentCoordinator
 from copilot.student_core.process_liveness import FileClaimStore
@@ -26,12 +28,16 @@ from copilot.student_platform.windows_runtime import (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the WorkBuddy student agent")
-    parser.add_argument("--base-url", default=os.environ.get("COPILOT_BASE_URL", "http://127.0.0.1:8765"))
-    parser.add_argument("--student-id", default=os.environ.get("COPILOT_STUDENT_ID", "student-1"))
-    parser.add_argument("--token", default=os.environ.get("COPILOT_STUDENT_TOKEN", ""))
+    parser.add_argument("--config", default=os.environ.get("COPILOT_CONFIG"))
+    parser.add_argument("--base-url", default=os.environ.get("COPILOT_BASE_URL"))
+    parser.add_argument("--student-id", default=os.environ.get("COPILOT_STUDENT_ID"))
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("COPILOT_STUDENT_TOKEN") or os.environ.get("COPILOT_TOKEN"),
+    )
     parser.add_argument(
         "--spool-dir",
-        default=os.environ.get("COPILOT_SPOOL_DIR", str(Path.home() / ".copilot" / "spool")),
+        default=os.environ.get("COPILOT_SPOOL_DIR"),
     )
     parser.add_argument("--interval", type=float, default=float(os.environ.get("COPILOT_AGENT_INTERVAL", "1")))
     parser.add_argument(
@@ -67,7 +73,32 @@ def _parser() -> argparse.ArgumentParser:
         "--reason",
         help="operator reason recorded in the local repair audit",
     )
+    parser.add_argument(
+        "--spool-only",
+        action="store_true",
+        help="deliver Hook spool events without opening a second WebSocket",
+    )
     return parser
+
+
+def _core_settings(args: argparse.Namespace) -> tuple[str, str, str, str]:
+    cfg = load_config(args.config) if args.config else {}
+    auth = cfg.get("auth", {}) if isinstance(cfg.get("auth"), dict) else {}
+    student = cfg.get("student", {}) if isinstance(cfg.get("student"), dict) else {}
+    base_url = args.base_url or (service_url(cfg) if cfg else "http://127.0.0.1:8765")
+    student_id = args.student_id or str(cfg.get("student_id") or "student-1")
+    token = args.token
+    if token is None:
+        token = str(
+            auth.get("student_token")
+            or auth.get("token")
+            or cfg.get("token")
+            or ""
+        )
+    spool_dir = args.spool_dir or student.get("spool_dir") or str(
+        Path.home() / ".workbuddy" / "copilot" / "spool"
+    )
+    return str(base_url), str(student_id), str(token), str(spool_dir)
 
 
 def _repair_claim(args: argparse.Namespace) -> int:
@@ -81,7 +112,7 @@ def _repair_claim(args: argparse.Namespace) -> int:
         )
         return 2
     try:
-        spool = EventSpool(args.spool_dir)
+        spool = EventSpool(_core_settings(args)[3])
         command_state_dir = spool.directory / ".copilot-upload-commands"
         command_store = FileClaimStore(
             command_state_dir,
@@ -117,15 +148,16 @@ def _repair_claim(args: argparse.Namespace) -> int:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    base_url, student_id, token, spool_dir = _core_settings(args)
     platform = args.platform
     if platform == "auto":
         platform = "windows" if sys.platform.startswith("win") else "core"
     if platform == "windows":
         runtime = WindowsStudentRuntime.build(
-            base_url=args.base_url,
-            student_id=args.student_id,
-            token=args.token,
-            spool_dir=args.spool_dir,
+            base_url=base_url,
+            student_id=student_id,
+            token=token,
+            spool_dir=spool_dir,
             state_dir=args.state_dir,
             workbuddy_config_dir=args.workbuddy_config_dir,
             profile_path=args.workbuddy_profile,
@@ -133,15 +165,27 @@ async def _run(args: argparse.Namespace) -> None:
         )
         await runtime.run()
         return
-    spool = EventSpool(args.spool_dir)
+    spool = EventSpool(spool_dir)
     transport = StudentTransport(
-        args.base_url,
-        student_id=args.student_id,
-        token=args.token,
+        base_url,
+        student_id=student_id,
+        token=token,
     )
     # WorkBuddyData upload orchestration is injected by a platform adapter in
     # a later phase.  Do not pretend this headless core can complete uploads.
     coordinator = StudentCoordinator(spool, transport, uploader=None)
+    if args.spool_only:
+        while True:
+            try:
+                await coordinator.flush_spool_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.getLogger("copilot.student_agent").warning(
+                    "student spool cycle failed type=%s",
+                    type(exc).__name__,
+                )
+            await asyncio.sleep(args.interval)
     await StudentAgent(coordinator, interval=args.interval).run()
 
 
