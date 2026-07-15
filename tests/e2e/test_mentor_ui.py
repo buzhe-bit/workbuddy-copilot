@@ -3,10 +3,9 @@
 
 策略
 ----
-- **不启后端**：用 Playwright `page.route` 拦截 `/api/mentor/*`，`page.route_web_socket`
-  拦截 `/ws/mentor`，喂确定性 fixture，驱动真实 `app.js` 渲染。快且确定。
-- 静态资源（index.html / app.js / style.css）用本机临时 `http.server` 起在随机端口，
-  以便 `fetch('/api/mentor/...')` 相对路径解析到 http:// 源、被 route 拦截。
+- **不启后端、不占端口**：用 Playwright `page.route` 直接提供静态资源并拦截
+  `/api/mentor/*`，`page.route_web_socket` 拦截 `/ws/mentor`，喂确定性 fixture，
+  驱动真实 `app.js` 渲染。快且确定。
 - 断言的是**内容 / 颜色 / 行为**（display_name 文本、状态点 class、精确 rgb、
   点击后其他会话状态不被刷新），不是"页面非空"。
 
@@ -18,11 +17,8 @@
   若 chromium 内核缺失，用例会以清晰原因 skip（见 `browser` fixture）。
 """
 
-import functools
-import http.server
 import json
 import re
-import threading
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -36,6 +32,7 @@ from playwright.sync_api import expect, sync_playwright  # noqa: E402
 
 # repo_root/copilot/static/mentor —— 被测前端静态资源目录
 MENTOR_DIR = Path(__file__).resolve().parents[2] / "copilot" / "static" / "mentor"
+STATIC_ORIGIN = "http://mentor.test"
 
 # 设计令牌（frontend-spec.md）→ 期望 computed rgb。
 # 断言精确 rgb：改错任一档，对应用例必红（负控见各用例注释）。
@@ -53,27 +50,13 @@ XSS_PAYLOAD = '<img src=x onerror="window.__xss=1">'
 
 
 # ─────────────────────────────────────────────────────────────
-# 本机静态资源服务（会话级）
+# Playwright 内建静态资源路由（不占用本机端口）
 # ─────────────────────────────────────────────────────────────
-class _QuietHandler(http.server.SimpleHTTPRequestHandler):
-    def log_message(self, *args):  # 静音，避免污染测试输出
-        pass
-
-
 @pytest.fixture(scope="session")
 def static_server():
     if not MENTOR_DIR.exists():
         pytest.skip(f"前端目录不存在: {MENTOR_DIR}")
-    handler = functools.partial(_QuietHandler, directory=str(MENTOR_DIR))
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    port = httpd.server_address[1]
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+    return STATIC_ORIGIN
 
 
 @pytest.fixture(scope="module")
@@ -97,6 +80,19 @@ def browser():
 def page(browser):
     ctx = browser.new_context()
     pg = ctx.new_page()
+    for name, content_type in {
+        "index.html": "text/html; charset=utf-8",
+        "app.js": "application/javascript; charset=utf-8",
+        "style.css": "text/css; charset=utf-8",
+    }.items():
+        body = (MENTOR_DIR / name).read_text(encoding="utf-8")
+        pg.route(
+            f"{STATIC_ORIGIN}/{name}*",
+            lambda route, body=body, content_type=content_type: route.fulfill(
+                body=body,
+                content_type=content_type,
+            ),
+        )
     # 收集页面报错（如 XSS 脚本注入执行会在此暴露）
     pg._console_errors = []
     pg.on("pageerror", lambda exc: pg._console_errors.append(str(exc)))
