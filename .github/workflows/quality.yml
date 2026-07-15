@@ -57,15 +57,15 @@ jobs:
     name: macOS client/browser (real Chromium)
     runs-on: macos-latest
     env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
       NO_PROXY: 127.0.0.1,localhost
-      no_proxy: 127.0.0.1,localhost
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
           cache: pip
+      - name: Configure Playwright cache
+        run: echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/ms-playwright" >> "$GITHUB_ENV"
       - name: Enforce release Python contract
         run: python scripts/python_preflight.py
       - name: Install lane dependencies
