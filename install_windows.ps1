@@ -20,6 +20,30 @@ param(
 $ErrorActionPreference = 'Stop'
 $OwnerId = 'workbuddy-copilot-v1'
 
+function Test-FullyQualifiedPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    if ($Path -match '^[A-Za-z]:[\\/]') {
+        return $true
+    }
+    return $Path -match '^\\\\[^\\/:*?"<>|]+\\[^\\/:*?"<>|]+(?:\\|$)'
+}
+
+function Initialize-WindowsSecurityModule {
+    $builtInModulePath = Join-Path $PSHOME 'Modules'
+    $modulePaths = @(
+        $env:PSModulePath -split ';' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($modulePaths -notcontains $builtInModulePath) {
+        $env:PSModulePath = (@($builtInModulePath) + $modulePaths) -join ';'
+    }
+    Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+}
+
+Initialize-WindowsSecurityModule
+
 function Require-Directory([string]$Path, [string]$Name) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw "$Name does not exist: $Path"
@@ -33,7 +57,7 @@ function Require-File([string]$Path, [string]$Name) {
 }
 
 function Assert-AbsolutePath([string]$Path, [string]$Name) {
-    if (-not [System.IO.Path]::IsPathFullyQualified($Path)) {
+    if (-not (Test-FullyQualifiedPath $Path)) {
         throw "$Name must be an absolute path"
     }
 }

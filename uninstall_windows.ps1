@@ -5,12 +5,37 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Test-FullyQualifiedPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    if ($Path -match '^[A-Za-z]:[\\/]') {
+        return $true
+    }
+    return $Path -match '^\\\\[^\\/:*?"<>|]+\\[^\\/:*?"<>|]+(?:\\|$)'
+}
+
+function Initialize-WindowsSecurityModule {
+    $builtInModulePath = Join-Path $PSHOME 'Modules'
+    $modulePaths = @(
+        $env:PSModulePath -split ';' |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($modulePaths -notcontains $builtInModulePath) {
+        $env:PSModulePath = (@($builtInModulePath) + $modulePaths) -join ';'
+    }
+    Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
+}
+
+Initialize-WindowsSecurityModule
+
 $ExpectedOwnerId = 'workbuddy-copilot-v1'
 $ExpectedProjectRoot = [System.IO.Path]::GetFullPath(
     (Split-Path -LiteralPath $PSCommandPath -Parent)
 ).TrimEnd('\', '/')
 
-if (-not [System.IO.Path]::IsPathFullyQualified($ManifestPath)) {
+if (-not (Test-FullyQualifiedPath $ManifestPath)) {
     throw 'ManifestPath must be an absolute path'
 }
 

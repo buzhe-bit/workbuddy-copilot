@@ -26,6 +26,27 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _windows_powershell_51_env() -> dict[str, str]:
+    """Build the module path that powershell.exe 5.1 expects on Windows."""
+
+    env = os.environ.copy()
+    program_files = Path(env.get("ProgramFiles", r"C:\Program Files"))
+    windows_dir = Path(env.get("WINDIR", r"C:\Windows"))
+    module_paths = []
+    if env.get("USERPROFILE"):
+        module_paths.append(
+            Path(env["USERPROFILE"]) / "Documents" / "WindowsPowerShell" / "Modules"
+        )
+    module_paths.extend(
+        (
+            program_files / "WindowsPowerShell" / "Modules",
+            windows_dir / "System32" / "WindowsPowerShell" / "v1.0" / "Modules",
+        )
+    )
+    env["PSModulePath"] = os.pathsep.join(str(path) for path in module_paths)
+    return env
+
+
 def _protect_private_windows_directory(path: Path) -> None:
     script = r"""
 $ErrorActionPreference = 'Stop'
@@ -62,6 +83,7 @@ Set-Acl -LiteralPath $path -AclObject $acl
         text=True,
         capture_output=True,
         check=False,
+        env=_windows_powershell_51_env(),
     )
     assert completed.returncode == 0, completed.stderr
 
@@ -78,6 +100,18 @@ def test_installer_pins_and_rechecks_python_313() -> None:
         "Invoke-Python313 @('-c', 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 13) else 13)')"
     )
     assert python_preflight < state_write
+
+
+@pytest.mark.parametrize("script_name", ("install_windows.ps1", "uninstall_windows.ps1"))
+def test_windows_scripts_support_powershell_51_path_and_security_modules(
+    script_name: str,
+) -> None:
+    source = _source(script_name)
+
+    assert "[System.IO.Path]::IsPathFullyQualified" not in source
+    assert "function Test-FullyQualifiedPath" in source
+    assert "Join-Path $PSHOME 'Modules'" in source
+    assert "Import-Module Microsoft.PowerShell.Security -ErrorAction Stop" in source
 
 
 def test_installer_accepts_only_secure_interactive_or_private_token_file() -> None:
@@ -349,6 +383,7 @@ def test_token_file_acl_is_checked_before_prepare_state(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         check=False,
+        env=_windows_powershell_51_env(),
     )
 
     assert completed.returncode != 0
@@ -404,6 +439,7 @@ def test_python_preflight_fails_before_state_mutation(tmp_path: Path) -> None:
         text=True,
         capture_output=True,
         check=False,
+        env=_windows_powershell_51_env(),
     )
 
     assert completed.returncode != 0
@@ -467,6 +503,7 @@ def test_uninstall_changed_settings_removes_only_owned_hooks(tmp_path: Path) -> 
         text=True,
         capture_output=True,
         check=False,
+        env=_windows_powershell_51_env(),
     )
 
     assert completed.returncode == 0, completed.stderr
