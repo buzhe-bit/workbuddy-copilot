@@ -343,6 +343,31 @@ def test_duplicate_mentor_message_is_handled_and_receipted_once(tmp_path: Path) 
     asyncio.run(scenario())
 
 
+def test_persisted_but_unshown_mentor_message_never_marks_rendered_or_receipts(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        persisted: list[str] = []
+        coordinator = StudentCoordinator(
+            EventSpool(tmp_path),
+            transport,
+            message_handler=lambda payload: persisted.append(str(payload["message_id"])) or False,
+        )
+        payload = {
+            "type": "mentor_message",
+            "student_id": "student-1",
+            "message_id": "session-b-message",
+            "session_id": "session-b",
+            "scope": "session",
+        }
+
+        assert await coordinator.handle_message(payload) is False
+        assert persisted == ["session-b-message"]
+        assert transport.acked == []
+        assert coordinator.spool.receipt_ledger.status("student-1", "session-b-message") is None
+
+    asyncio.run(scenario())
+
+
 def test_same_message_id_for_two_students_is_not_cross_deduplicated(tmp_path: Path) -> None:
     async def scenario() -> None:
         seen: set[tuple[str, str]] = set()

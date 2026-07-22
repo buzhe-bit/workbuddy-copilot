@@ -7,7 +7,12 @@ import urllib.error
 from urllib.parse import parse_qs, urlparse
 
 import copilot.floating_native as floating_native
-from copilot.floating_native import CopilotNativeApp, _build_float_ws_url, _panel_origin_for_icon
+from copilot.floating_native import (
+    CopilotNativeApp,
+    _build_float_ws_url,
+    _panel_origin_for_icon,
+    _session_display_title,
+)
 from copilot.student_platform.macos import StudentCoordinatorCommandCallback
 
 
@@ -38,6 +43,11 @@ def test_panel_origin_follows_icon_position_changes():
     assert origin_a != origin_b
     assert origin_b[0] > origin_a[0]
     assert origin_b[1] < origin_a[1]
+
+
+def test_native_session_title_never_falls_back_to_session_id():
+    assert _session_display_title({"session_id": "private-session-id"}) == "新建对话"
+    assert _session_display_title({"display_title": "显示名"}) == "显示名"
 
 
 def test_float_ws_url_includes_student_token_and_last_seen_without_leaking_when_redacted(monkeypatch):
@@ -94,6 +104,23 @@ def test_float_urls_use_public_base_url_for_https_and_wss(monkeypatch):
 
     assert ws_url.startswith("wss://copilot.example.com/copilot/ws?")
     assert parse_qs(urlparse(ws_url).query)["token"] == ["student-token"]
+
+
+def test_float_ws_loopback_uses_proxy_safe_connector(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_connect(url: str, headers: dict[str, str]):
+        captured["url"] = url
+        captured["headers"] = headers
+        return "connection"
+
+    monkeypatch.setattr(floating_native, "_default_ws_connect", fake_connect)
+
+    assert floating_native._connect_float_ws("ws://127.0.0.1:8765/ws") == "connection"
+    assert captured == {
+        "url": "ws://127.0.0.1:8765/ws",
+        "headers": {},
+    }
 
 
 def test_macos_command_callback_hands_non_ui_command_to_student_coordinator():
@@ -584,6 +611,106 @@ def test_mentor_message_acks_only_after_render_and_state_save():
     assert app._last_seen_mentor_message_id == 7
 
 
+def test_session_mentor_message_for_another_session_is_persisted_unread_not_rendered_or_acked():
+    class FakeApp:
+        _handle_mentor_message = CopilotNativeApp._handle_mentor_message
+
+        def __init__(self):
+            self._student_id = "student-a"
+            self._current_session_id = "session-a"
+            self._sessions = {"session-b": {"title": "B", "unread": 0}}
+            self._seen_mentor_message_ids = set()
+            self._pending_receipt_message_ids = set()
+            self._last_seen_mentor_message_id = 0
+            self.rendered: list[str] = []
+            self.acked: list[str] = []
+            self.saved = 0
+
+        def _render_mentor_message(self, item):
+            self.rendered.append(item["message_id"])
+            return True
+
+        def _save_mentor_message_state(self):
+            self.saved += 1
+            return True
+
+        def _ack_mentor_message(self, message_id):
+            self.acked.append(message_id)
+            return True
+
+    app = FakeApp()
+    app._handle_mentor_message({
+        "type": "mentor_message",
+        "student_id": "student-a",
+        "message_id": "message-b",
+        "session_id": "session-b",
+        "scope": "session",
+        "id": 7,
+        "text": "Only show in B",
+    })
+
+    assert app.rendered == []
+    assert app.acked == []
+    assert app._sessions["session-b"]["unread"] == 1
+
+    app._current_session_id = "session-b"
+    CopilotNativeApp._settle_current_session_mentor_messages(app)
+
+    assert app.acked == ["message-b"]
+    assert app._mentor_items_by_session["session-b"][0]["rendered"] is True
+
+
+def test_session_bucket_and_unread_survive_native_restart(tmp_path):
+    state_path = tmp_path / "float-state.json"
+
+    class FakeApp:
+        _handle_mentor_message = CopilotNativeApp._handle_mentor_message
+        _load_mentor_message_state = CopilotNativeApp._load_mentor_message_state
+        _save_mentor_message_state = CopilotNativeApp._save_mentor_message_state
+
+        def __init__(self):
+            self._student_id = "student-a"
+            self._current_session_id = "session-a"
+            self._sessions = {"session-b": {"title": "B", "unread": 0}}
+            self._mentor_items_by_session = {}
+            self._mentor_notifications = []
+            self._mentor_unread = 0
+            self._seen_mentor_message_ids = set()
+            self._seen_mentor_message_order = []
+            self._pending_receipt_message_ids = set()
+            self._unpersisted_rendered_message_ids = {}
+            self._rendering_mentor_message_ids = set()
+            self._receipt_ack_inflight_ids = set()
+            self._mentor_message_state_lock = threading.RLock()
+            self._last_seen_mentor_message_id = 0
+
+        def _mentor_message_state_path(self):
+            return str(state_path)
+
+        def _ack_mentor_message(self, _message_id):
+            raise AssertionError("off-session item must not ack before selection")
+
+    first = FakeApp()
+    first._handle_mentor_message({
+        "type": "mentor_message",
+        "student_id": "student-a",
+        "message_id": "message-b",
+        "session_id": "session-b",
+        "scope": "session",
+        "id": 7,
+        "text": "Keep this in B",
+    })
+
+    restarted = FakeApp()
+    restarted._load_mentor_message_state()
+
+    assert restarted._sessions["session-b"]["unread"] == 1
+    assert [item["message_id"] for item in restarted._mentor_items_by_session["session-b"]] == [
+        "message-b"
+    ]
+    assert restarted._mentor_items_by_session["session-b"][0]["rendered"] is False
+
+
 def test_duplicate_acknowledged_mentor_message_does_not_retry_receipt_or_render():
     class FakeApp:
         def __init__(self):
@@ -760,6 +887,77 @@ def test_mentor_message_no_ack_when_render_fails():
     assert app.acked == []
     assert app._seen_mentor_message_ids == set()
     assert app._last_seen_mentor_message_id == 0
+
+
+def test_native_mentor_message_retries_after_real_render_method_fails_once():
+    class Panel:
+        def orderFrontRegardless(self):
+            return None
+
+        def setLevel_(self, _level):
+            return None
+
+    class FakeApp:
+        _handle_mentor_message = CopilotNativeApp._handle_mentor_message
+        _render_mentor_message = CopilotNativeApp._render_mentor_message
+
+        def __init__(self):
+            self._student_id = "student-a"
+            self._current_session_id = "session-a"
+            self._mentor_items_by_session = {}
+            self._mentor_notifications = []
+            self._mentor_unread = 0
+            self._seen_mentor_message_ids = set()
+            self._seen_mentor_message_order = []
+            self._pending_receipt_message_ids = set()
+            self._unpersisted_rendered_message_ids = {}
+            self._rendering_mentor_message_ids = set()
+            self._receipt_ack_inflight_ids = set()
+            self._last_seen_mentor_message_id = 0
+            self._mentor_message_state_lock = threading.RLock()
+            self.analysis_panel = Panel()
+            self._panel_visible = False
+            self.rebuilds = 0
+            self.acked = []
+
+        def _rebuild_cards(self):
+            self.rebuilds += 1
+            if self.rebuilds == 1:
+                raise RuntimeError("AppKit unavailable")
+
+        def _position_analysis_panel_near_icon(self):
+            return None
+
+        def _update_icon_state(self):
+            return None
+
+        def _save_mentor_message_state(self):
+            return True
+
+        def _ack_mentor_message(self, message_id):
+            self.acked.append(message_id)
+            return True
+
+    payload = {
+        "type": "mentor_message",
+        "student_id": "student-a",
+        "message_id": "message-1",
+        "session_id": "session-a",
+        "scope": "session",
+        "id": 1,
+        "text": "retry once",
+    }
+    app = FakeApp()
+
+    app._handle_mentor_message(payload)
+    app._handle_mentor_message(payload)
+
+    assert app.rebuilds == 2
+    assert app.acked == ["message-1"]
+    assert [item["message_id"] for item in app._mentor_items_by_session["session-a"]] == [
+        "message-1"
+    ]
+    assert app._mentor_items_by_session["session-a"][0]["rendered"] is True
 
 
 def test_upload_mentor_command_starts_background_upload_without_rendering(monkeypatch):

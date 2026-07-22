@@ -4,6 +4,8 @@ import asyncio
 import json
 import sqlite3
 
+import pytest
+
 from copilot.connections import WSRegistry
 from copilot.eventbus import EventBus
 from copilot.services import MessageService
@@ -45,7 +47,12 @@ def test_send_persists_before_live_push_and_waits_for_student_rest_receipt(tmp_p
         assert result == {
             "message_id": rows[0]["message_id"],
             "id": rows[0]["id"],
+            "student_id": "student-a",
+            "session_id": "",
+            "scope": "student",
+            "client_request_id": None,
             "delivered": False,
+            "duplicate": False,
         }
 
         assert await service.ack(result["message_id"], "student-a") is True
@@ -301,6 +308,8 @@ def test_mentor_message_status_recovers_delivery_without_exposing_text(tmp_path)
             "message_id": sent["message_id"],
             "id": sent["id"],
             "student_id": "student-a",
+            "session_id": "",
+            "scope": "student",
             "delivered": True,
         }]
         assert "text" not in statuses[0]
@@ -339,3 +348,86 @@ def test_legacy_mentor_message_schema_migrates_idempotency_column_reentrantly(tm
         }
     assert "client_request_id" in columns
     assert "idx_mentor_messages_client_request_unique" in index_names
+
+
+def test_session_message_is_scoped_and_isolated_from_other_sessions(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "messages.db")
+        store.upsert_session("session-a", "student-a", "", "", created_at=1, last_activity_at=1)
+        store.upsert_session("session-b", "student-a", "", "", created_at=1, last_activity_at=1)
+        published = []
+
+        async def capture(payload):
+            published.append(payload)
+
+        service = MessageService(store, EventBus())
+        service.bus.subscribe(capture)
+        sent = await service.send(
+            "student-a", "mentor-1", "Only session A", session_id="session-a",
+            client_request_id="session-request",
+        )
+
+        assert sent["student_id"] == "student-a"
+        assert sent["session_id"] == "session-a"
+        assert sent["scope"] == "session"
+        assert sent["client_request_id"] == "session-request"
+        assert sent["duplicate"] is False
+        assert published[0]["session_id"] == "session-a"
+        assert published[0]["scope"] == "session"
+        assert published[0]["client_request_id"] == "session-request"
+        assert service.get_mentor_message_statuses(["session-request"])[0] == {
+            "client_request_id": "session-request",
+            "message_id": sent["message_id"],
+            "id": sent["id"],
+            "student_id": "student-a",
+            "session_id": "session-a",
+            "scope": "session",
+            "delivered": False,
+        }
+        assert not [row for row in store.get_timeline_by_session("session-b") if row["type"] == "mentor_message"]
+        timeline = store.get_timeline_by_session("session-a")
+        assert [row["content"] for row in timeline if row["type"] == "mentor_message"] == ["Only session A"]
+
+        await service.send("student-a", "mentor-1", "Student notice")
+        assert [row["content"] for row in store.get_timeline_by_session("session-a") if row["type"] == "mentor_message"] == ["Only session A"]
+
+    asyncio.run(scenario())
+
+
+def test_session_message_rejects_missing_or_foreign_session_without_creating_a_row(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "messages.db")
+        store.upsert_session("other-session", "student-b", "", "", created_at=1, last_activity_at=1)
+        service = MessageService(store, EventBus())
+
+        for session_id in ("missing-session", "other-session"):
+            try:
+                await service.send("student-a", "mentor-1", "Private", session_id=session_id)
+            except LookupError:
+                pass
+            else:
+                raise AssertionError("unknown or foreign session must be fail-closed")
+
+        assert store.list_messages_since("student-a", 0) == []
+
+    asyncio.run(scenario())
+
+
+def test_client_request_id_conflicts_when_session_changes(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "messages.db")
+        for session_id in ("session-a", "session-b"):
+            store.upsert_session(session_id, "student-a", "", "", created_at=1, last_activity_at=1)
+        service = MessageService(store, EventBus())
+        await service.send(
+            "student-a", "mentor-1", "Same text", session_id="session-a",
+            client_request_id="same-key",
+        )
+
+        with pytest.raises(ValueError, match="client_request_id payload conflict"):
+            await service.send(
+                "student-a", "mentor-1", "Same text", session_id="session-b",
+                client_request_id="same-key",
+            )
+
+    asyncio.run(scenario())

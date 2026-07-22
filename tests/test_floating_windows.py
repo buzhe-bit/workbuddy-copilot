@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import json
+import sqlite3
 from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
@@ -45,14 +47,25 @@ class _Renderer:
         self.states.append(state)
 
 
-def _mentor(message_id: str, *, text: str | None = None) -> dict[str, Any]:
-    return {
+def _mentor(
+    message_id: str,
+    *,
+    text: str | None = None,
+    session_id: str = "",
+    scope: str = "",
+) -> dict[str, Any]:
+    payload = {
         "type": "mentor_message",
         "student_id": "student-a",
         "message_id": message_id,
         "content": text or f"mentor {message_id}",
         "timestamp": 1_720_000_000.0,
     }
+    if scope:
+        payload["scope"] = scope
+    if session_id:
+        payload["session_id"] = session_id
+    return payload
 
 
 def _analysis(
@@ -138,6 +151,50 @@ def test_stable_ids_reject_payload_collisions_without_overwriting_history(
 
     assert store.list_mentor()[0].payload["content"] == "first"
     assert store.list_analysis()[0].payload["result"]["diagnosis"] == "first"
+
+
+def test_old_mentor_payload_accepts_default_route_field_upgrade_only(tmp_path: Path) -> None:
+    path = tmp_path / "messages.sqlite3"
+    legacy_payload = {
+        "type": "mentor_message",
+        "student_id": "student-a",
+        "message_id": "message-1",
+        "content": "first",
+        "timestamp": 1.0,
+    }
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE windows_ui_mentor_messages (
+            message_id TEXT PRIMARY KEY,
+            student_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            delivery_state TEXT NOT NULL,
+            created_at_ns INTEGER NOT NULL,
+            terminal_at_ns INTEGER,
+            read_at_ns INTEGER
+        )
+        """
+    )
+    connection.execute(
+        """INSERT INTO windows_ui_mentor_messages
+           VALUES(?, ?, ?, 'unrendered', 1, NULL, NULL)""",
+        ("message-1", "student-a", json.dumps(legacy_payload, sort_keys=True)),
+    )
+    connection.commit()
+    connection.close()
+
+    store = WindowsMessageStore(path, student_id="student-a")
+    upgraded = {
+        **legacy_payload,
+        "session_id": "",
+        "scope": "student",
+        "client_request_id": None,
+    }
+
+    assert store.upsert_mentor(upgraded).created is False
+    with pytest.raises(ValueError, match="collision"):
+        store.upsert_mentor({**upgraded, "content": "tampered"})
 
 
 @pytest.mark.parametrize(
@@ -335,7 +392,7 @@ def test_duplicate_live_and_catchup_messages_remain_one_visible_card(tmp_path: P
     view = WindowsStudentView(store, renderer=renderer)
 
     assert view.present_mentor_message(_mentor("message-1")) is True
-    assert view.present_mentor_message(_mentor("message-1")) is False
+    assert view.present_mentor_message(_mentor("message-1")) is True
     assert view.present_analysis(_analysis(1, analysis_id=10)) is True
     assert view.present_analysis(_analysis(1, analysis_id=10)) is False
 
@@ -343,6 +400,78 @@ def test_duplicate_live_and_catchup_messages_remain_one_visible_card(tmp_path: P
     assert len(view.state.analyses) == 1
     assert store.list_mentor()[0].state == "ack_pending"
     assert store.list_analysis()[0].state == "rendered"
+
+
+def test_session_message_waits_for_its_selected_session_before_render_or_receipt(
+    tmp_path: Path,
+) -> None:
+    renderer = _Renderer()
+    store = WindowsMessageStore(tmp_path / "messages.sqlite3", student_id="student-a")
+    view = WindowsStudentView(store, renderer=renderer)
+    view.update_sessions(
+        [{"session_id": "session-a"}, {"session_id": "session-b"}],
+        active_session_id="session-a",
+        active_reliable=True,
+    )
+
+    assert view.present_mentor_message(
+        _mentor("message-b", session_id="session-b", scope="session")
+    ) is False
+    assert view.state.selected_session_id == "session-a"
+    assert view.state.mentor_messages == ()
+    assert store.unread_count == 1
+    assert store.list_mentor()[0].state == "unrendered"
+
+    view.select_session("session-b")
+
+    assert [item.key for item in view.state.mentor_messages] == ["message-b"]
+    assert store.unread_count == 0
+    assert store.list_mentor()[0].state == "ack_pending"
+    assert view.present_mentor_message(
+        _mentor("message-b", session_id="session-b", scope="session")
+    ) is True
+    assert [item.key for item in view.state.mentor_messages] == ["message-b"]
+
+
+def test_student_scope_notification_is_not_copied_into_a_session(tmp_path: Path) -> None:
+    renderer = _Renderer()
+    view = WindowsStudentView(
+        WindowsMessageStore(tmp_path / "messages.sqlite3", student_id="student-a"),
+        renderer=renderer,
+    )
+    view.update_sessions(
+        [{"session_id": "session-a"}],
+        active_session_id="session-a",
+        active_reliable=True,
+    )
+
+    assert view.present_mentor_message(_mentor("notice-1")) is True
+    assert view.state.mentor_messages == ()
+
+
+def test_session_buckets_and_unread_survive_restart(tmp_path: Path) -> None:
+    path = tmp_path / "messages.sqlite3"
+    first = WindowsStudentView(
+        WindowsMessageStore(path, student_id="student-a"), renderer=_Renderer()
+    )
+    sessions = [{"session_id": "session-a"}, {"session_id": "session-b"}]
+    first.update_sessions(sessions, active_session_id="session-a", active_reliable=True)
+    assert first.present_mentor_message(
+        _mentor("message-b", session_id="session-b", scope="session")
+    ) is False
+
+    restarted_store = WindowsMessageStore(path, student_id="student-a")
+    restarted = WindowsStudentView(restarted_store, renderer=_Renderer())
+    restarted.update_sessions(sessions, active_session_id="session-a", active_reliable=True)
+
+    assert restarted.state.mentor_messages == ()
+    assert restarted_store.unread_count == 1
+    restarted.select_session("session-b")
+    assert [item.key for item in restarted.state.mentor_messages] == ["message-b"]
+    assert restarted_store.unread_count == 0
+    assert restarted.present_mentor_message(
+        _mentor("message-b", session_id="session-b", scope="session")
+    ) is True
 
 
 def test_opening_panel_clears_persisted_unread_badge(tmp_path: Path) -> None:
@@ -956,7 +1085,6 @@ def test_tk_adapter_projects_sessions_ask_feedback_and_callback_seams(
     assert "已回答" in ask_status.options["text"]
     assert "完整答案" in ask_status.options["text"]
     assert helpful.options["state"] == "normal"
-
     failed = replace(
         view.state,
         ask=replace(view.state.ask, status="failed", error_code="offline"),
@@ -965,6 +1093,35 @@ def test_tk_adapter_projects_sessions_ask_feedback_and_callback_seams(
     assert "失败" in ask_status.options["text"]
     assert "offline" in ask_status.options["text"]
     assert helpful.options["state"] == "disabled"
+
+
+def test_tk_session_selector_hides_ids_and_numbers_duplicate_titles(tmp_path: Path) -> None:
+    selector = _FakeSelector()
+    adapter = TkWindowsStudentAdapter(
+        icon_window=_FakeWindow(),
+        panel_window=_FakeWindow(),
+        unread_badge=_FakeLabel(),
+        content_widget=_FakeText(),
+        session_selector=selector,
+    )
+    view = WindowsStudentView(
+        WindowsMessageStore(tmp_path / "messages.sqlite3", student_id="student-a"),
+        renderer=adapter,
+    )
+
+    view.update_sessions(
+        [
+            {"session_id": "private-id-a", "title": "同名对话"},
+            {"session_id": "private-id-b", "title": "同名对话"},
+            {"session_id": "private-id-c"},
+        ],
+        active_session_id="private-id-a",
+        active_reliable=True,
+    )
+
+    labels = selector.options["values"]
+    assert labels == ("同名对话（1）", "同名对话（2）", "新建对话")
+    assert all("private-id" not in label for label in labels)
 
 
 def test_focus_request_is_consumed_after_one_successful_tk_render(tmp_path: Path) -> None:

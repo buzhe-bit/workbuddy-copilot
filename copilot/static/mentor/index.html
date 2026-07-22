@@ -97,6 +97,9 @@
 
         <!-- 右栏：时间线 -->
         <section class="panel panel-timeline" aria-labelledby="timeline-heading">
+          <div id="conversation-context" class="conversation-context" role="status" aria-live="polite">
+            请选择学员和对话
+          </div>
           <h2 id="timeline-heading">时间线</h2>
 
           <!-- 会话级单一入口：查看整段对话原文（懒加载，与逐条摘要解耦） -->
@@ -107,12 +110,28 @@
 
           <div id="timeline" class="timeline"></div>
 
-          <!-- 发消息：定向当前学员 -->
+          <!-- 会话回复：只进入当前对话。 -->
           <form id="compose" class="compose" autocomplete="off">
-            <input id="compose-input" type="text" aria-label="发给当前学员的导师提示"
-                   placeholder="选中学员后可发送提示…（不改 AI，仅提示学员）" disabled />
-            <button id="compose-send" type="submit" disabled>发送</button>
+            <input id="compose-input" type="text" aria-label="当前对话的导师回复"
+                   placeholder="选中对话后可发送回复…" disabled />
+            <button id="compose-send" type="submit" disabled>发送回复</button>
           </form>
+
+          <!-- 学员通知独立于会话，不写入任何对话时间线。 -->
+          <section class="notification-area" aria-label="学员通知">
+            <button id="notification-toggle" class="notification-toggle" type="button" disabled>
+              给学员发通知
+            </button>
+            <form id="notification-form" class="notification-form" autocomplete="off" hidden>
+              <label for="notification-input">独立通知</label>
+              <div>
+                <input id="notification-input" type="text" aria-label="给当前学员的独立通知"
+                       placeholder="输入不会进入对话的通知…" disabled />
+                <button type="submit" disabled>发送通知</button>
+              </div>
+            </form>
+            <div id="notification-status" class="notification-status" role="status" aria-live="polite"></div>
+          </section>
 
           <!-- 四色类型图例：色块同步卡片背景色 -->
           <div class="legend">

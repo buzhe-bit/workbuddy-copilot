@@ -323,9 +323,14 @@ class StudentCoordinator:
         try:
             if message_key not in self.rendered_message_ids and self.message_handler is not None:
                 try:
-                    await _maybe_await(self.message_handler(payload))
+                    displayed = await _maybe_await(self.message_handler(payload))
                 except Exception as exc:
                     log.warning("mentor message handler failed type=%s", type(exc).__name__)
+                    return False
+                # ``False`` is the platform contract for a durable inbox
+                # write that is intentionally not on the current surface.
+                # ``None`` remains a successful display for old adapters.
+                if displayed is False:
                     return False
             if message_key not in self.rendered_message_ids:
                 try:

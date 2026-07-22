@@ -10,7 +10,7 @@ from copilot.app_context import get_message_service, get_session_service, get_st
 from copilot.eventbus import EventBus
 from copilot.service import app
 from copilot.models import Student, Conversation, TimelineEntry
-from copilot.services import MessageService
+from copilot.services import MessageService, SessionQueryService
 from copilot.store import Store
 
 
@@ -85,6 +85,37 @@ class TestMentorStudentSessions:
         finally:
             app.dependency_overrides.clear()
 
+    def test_session_list_exposes_safe_display_title(self, client):
+        conversation = Conversation(session_id="opaque-id", title="")
+        conversation.display_title = "学员的第一条问题"
+
+        class FakeSessionService:
+            def list_sessions(self, student_id):
+                return [conversation]
+
+        app.dependency_overrides[get_session_service] = lambda: FakeSessionService()
+        try:
+            response = client.get("/api/mentor/students/stu-1/sessions")
+            assert response.status_code == 200
+            item = response.json()["items"][0]
+            assert item["display_title"] == "学员的第一条问题"
+            assert item["display_title"] != item["session_id"]
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_session_service_derives_display_title_without_exposing_session_id(self, tmp_path):
+        store = Store(tmp_path / "sessions.db")
+        store.upsert_student("stu-1")
+        store.upsert_session("opaque-prompt", "stu-1", "", "", created_at=1, last_activity_at=1)
+        store.upsert_session("opaque-timestamp", "stu-1", "", "", created_at=0, last_activity_at=0)
+        store.add_prompt("opaque-prompt", 0, "stu-1", "这是第一条学员提问，长度超过三十二个字符时需要截断而不能展示会话ID")
+
+        rows = SessionQueryService(store, {}).list_sessions("stu-1")
+        by_session = {row.session_id: row for row in rows}
+
+        assert by_session["opaque-prompt"].display_title == "这是第一条学员提问，长度超过三十二个字符时需要截断而不能展示会话"
+        assert by_session["opaque-timestamp"].display_title == "对话 1970年01月01日 08:00"
+
 
 class TestMentorTimeline:
     """GET /api/mentor/sessions/{id}/timeline。"""
@@ -126,6 +157,42 @@ class TestMentorTimeline:
             resp = client.get("/api/mentor/sessions/nonexistent/timeline")
             assert resp.status_code == 200
             assert resp.json()["items"] == []
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_mentor_message_delivery_state_changes_after_ack(self, client, tmp_path):
+        store = Store(tmp_path / "timeline-delivery.db")
+        store.upsert_student("stu-1")
+        store.upsert_session("sess-1", "stu-1", "", "", created_at=1, last_activity_at=1)
+        message_svc = MessageService(store, EventBus())
+        sent = asyncio.run(message_svc.send(
+            "stu-1", "mentor-1", "Session hint",
+            session_id="sess-1", client_request_id="timeline-request",
+        ))
+        app.dependency_overrides[get_session_service] = lambda: SessionQueryService(store, {})
+        try:
+            pending = client.get("/api/mentor/sessions/sess-1/timeline").json()["items"]
+            pending_message = next(item for item in pending if item["type"] == "mentor_message")
+            assert pending_message["delivered"] is False
+            assert {
+                key: pending_message[key]
+                for key in (
+                    "message_id", "client_request_id", "student_id", "mentor_id",
+                    "session_id", "scope",
+                )
+            } == {
+                "message_id": sent["message_id"],
+                "client_request_id": "timeline-request",
+                "student_id": "stu-1",
+                "mentor_id": "mentor-1",
+                "session_id": "sess-1",
+                "scope": "session",
+            }
+
+            assert asyncio.run(message_svc.ack(sent["message_id"], "stu-1")) is True
+            delivered = client.get("/api/mentor/sessions/sess-1/timeline").json()["items"]
+            delivered_message = next(item for item in delivered if item["type"] == "mentor_message")
+            assert delivered_message["delivered"] is True
         finally:
             app.dependency_overrides.clear()
 
@@ -323,6 +390,55 @@ class TestReverseMessageApi:
         finally:
             app.dependency_overrides.clear()
 
+    def test_post_session_mentor_message_forwards_scope_and_session_id(self, client):
+        class FakeMessageService:
+            async def send(self, student_id, mentor_id, text, client_request_id=None, session_id=None, scope=None):
+                assert (student_id, mentor_id, text) == ("stu-1", None, "Scoped hint")
+                assert client_request_id == "session-request"
+                assert session_id == "session-1"
+                assert scope == "session"
+                return {
+                    "message_id": "msg-1", "id": 3, "student_id": student_id,
+                    "session_id": session_id, "scope": scope,
+                    "client_request_id": client_request_id, "delivered": False,
+                    "duplicate": False,
+                }
+
+        app.dependency_overrides[get_message_service] = lambda: FakeMessageService()
+        try:
+            response = client.post("/api/mentor/message", json={
+                "student_id": "stu-1", "text": "Scoped hint", "session_id": "session-1",
+                "scope": "session", "client_request_id": "session-request",
+            })
+            assert response.status_code == 200
+            assert response.json()["scope"] == "session"
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.mark.parametrize("payload", [
+        {"student_id": "stu-1", "text": "x", "scope": "session"},
+        {"student_id": "stu-1", "text": "x", "scope": "student", "session_id": "session-1"},
+        {"student_id": "stu-1", "text": "x", "scope": "invalid"},
+    ])
+    def test_post_mentor_message_rejects_invalid_scope_shape(self, client, payload):
+        response = client.post("/api/mentor/message", json=payload)
+        assert response.status_code == 422
+
+    def test_post_mentor_message_returns_404_for_unknown_or_foreign_session(self, client):
+        class FakeMessageService:
+            async def send(self, **kwargs):
+                raise LookupError("session not found")
+
+        app.dependency_overrides[get_message_service] = lambda: FakeMessageService()
+        try:
+            response = client.post("/api/mentor/message", json={
+                "student_id": "stu-1", "text": "x", "session_id": "unknown",
+            })
+            assert response.status_code == 404
+            assert response.json()["detail"] == "session not found"
+        finally:
+            app.dependency_overrides.clear()
+
     def test_mentor_message_status_is_bounded_and_mentor_protected(
         self,
         client,
@@ -412,6 +528,8 @@ class TestReverseMessageApi:
                 "message_id": sent["message_id"],
                 "id": sent["id"],
                 "student_id": "stu-1",
+                "session_id": "",
+                "scope": "student",
                 "delivered": True,
             }]}
             assert "private mentor guidance" not in response.text

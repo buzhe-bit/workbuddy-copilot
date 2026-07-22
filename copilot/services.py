@@ -12,6 +12,7 @@ import copy
 import re
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from time import monotonic
 from typing import Any, Awaitable, Callable
 
@@ -581,42 +582,52 @@ class SessionQueryService:
     def list_sessions(self, student_id: str, limit: int = 1000) -> list[Conversation]:
         """某学员的对话列表（以 copilot.db sessions 表为权威源）。"""
         rows = self.copilot.get_sessions_by_student(student_id, limit=limit)
-        return [Conversation(
-            session_id=r["session_id"],
-            work_dir=r.get("work_dir", ""),
-            title=r.get("session_title", ""),
-            group_type=r.get("group_type", "") or "",
-            space_name=r.get("space_name", "") or "",
-            created_at=r.get("created_at", 0) or 0,
-            analysis_count=r.get("analysis_count", 0),
-            message_count=r.get("message_count", 0),
-            alert_count=r.get("alert_count", 0),
-            last_diagnosis=r.get("last_diagnosis", ""),
-            last_topic=r.get("last_topic", ""),
-            last_severity=r.get("last_severity", "info"),
-            last_is_technical=r.get("last_is_technical", 0),
-            last_activity_at=r.get("last_ts", 0),
-        ) for r in rows]
+        conversations = []
+        for r in rows:
+            conversation = Conversation(
+                session_id=r["session_id"], work_dir=r.get("work_dir", ""),
+                title=r.get("session_title", ""), group_type=r.get("group_type", "") or "",
+                space_name=r.get("space_name", "") or "", created_at=r.get("created_at", 0) or 0,
+                analysis_count=r.get("analysis_count", 0), message_count=r.get("message_count", 0),
+                alert_count=r.get("alert_count", 0), last_diagnosis=r.get("last_diagnosis", ""),
+                last_topic=r.get("last_topic", ""), last_severity=r.get("last_severity", "info"),
+                last_is_technical=r.get("last_is_technical", 0), last_activity_at=r.get("last_ts", 0),
+            )
+            title = str(conversation.title or "").strip()
+            if not title:
+                title = str(r.get("first_prompt") or "").strip()[:32]
+            if not title:
+                timestamp = float(r.get("created_at") or r.get("last_ts") or 0)
+                title = "对话 " + datetime.fromtimestamp(
+                    timestamp, timezone(timedelta(hours=8)),
+                ).strftime("%Y年%m月%d日 %H:%M")
+            conversation.display_title = title
+            conversations.append(conversation)
+        return conversations
 
     def get_timeline(self, session_id: str) -> list[TimelineEntry]:
         """某对话的时间线（三表 UNION）。"""
         rows = self.copilot.get_timeline_by_session(session_id)
-        return [TimelineEntry(
-            type=r.get("type", ""),
-            content=r.get("content", ""),
-            created_at=r.get("created_at", 0),
-            session_id=r.get("session_id", session_id),
-            seq_in_session=r.get("seq_in_session"),
-            prompt_id=r.get("prompt_id"),
-            reply_ref=r.get("reply_ref"),
-            has_summary=bool(r.get("has_summary", False)),
-            has_full_reply=bool(r.get("has_full_reply", False)),
-            suggestion=r.get("suggestion", ""),
-            severity=r.get("severity", ""),
-            understanding=r.get("understanding", "") or "",
-            topic=r.get("topic", "") or "",
-            is_technical=bool(r.get("is_technical", 0)),
-        ) for r in rows]
+        entries = []
+        for r in rows:
+            entry = TimelineEntry(
+                type=r.get("type", ""), content=r.get("content", ""),
+                created_at=r.get("created_at", 0), session_id=r.get("session_id", session_id),
+                seq_in_session=r.get("seq_in_session"), prompt_id=r.get("prompt_id"),
+                reply_ref=r.get("reply_ref"), has_summary=bool(r.get("has_summary", False)),
+                has_full_reply=bool(r.get("has_full_reply", False)), suggestion=r.get("suggestion", ""),
+                severity=r.get("severity", ""), understanding=r.get("understanding", "") or "",
+                topic=r.get("topic", "") or "", is_technical=bool(r.get("is_technical", 0)),
+            )
+            if entry.type == "mentor_message":
+                entry.student_id = r.get("student_id", "")
+                entry.mentor_id = r.get("mentor_id", "")
+                entry.message_id = r.get("message_id", "")
+                entry.client_request_id = r.get("client_request_id")
+                entry.scope = "session"
+                entry.delivered = bool(r.get("delivered_at"))
+            entries.append(entry)
+        return entries
 
     def get_active_session(
         self,
@@ -653,9 +664,22 @@ class MessageService:
         mentor_id: str | None,
         text: str,
         client_request_id: str | None = None,
+        session_id: str | None = None,
+        scope: str | None = None,
     ) -> dict[str, Any]:
         """Persist a mentor message, publish it, and report delivery status."""
         resolved_mentor_id = mentor_id or "mentor"
+        resolved_session_id = str(session_id or "").strip()
+        resolved_scope = scope or ("session" if resolved_session_id else "student")
+        if resolved_scope not in {"session", "student"}:
+            raise ValueError("invalid mentor message scope")
+        if resolved_scope == "session":
+            if not resolved_session_id:
+                raise ValueError("session scope requires session_id")
+            if not self.copilot.session_belongs_to_student(resolved_session_id, student_id):
+                raise LookupError("session not found")
+        elif resolved_session_id:
+            raise ValueError("student scope cannot include session_id")
         message_id = uuid.uuid4().hex
         created = True
         if client_request_id is None:
@@ -663,7 +687,7 @@ class MessageService:
             row_id = self.copilot.add_mentor_message(
                 student_id=student_id,
                 mentor_id=resolved_mentor_id,
-                session_id="",
+                session_id=resolved_session_id,
                 text=text,
                 message_id=message_id,
             )
@@ -672,7 +696,7 @@ class MessageService:
             row, created = self.copilot.get_or_create_mentor_message(
                 student_id=student_id,
                 mentor_id=resolved_mentor_id,
-                session_id="",
+                session_id=resolved_session_id,
                 text=text,
                 message_id=message_id,
                 client_request_id=client_request_id,
@@ -687,13 +711,13 @@ class MessageService:
         result = {
             "message_id": message_id,
             "id": row_id,
+            "student_id": student_id,
+            "session_id": resolved_session_id,
+            "scope": resolved_scope,
+            "client_request_id": client_request_id,
             "delivered": bool(delivered_row.get("delivered_at")),
+            "duplicate": not created,
         }
-        if client_request_id is not None:
-            result.update({
-                "client_request_id": client_request_id,
-                "duplicate": not created,
-            })
         return result
 
     def get_mentor_message_statuses(
@@ -706,6 +730,8 @@ class MessageService:
             "message_id": row["message_id"],
             "id": row["id"],
             "student_id": row["student_id"],
+            "session_id": row.get("session_id") or "",
+            "scope": "session" if row.get("session_id") else "student",
             "delivered": bool(row.get("delivered_at")),
         } for row in self.copilot.list_mentor_messages_by_client_request_ids(
             client_request_ids,
@@ -797,5 +823,8 @@ class MessageService:
             "id": row["id"],
             "text": row["text"],
             "mentor_id": row["mentor_id"],
+            "session_id": row.get("session_id") or "",
+            "scope": "session" if row.get("session_id") else "student",
+            "client_request_id": row.get("client_request_id"),
             "timestamp": row["created_at"],
         }

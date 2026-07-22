@@ -1482,6 +1482,20 @@ class Store:
                      s.space_name,
                      s.created_at,
                      s.last_activity_at AS last_ts,
+                     (SELECT content FROM (
+                        SELECT p.content AS content, p.created_at AS created_at, p.id AS item_id
+                        FROM prompts p
+                        WHERE p.session_id = s.session_id
+                          AND p.student_id = s.student_id
+                          AND TRIM(p.content) != ''
+                        UNION ALL
+                        SELECT m.text AS content, m.created_at AS created_at, m.id AS item_id
+                        FROM messages m
+                        WHERE m.session_id = s.session_id
+                          AND m.student_id = s.student_id
+                          AND m.role = 'user'
+                          AND TRIM(m.text) != ''
+                     ) ORDER BY created_at ASC, item_id ASC LIMIT 1) AS first_prompt,
                      COUNT(a.id) AS analysis_count,
                      COALESCE(MAX(mc.c), 0) AS message_count,
                      COALESCE(SUM(CASE
@@ -1530,6 +1544,14 @@ class Store:
                 (student_id, limit),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def session_belongs_to_student(self, session_id: str, student_id: str) -> bool:
+        """Return ownership without exposing whether another student owns it."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ? AND student_id = ?",
+                (session_id, student_id),
+            ).fetchone() is not None
 
     def get_session_title(self, session_id: str) -> str:
         """Return a session title from copilot.db."""
@@ -1710,7 +1732,7 @@ class Store:
         placeholders = ",".join("?" for _ in ordered_ids)
         with self._conn() as c:
             rows = c.execute(
-                f"""SELECT client_request_id, message_id, id, student_id,
+                f"""SELECT client_request_id, message_id, id, student_id, session_id,
                            delivered_at
                     FROM mentor_messages
                     WHERE client_request_id IN ({placeholders})""",
@@ -5020,6 +5042,21 @@ class Store:
                 })
         return events
 
+    def _mentor_message_timeline_rows(self, c: sqlite3.Connection, session_id: str) -> list[dict]:
+        rows = c.execute(
+            """SELECT id, session_id, student_id, text AS content, created_at,
+                      'mentor_message' AS type,
+                      NULL AS seq_in_session, NULL AS prompt_id, NULL AS reply_ref,
+                      NULL AS report_id, NULL AS severity, NULL AS understanding,
+                      NULL AS suggestion, NULL AS is_technical, NULL AS topic,
+                      NULL AS has_summary, NULL AS has_full_reply,
+                      mentor_id, message_id, client_request_id, delivered_at
+               FROM mentor_messages
+               WHERE session_id = ?""",
+            (session_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_timeline_by_session(self, session_id: str) -> list[dict]:
         """Timeline aggregation by session.
 
@@ -5031,8 +5068,9 @@ class Store:
             if not events:
                 events = self._bulk_message_timeline_rows(c, session_id)
             events.extend(self._analysis_timeline_rows(c, session_id))
+            events.extend(self._mentor_message_timeline_rows(c, session_id))
             if events:
-                priority = {"prompt": 0, "ai_summary": 1, "analysis": 2}
+                priority = {"prompt": 0, "ai_summary": 1, "analysis": 2, "mentor_message": 3}
                 events.sort(key=lambda item: (
                     float(item.get("created_at") or 0),
                     priority.get(str(item.get("type") or ""), 99),

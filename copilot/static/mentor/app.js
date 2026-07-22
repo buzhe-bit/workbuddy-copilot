@@ -9,7 +9,7 @@
 //   GET  /api/mentor/students                       学员列表
 //   GET  /api/mentor/students/{id}/sessions         某学员的对话列表
 //   GET  /api/mentor/sessions/{id}/timeline         某对话的时间线
-//   POST /api/mentor/message {student_id,text,client_request_id} 幂等发消息
+//   POST /api/mentor/message {student_id,session_id?,scope,text,client_request_id} 幂等发消息
 //   POST /api/mentor/messages/status               断线/响应丢失后补查送达状态
 //   WS   /ws/mentor                                 实时事件推送
 
@@ -41,6 +41,7 @@ const state = {
   replies: {},
   // 出站导师消息独立于当前 timeline，切学员后仍能匹配送达回执。
   outboundMessages: [],
+  notifications: [],
   pendingDeliveryReceipts: [],
 };
 
@@ -107,6 +108,11 @@ const systemStatusEl = document.getElementById('system-status');
 const composeForm = document.getElementById('compose');
 const composeInput = document.getElementById('compose-input');
 const composeSend = document.getElementById('compose-send');
+const conversationContextEl = document.getElementById('conversation-context');
+const notificationToggle = document.getElementById('notification-toggle');
+const notificationForm = document.getElementById('notification-form');
+const notificationInput = document.getElementById('notification-input');
+const notificationStatusEl = document.getElementById('notification-status');
 const transcriptEntryEl = document.getElementById('transcript-entry');
 const transcriptBodyEl = document.getElementById('transcript-body');
 const syncBtn = document.getElementById('sync-student');
@@ -166,6 +172,10 @@ function formatTime(ts) {
 function currentStudentName() {
   const s = state.students.find((x) => x.student_id === state.currentStudentId);
   return (s && (s.display_name || s.student_id)) || state.currentStudentId || '学员';
+}
+
+function currentSession() {
+  return state.sessions.find((session) => session.session_id === state.currentSessionId) || null;
 }
 
 function storedMentorToken() {
@@ -1042,11 +1052,27 @@ async function selectStudent(studentId) {
 }
 
 function sessionTitleOf(s) {
-  // 后端当前返回 title；契约字段名 session_title —— 两者都兼容
-  // 标题为空（含纯空白）时显示"未命名对话"，绝不回退到原始 session_id
-  // （原始 id 如 "44cc4b2e-1d3e…" / "hook-test-3" 对导师无意义、观感差）
-  const raw = (s.session_title || s.title || '').trim();
-  return raw || '未命名对话';
+  // display_title 是后端为导师端准备的标题；旧字段只作兼容，不泄露 session_id。
+  const raw = (s.display_title || s.title || s.session_title ||
+    s.first_prompt || s.prompt || s.first_message || '').trim();
+  if (raw) return raw;
+  const date = formatTime(s.created_at || s.last_activity_at || s.updated_at);
+  return date ? '对话 · ' + date : '新建对话';
+}
+
+function renderConversationContext() {
+  if (!conversationContextEl) return;
+  const session = currentSession();
+  if (!state.currentStudentId || !session) {
+    conversationContextEl.textContent = state.currentStudentId
+      ? currentStudentName() + ' · 请选择对话'
+      : '请选择学员和对话';
+    return;
+  }
+  const group = session.group_type === 'space'
+    ? 'Space · ' + ((session.space_name || '').trim() || '未命名空间')
+    : 'Task';
+  conversationContextEl.textContent = currentStudentName() + ' · ' + group + ' · ' + sessionTitleOf(session);
 }
 
 // 会话最后活动时间（倒序排列用）；主字段 last_activity_at，容错回退到其它时间字段
@@ -1211,6 +1237,7 @@ function renderSessions() {
     );
   }
   if (replacement && elementIsRendered(replacement)) replacement.focus();
+  renderConversationContext();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1222,6 +1249,7 @@ async function selectSession(sessionId) {
   resetTranscript(); // 换会话 → 原文入口回到未加载/收起态（原文是会话级）
   resetReplies();    // 换会话 → AI 回复展开缓存回到未加载/收起态
   renderSessions(); // 只更新选中态，state.sessions 不变（修 B3 伪状态 bug）
+  updateComposeEnabled(); // 会话已确定；即使 timeline 拉取失败也允许回复。
   await fetchTimeline(sessionId, { replace: true });
 }
 
@@ -1232,11 +1260,13 @@ async function fetchTimeline(sessionId, { replace } = {}) {
     const items = (data.items || []).map(normalizeRestEntry);
     if (state.currentSessionId !== sessionId) return; // 期间已切走
     if (replace) {
-      // timeline 接口不返回导师出站消息；按学员恢复本页面发送记录。
+      // timeline 接口不返回导师出站消息；只恢复当前学员的当前会话回复。
       const pendingOutbound = state.outboundMessages.filter(
-        (entry) => entry.student_id === state.currentStudentId
+        (entry) => entry.scope === 'session' &&
+          entry.student_id === state.currentStudentId &&
+          entry.session_id === sessionId
       );
-      state.timeline = items.concat(pendingOutbound);
+      state.timeline = mergeTimelineOutbound(items, pendingOutbound);
     } else {
       state.timeline = items;
     }
@@ -1253,9 +1283,10 @@ async function fetchTimeline(sessionId, { replace } = {}) {
 //     mentor_name, message_id, server_id, delivered, _optimistic }
 // ─────────────────────────────────────────────────────────────
 function normalizeRestEntry(r) {
+  const type = r.type || 'unknown';
   return {
-    key: 'rest-' + (r.type || '') + '-' + (r.created_at || 0) + '-' + Math.random().toString(36).slice(2, 7),
-    type: r.type || 'unknown',
+    key: 'rest-' + type + '-' + (r.created_at || 0) + '-' + Math.random().toString(36).slice(2, 7),
+    type: type,
     content: r.content || '',
     created_at: r.created_at || 0,
     severity: r.severity || '',
@@ -1268,8 +1299,44 @@ function normalizeRestEntry(r) {
     prompt_id: r.prompt_id != null ? r.prompt_id : null,
     reply_ref: r.reply_ref || (r.prompt_id != null ? ('prompt:' + r.prompt_id) : null),
     has_full_reply: !!r.has_full_reply,
-    delivered: true,
+    mentor_name: r.mentor_name || '导师',
+    message_id: r.message_id || null,
+    server_id: r.id != null ? r.id : null,
+    client_request_id: r.client_request_id || null,
+    student_id: r.student_id || null,
+    session_id: r.session_id || null,
+    scope: r.scope || null,
+    // 导师消息只有服务端明确 delivered=true 才显示为已展示；缺字段不能猜测成功。
+    delivered: type === 'mentor_message' ? r.delivered === true : true,
   };
+}
+
+function sameMentorMessage(left, right) {
+  return !!(
+    (left.client_request_id && left.client_request_id === right.client_request_id) ||
+    (left.message_id && left.message_id === right.message_id) ||
+    (left.server_id != null && left.server_id === right.server_id)
+  );
+}
+
+function mergeTimelineOutbound(restItems, outboundMessages) {
+  const merged = restItems.slice();
+  outboundMessages.forEach((outbound) => {
+    const index = merged.findIndex((rest) =>
+      rest.type === 'mentor_message' && sameMentorMessage(rest, outbound)
+    );
+    if (index < 0) {
+      merged.push(outbound);
+      return;
+    }
+    const rest = merged[index];
+    if (!outbound.message_id && rest.message_id) outbound.message_id = rest.message_id;
+    if (outbound.server_id == null && rest.server_id != null) outbound.server_id = rest.server_id;
+    if (rest.delivered) outbound.delivered = true;
+    if (outbound._failed) outbound._failed = false;
+    merged[index] = outbound;
+  });
+  return merged;
 }
 
 function wsPayloadToTimeline(payload) {
@@ -1479,9 +1546,9 @@ function badge(cls, text) {
 
 function deliveredPill(entry) {
   let pill;
-  if (entry.delivered) pill = el('span', 'pill', '✓ 已展示');
+  if (entry.delivered) pill = el('span', 'pill', '已展示');
   else if (entry._failed) pill = el('span', 'pill failed', '发送失败');
-  else pill = el('span', 'pill sending', '发送中…');
+  else pill = el('span', 'pill sending', '发送中');
   pill.setAttribute('role', 'status');
   pill.setAttribute('aria-live', 'polite');
   return pill;
@@ -1811,12 +1878,18 @@ if (retryAnalysisBtn) retryAnalysisBtn.addEventListener('click', retryUploadAnal
 // 导师发消息 + 学员端已展示
 // ─────────────────────────────────────────────────────────────
 function updateComposeEnabled() {
-  const enabled = !!state.currentStudentId;
-  composeInput.disabled = !enabled;
-  composeSend.disabled = !enabled;
-  composeInput.placeholder = enabled
-    ? ('给 ' + currentStudentName() + ' 发一条提示…（不改 AI，仅提示学员）')
-    : '选中学员后可发送提示…（不改 AI，仅提示学员）';
+  const sessionEnabled = !!(state.currentStudentId && state.currentSessionId);
+  const studentEnabled = !!state.currentStudentId;
+  composeInput.disabled = !sessionEnabled;
+  composeSend.disabled = !sessionEnabled;
+  composeInput.placeholder = sessionEnabled
+    ? ('回复 ' + currentStudentName() + ' 的当前对话…')
+    : '选中学员和对话后可发送回复…';
+  if (notificationToggle) notificationToggle.disabled = !studentEnabled;
+  if (notificationInput) notificationInput.disabled = !studentEnabled;
+  if (notificationForm) notificationForm.querySelector('button[type="submit"]').disabled = !studentEnabled;
+  renderConversationContext();
+  renderNotificationStatus();
 }
 
 function retainOutboundMessage(entry) {
@@ -1828,6 +1901,20 @@ function retainOutboundMessage(entry) {
   if (removable < 0) removable = 0;
   const removed = state.outboundMessages.splice(removable, 1)[0];
   state.timeline = state.timeline.filter((message) => message !== removed);
+  state.notifications = state.notifications.filter((message) => message !== removed);
+}
+
+function deliveryLabel(entry) {
+  return entry && entry.delivered ? '已展示' : entry && entry._failed ? '发送失败' : '发送中';
+}
+
+function renderNotificationStatus() {
+  if (!notificationStatusEl) return;
+  const notifications = state.notifications.filter((entry) => entry.student_id === state.currentStudentId);
+  const last = notifications[notifications.length - 1];
+  notificationStatusEl.textContent = last
+    ? '独立通知：' + deliveryLabel(last)
+    : '';
 }
 
 function applyRecoveredMessageStatus(item) {
@@ -1924,7 +2011,8 @@ async function recoverFailedOutboundMessage(entry) {
 
 async function sendMentorMessage(text) {
   const studentId = state.currentStudentId;
-  if (!studentId || !text.trim()) return;
+  const sessionId = state.currentSessionId;
+  if (!studentId || !sessionId || !text.trim()) return;
   const localId = 'out-' + (++outboundSeq);
   const clientRequestId = newClientRequestId();
 
@@ -1941,6 +2029,8 @@ async function sendMentorMessage(text) {
     delivered: false,
     _optimistic: true,
     student_id: studentId,
+    session_id: sessionId,
+    scope: 'session',
     client_request_id: clientRequestId,
   };
   retainOutboundMessage(entry);
@@ -1953,6 +2043,8 @@ async function sendMentorMessage(text) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         student_id: studentId,
+        session_id: sessionId,
+        scope: 'session',
         text: entry.content,
         client_request_id: clientRequestId,
       }),
@@ -1980,6 +2072,49 @@ async function sendMentorMessage(text) {
   renderTimeline();
 }
 
+async function sendStudentNotification(text) {
+  const studentId = state.currentStudentId;
+  if (!studentId || !text.trim()) return;
+  const entry = {
+    key: 'notice-' + (++outboundSeq),
+    type: 'mentor_notification',
+    content: text.trim(),
+    created_at: Date.now() / 1000,
+    message_id: null,
+    server_id: null,
+    delivered: false,
+    _optimistic: true,
+    student_id: studentId,
+    scope: 'student',
+    client_request_id: newClientRequestId(),
+  };
+  retainOutboundMessage(entry);
+  state.notifications.push(entry);
+  renderNotificationStatus();
+  try {
+    const resp = await authFetch('/api/mentor/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        student_id: studentId,
+        scope: 'student',
+        text: entry.content,
+        client_request_id: entry.client_request_id,
+      }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    entry.message_id = data.message_id || null;
+    entry.server_id = data.id != null ? data.id : null;
+    if (data.delivered) entry.delivered = true;
+  } catch (err) {
+    console.error('发送学员通知失败', err);
+    entry._failed = true;
+    recoverFailedOutboundMessage(entry);
+  }
+  renderNotificationStatus();
+}
+
 // WS message_delivered → 把对应出站条标记学员端已展示
 function deliveryMatchesEntry(entry, payload) {
   const byMsgId = payload.message_id && entry.message_id === payload.message_id;
@@ -1995,14 +2130,15 @@ function markDelivered(payload) {
   const candidates = state.outboundMessages.concat(
     state.timeline.filter((entry) => !state.outboundMessages.includes(entry))
   );
-  candidates.forEach((e) => {
-    if (e.type !== 'mentor_message' || !deliveryMatchesEntry(e, payload)) return;
+  candidates.forEach((entry) => {
+    const outbound = entry.type === 'mentor_message' || entry.type === 'mentor_notification';
+    if (!outbound || !deliveryMatchesEntry(entry, payload)) return;
     matched = true;
-    if (!e.message_id && payload.message_id) e.message_id = payload.message_id;
-    if (e.server_id == null && payload.id != null) e.server_id = payload.id;
-    if (!e.delivered) {
-      e.delivered = true;
-      e._failed = false;
+    if (!entry.message_id && payload.message_id) entry.message_id = payload.message_id;
+    if (entry.server_id == null && payload.id != null) entry.server_id = payload.id;
+    if (!entry.delivered) {
+      entry.delivered = true;
+      entry._failed = false;
       changed = true;
     }
   });
@@ -2018,7 +2154,10 @@ function markDelivered(payload) {
       if (state.pendingDeliveryReceipts.length > 300) state.pendingDeliveryReceipts.shift();
     }
   }
-  if (changed) renderTimeline();
+  if (changed) {
+    renderTimeline();
+    renderNotificationStatus();
+  }
 }
 
 composeForm.addEventListener('submit', (evt) => {
@@ -2027,6 +2166,20 @@ composeForm.addEventListener('submit', (evt) => {
   if (!text.trim() || !state.currentStudentId) return;
   composeInput.value = '';
   sendMentorMessage(text);
+});
+
+if (notificationToggle) notificationToggle.addEventListener('click', () => {
+  if (!notificationForm) return;
+  notificationForm.hidden = !notificationForm.hidden;
+  if (!notificationForm.hidden && !notificationInput.disabled) notificationInput.focus();
+});
+
+if (notificationForm) notificationForm.addEventListener('submit', (evt) => {
+  evt.preventDefault();
+  const text = notificationInput.value;
+  if (!text.trim() || !state.currentStudentId) return;
+  notificationInput.value = '';
+  sendStudentNotification(text);
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -2108,6 +2261,7 @@ window.addEventListener('DOMContentLoaded', () => {
   syncResponsiveMode();
   renderAttention();     // 初始关注队列骨架
   renderTimeline();      // 初始空态提示
+  renderNotificationStatus();
   updateComposeEnabled();
   updateSyncEnabled();   // 初始未选中学员 → 同步按钮禁用
   // 先完成一次导师鉴权，再拉关注队列，避免 public 模式并发 401 弹两次 token 输入。

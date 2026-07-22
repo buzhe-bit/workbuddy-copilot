@@ -26,10 +26,9 @@ import urllib.request
 from typing import Any, Optional
 
 import asyncio
-import websockets
-
 from . import wb_sync, wb_upload
 from .config import load_config, service_url, ws_url
+from .student_core.transport import _default_ws_connect
 
 log = logging.getLogger("copilot.floating_native")
 
@@ -120,6 +119,11 @@ PENDING_RECEIPT_RETRY_DELAY_SECONDS = 2.0
 PENDING_RECEIPT_DIRECT_ACK_LIMIT = 64
 
 
+def _connect_float_ws(url: str):
+    """Open the floating client's WebSocket without proxying loopback traffic."""
+    return _default_ws_connect(url, {})
+
+
 def _rect_xywh(rect) -> tuple[float, float, float, float]:
     """Return x/y/width/height for NSRect-like objects or plain tuples."""
     if isinstance(rect, (tuple, list)):
@@ -142,6 +146,21 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     if upper < lower:
         return lower
     return min(max(value, lower), upper)
+
+
+def _session_display_title(session: dict[str, Any]) -> str:
+    for key in ("display_title", "title", "session_title"):
+        title = str(session.get(key) or "").strip()
+        if title:
+            return title
+    for key in ("resumed_at", "last_activity_at", "timestamp"):
+        try:
+            timestamp = float(session.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if timestamp > 0:
+            return time.strftime("%H:%M", time.localtime(timestamp))
+    return "新建对话"
 
 
 def _panel_origin_for_icon(icon_frame, panel_size, screen_frame, gap: float = PANEL_GAP) -> tuple[float, float]:
@@ -552,7 +571,8 @@ class CopilotNativeApp(NSObject):
         self._unread_count = 0
         self._panel_visible = False
         self._items = []
-        self._mentor_items = []
+        self._mentor_items_by_session = {}
+        self._mentor_notifications = []
         self._seen_mentor_message_ids = set()
         self._seen_mentor_message_order = []
         self._pending_receipt_message_ids = set()
@@ -571,12 +591,12 @@ class CopilotNativeApp(NSObject):
         self._current_ask_status = ""
         self._current_ask_rendered_text = ""
         self._ask_feedback_inflight = False
-        self._load_mentor_message_state()
         # 多对话状态
         self._sessions = {}            # session_id -> {title, last_ts, unread, last_result}
         self._sessions_list = []       # 切换栏显示的有序列表
         self._current_session_id = None
         self._wb_sessions = []         # WorkBuddy 侧会话列表（/current_session 返回）
+        self._load_mentor_message_state()
 
         # 创建应用
         app = NSApplication.sharedApplication()
@@ -955,10 +975,6 @@ class CopilotNativeApp(NSObject):
             data = self._get_json("/recent", query=recent_query, timeout=5)
             self._items = data.get("items", [])
 
-            # 当前对话未读清零
-            if cur and cur in self._sessions:
-                self._sessions[cur]["unread"] = 0
-
             try:
                 self._rebuild_session_bar()
             except Exception:
@@ -967,7 +983,14 @@ class CopilotNativeApp(NSObject):
                 self._rebuild_cards()
             except Exception:
                 log.exception("重建分析卡片失败")
-            self._update_icon_state()
+            else:
+                self._settle_current_session_mentor_messages()
+                if cur and cur in self._sessions:
+                    self._sessions[cur]["unread"] = 0
+            try:
+                self._update_icon_state()
+            except Exception:
+                pass
             log.info("_refresh_data 完成: sessions=%d, items=%d, current=%s",
                      len(self._sessions_list), len(self._items),
                      (self._current_session_id or "?")[:8])
@@ -1005,7 +1028,7 @@ class CopilotNativeApp(NSObject):
                 break
         for i, s in enumerate(sessions):
             sid = s.get("session_id")
-            title = s.get("session_title") or (sid[:8] if sid else "?")
+            title = _session_display_title(s)
             # 截断长标题
             if len(title) > 10:
                 title = title[:9] + "…"
@@ -1092,7 +1115,9 @@ class CopilotNativeApp(NSObject):
         card_w = self.card_container.frame().size.width - 16  # 左右各 8 边距
 
         items = sorted(
-            list(self._items) + list(self._mentor_items),
+            list(self._items)
+            + CopilotNativeApp._current_session_mentor_items(self)
+            + list(getattr(self, "_mentor_notifications", [])),
             key=lambda item: item.get("created_at") or item.get("timestamp") or 0,
         )
 
@@ -1238,7 +1263,7 @@ class CopilotNativeApp(NSObject):
             ws_addr = self._float_ws_url()
             log.info("WS 连接中 %s", self._float_ws_url(redact_token=True))
             try:
-                async with websockets.connect(ws_addr, ping_interval=20) as ws:
+                async with _connect_float_ws(ws_addr) as ws:
                     log.info("WS 已连接")
                     backoff = 1
                     self._fetch_mentor_catchup()
@@ -1461,6 +1486,9 @@ class CopilotNativeApp(NSObject):
         message_id = str(data.get("message_id") or "")
         if not message_id:
             return
+        session_id = str(data.get("session_id") or "").strip()
+        scope = str(data.get("scope") or "").strip()
+        is_session_message = bool(session_id and scope in {"", "session"})
         try:
             numeric_id = int(data.get("id") or 0)
         except (TypeError, ValueError):
@@ -1480,13 +1508,14 @@ class CopilotNativeApp(NSObject):
             is_rendering = message_id in rendering_ids
             retry_unpersisted = message_id in unpersisted
             last_seen_id = self._last_seen_mentor_message_id
+            queued = CopilotNativeApp._has_queued_mentor_message(self, message_id)
         if retry_unpersisted:
             if not CopilotNativeApp._persist_unpersisted_rendered_message(self, message_id):
                 CopilotNativeApp._wake_pending_receipt_retry(self)
             elif not self._ack_mentor_message(message_id):
                 CopilotNativeApp._wake_pending_receipt_retry(self)
             return
-        if is_seen or retry_pending:
+        if is_seen or retry_pending or queued:
             # A previous render may have completed while its REST receipt was
             # unavailable. Only IDs persisted as pending are retried: an
             # already confirmed duplicate needs neither rendering nor another
@@ -1517,11 +1546,32 @@ class CopilotNativeApp(NSObject):
             "student_id": student_id or self._student_id,
             "message_id": message_id,
             "id": numeric_id,
+            "session_id": session_id,
+            "scope": "session" if is_session_message else "student",
             "text": data.get("text", ""),
             "mentor_id": data.get("mentor_id", "mentor"),
             "timestamp": data.get("timestamp", time.time()),
             "created_at": data.get("timestamp", time.time()),
         }
+        if is_session_message and session_id != getattr(self, "_current_session_id", None):
+            item["rendered"] = False
+            CopilotNativeApp._store_mentor_item(self, item)
+            sessions = getattr(self, "_sessions", {})
+            if session_id not in sessions:
+                sessions[session_id] = {"title": "", "unread": 0}
+            sessions[session_id]["unread"] = sessions[session_id].get("unread", 0) + 1
+            self._save_mentor_message_state()
+            try:
+                self._rebuild_session_bar()
+            except Exception:
+                pass
+            try:
+                self._update_icon_state()
+            except Exception:
+                pass
+            with CopilotNativeApp._mentor_message_state_guard(self):
+                rendering_ids.discard(message_id)
+            return
         if not self._render_mentor_message(item):
             with CopilotNativeApp._mentor_message_state_guard(self):
                 rendering_ids.discard(message_id)
@@ -1543,6 +1593,7 @@ class CopilotNativeApp(NSObject):
             numeric_id = unpersisted.get(message_id)
             if numeric_id is None:
                 return True
+            CopilotNativeApp._mark_stored_mentor_item_rendered(self, message_id)
             previous_seen = set(self._seen_mentor_message_ids)
             previous_order = list(getattr(self, "_seen_mentor_message_order", []))
             previous_last_seen_id = self._last_seen_mentor_message_id
@@ -1581,10 +1632,76 @@ class CopilotNativeApp(NSObject):
             seen.discard(order.pop(0))
         self._seen_mentor_message_order = order
 
+    def _has_queued_mentor_message(self, message_id: str) -> bool:
+        for items in getattr(self, "_mentor_items_by_session", {}).values():
+            if any(str(item.get("message_id") or "") == message_id for item in items):
+                return True
+        return any(
+            str(item.get("message_id") or "") == message_id
+            for item in getattr(self, "_mentor_notifications", [])
+        )
+
+    def _store_mentor_item(self, item: dict[str, Any]) -> None:
+        message_id = str(item.get("message_id") or "")
+        if item.get("scope") == "session" and item.get("session_id"):
+            buckets = getattr(self, "_mentor_items_by_session", None)
+            if not isinstance(buckets, dict):
+                buckets = {}
+                self._mentor_items_by_session = buckets
+            bucket = buckets.setdefault(str(item["session_id"]), [])
+        else:
+            bucket = getattr(self, "_mentor_notifications", None)
+            if not isinstance(bucket, list):
+                bucket = []
+                self._mentor_notifications = bucket
+        if not any(str(existing.get("message_id") or "") == message_id for existing in bucket):
+            bucket.append(item)
+
+    def _remove_stored_mentor_item(self, message_id: str) -> None:
+        buckets = getattr(self, "_mentor_items_by_session", {})
+        for session_id, items in list(buckets.items()):
+            kept = [item for item in items if str(item.get("message_id") or "") != message_id]
+            if kept:
+                buckets[session_id] = kept
+            else:
+                buckets.pop(session_id, None)
+        self._mentor_notifications = [
+            item
+            for item in getattr(self, "_mentor_notifications", [])
+            if str(item.get("message_id") or "") != message_id
+        ]
+
+    def _current_session_mentor_items(self) -> list[dict[str, Any]]:
+        session_id = getattr(self, "_current_session_id", None)
+        return list(getattr(self, "_mentor_items_by_session", {}).get(session_id, []))
+
+    def _mark_stored_mentor_item_rendered(self, message_id: str) -> None:
+        for items in list(getattr(self, "_mentor_items_by_session", {}).values()) + [
+            getattr(self, "_mentor_notifications", [])
+        ]:
+            for item in items:
+                if str(item.get("message_id") or "") == message_id:
+                    item["rendered"] = True
+                    return
+
+    def _settle_current_session_mentor_messages(self) -> None:
+        for item in CopilotNativeApp._current_session_mentor_items(self):
+            if item.get("rendered"):
+                continue
+            message_id = str(item.get("message_id") or "")
+            if not message_id:
+                continue
+            item["rendered"] = True
+            with CopilotNativeApp._mentor_message_state_guard(self):
+                self._unpersisted_rendered_message_ids[message_id] = int(item.get("id") or 0)
+            if not CopilotNativeApp._persist_unpersisted_rendered_message(self, message_id):
+                CopilotNativeApp._wake_pending_receipt_retry(self)
+            elif not self._ack_mentor_message(message_id):
+                CopilotNativeApp._wake_pending_receipt_retry(self)
+
     def _render_mentor_message(self, item: dict[str, Any]) -> bool:
-        self._mentor_items.append(item)
-        self._mentor_items = self._mentor_items[-20:]
-        self._mentor_unread = 0
+        item["rendered"] = False
+        CopilotNativeApp._store_mentor_item(self, item)
         try:
             self._rebuild_cards()
             self._position_analysis_panel_near_icon()
@@ -1592,8 +1709,14 @@ class CopilotNativeApp(NSObject):
             self.analysis_panel.setLevel_(NSFloatingWindowLevel)
             self._panel_visible = True
             self._update_icon_state()
+            item["rendered"] = True
+            if item.get("scope") != "session":
+                self._mentor_unread = 0
             return True
         except Exception as exc:
+            CopilotNativeApp._remove_stored_mentor_item(
+                self, str(item.get("message_id") or "")
+            )
             log.warning("导师消息渲染失败，暂不 ack: %s", exc)
             return False
 
@@ -2079,6 +2202,27 @@ class CopilotNativeApp(NSObject):
                 self._pending_receipt_message_ids = {
                     str(message_id) for message_id in pending_ids if str(message_id)
                 }
+                raw_buckets = state.get("mentor_items_by_session") or {}
+                if isinstance(raw_buckets, dict):
+                    self._mentor_items_by_session = {
+                        str(session_id): [dict(item) for item in items if isinstance(item, dict)]
+                        for session_id, items in raw_buckets.items()
+                        if str(session_id) and isinstance(items, list)
+                    }
+                notifications = state.get("mentor_notifications") or []
+                self._mentor_notifications = [
+                    dict(item) for item in notifications if isinstance(item, dict)
+                ] if isinstance(notifications, list) else []
+                self._mentor_unread = max(0, int(state.get("mentor_unread") or 0))
+                unread_by_session = state.get("mentor_session_unread") or {}
+                if isinstance(unread_by_session, dict):
+                    for session_id, unread in unread_by_session.items():
+                        try:
+                            count = max(0, int(unread))
+                        except (TypeError, ValueError):
+                            continue
+                        if count:
+                            self._sessions[str(session_id)] = {"title": "", "unread": count}
             except FileNotFoundError:
                 return
             except Exception as exc:
@@ -2130,6 +2274,18 @@ class CopilotNativeApp(NSObject):
                             for message_id in self._pending_receipt_message_ids
                             if str(message_id)
                         ),
+                        "mentor_items_by_session": getattr(
+                            self, "_mentor_items_by_session", {}
+                        ),
+                        "mentor_notifications": getattr(
+                            self, "_mentor_notifications", []
+                        ),
+                        "mentor_unread": int(getattr(self, "_mentor_unread", 0) or 0),
+                        "mentor_session_unread": {
+                            str(session_id): int(info.get("unread", 0) or 0)
+                            for session_id, info in getattr(self, "_sessions", {}).items()
+                            if int(info.get("unread", 0) or 0) > 0
+                        },
                     }
                     directory = os.path.dirname(path) or "."
                     os.makedirs(directory, exist_ok=True)

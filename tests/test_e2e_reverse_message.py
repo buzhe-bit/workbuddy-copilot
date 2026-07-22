@@ -88,6 +88,9 @@ def test_online_send_targets_one_float_but_waits_for_student_receipt(tmp_path):
             "id": result["id"],
             "text": "Try a smaller example",
             "mentor_id": "mentor-1",
+            "session_id": "",
+            "scope": "student",
+            "client_request_id": None,
             "timestamp": float_a.sent[0]["timestamp"],
         }
         assert float_b.sent == []
@@ -158,6 +161,9 @@ def test_offline_send_is_caught_up_by_student_api_and_ack_marks_delivered(tmp_pa
             "id": sent_a_body["id"],
             "text": "Read the error from top to bottom",
             "mentor_id": "mentor-1",
+            "session_id": "",
+            "scope": "student",
+            "client_request_id": None,
             "timestamp": catchup.json()["items"][0]["timestamp"],
         }]
         assert sent_b_body["message_id"] not in {

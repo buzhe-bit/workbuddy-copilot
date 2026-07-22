@@ -134,6 +134,8 @@ class MentorMessageIn(BaseModel):
     student_id: str
     text: str
     mentor_id: str | None = None
+    session_id: str | None = None
+    scope: Literal["session", "student"] | None = None
     client_request_id: _ClientRequestId | None = None
 
 
@@ -1540,15 +1542,27 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         _: None = Depends(require_mentor_token),
         message_svc: MessageService = Depends(get_message_service),
     ):
+        session_id = (data.session_id or "").strip()
+        scope = data.scope or ("session" if session_id else "student")
+        if scope == "session" and not session_id:
+            raise HTTPException(status_code=422, detail="session scope requires session_id")
+        if scope == "student" and session_id:
+            raise HTTPException(status_code=422, detail="student scope cannot include session_id")
+        kwargs = {
+            "student_id": data.student_id,
+            "mentor_id": data.mentor_id,
+            "text": data.text,
+            "client_request_id": data.client_request_id,
+        }
+        if data.session_id is not None or data.scope is not None:
+            kwargs.update(session_id=session_id or None, scope=scope)
         try:
-            return await message_svc.send(
-                student_id=data.student_id,
-                mentor_id=data.mentor_id,
-                text=data.text,
-                client_request_id=data.client_request_id,
-            )
+            return await message_svc.send(**kwargs)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            status_code = 409 if str(exc) == "client_request_id payload conflict" else 422
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
     @app.post("/api/mentor/messages/status")
     async def get_mentor_message_statuses(

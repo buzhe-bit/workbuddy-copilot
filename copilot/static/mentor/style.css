@@ -34,8 +34,9 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 12px 20px;
-  background: #1f2430;
-  color: #fff;
+  background: #fff;
+  color: #172033;
+  border-bottom: 1px solid #e4e7ec;
   flex: 0 0 auto;
   min-width: 0;
 }
@@ -55,7 +56,7 @@ body {
 
 .system-status {
   font-size: 12px;
-  color: #cbd5e1;
+  color: #6c768a;
 }
 
 .system-status[data-level="warning"] {
@@ -68,7 +69,7 @@ body {
 
 .ws-status {
   font-size: 12px;
-  color: #aaa;
+  color: #6c768a;
 }
 
 .ws-status.connected {
@@ -106,14 +107,13 @@ body {
   color: #4338ca;
 }
 
-/* 大屏：关注队列 + 原有三栏并排。wrapper 仅负责窄屏编组，不复制 DOM。 */
+/* 大屏：关注队列 / 学员来源 / 当前会话，三栏不复制任何业务 DOM。 */
 .layout {
   display: grid;
   grid-template-columns:
-    minmax(220px, 1fr)
-    minmax(150px, .62fr)
-    minmax(190px, .78fr)
-    minmax(300px, 1.6fr);
+    minmax(230px, .85fr)
+    minmax(240px, .9fr)
+    minmax(0, 2.15fr);
   gap: 1px;
   flex: 1 1 auto;
   min-width: 0;
@@ -123,9 +123,23 @@ body {
   overflow: hidden;
 }
 
-.content-workspace,
+.content-workspace {
+  grid-column: 2 / span 2;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, .7fr) minmax(0, 1.7fr);
+  overflow: hidden;
+  background: #e4e7ec;
+}
+
 .conversation-workspace {
-  display: contents;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(150px, .42fr) minmax(0, 1.58fr);
+  gap: 1px;
+  overflow: hidden;
 }
 
 .panel {
@@ -143,6 +157,16 @@ body {
   margin-bottom: 8px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+.conversation-context {
+  min-height: 19px;
+  margin-bottom: 5px;
+  color: #2f6feb;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .panel-heading-row {
@@ -795,6 +819,68 @@ body {
 }
 .compose button:disabled { background: #f3a9cd; cursor: not-allowed; }
 
+/* 独立通知保持在会话输入之外，避免被误认为当前对话消息。 */
+.notification-area {
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+
+.notification-toggle,
+.notification-form button {
+  border: 1px solid #d7b36b;
+  border-radius: 8px;
+  background: #fff8ec;
+  color: #8a5a10;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.notification-toggle:disabled,
+.notification-form button:disabled {
+  cursor: not-allowed;
+  opacity: .6;
+}
+
+.notification-form {
+  margin-top: 7px;
+  padding: 8px;
+  border: 1px solid #f0d9b0;
+  border-radius: 8px;
+  background: #fffaf1;
+}
+
+.notification-form label {
+  display: block;
+  margin-bottom: 5px;
+  color: #8a5a10;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.notification-form > div {
+  display: flex;
+  gap: 7px;
+}
+
+.notification-form input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #d7dce4;
+  border-radius: 7px;
+  padding: 8px 9px;
+  font-size: 13px;
+}
+
+.notification-status {
+  min-height: 17px;
+  margin-top: 5px;
+  color: #8a5a10;
+  font-size: 11px;
+}
+
 /* ── 四色图例 ── */
 .legend {
   font-size: 11px;
@@ -832,16 +918,15 @@ body {
     grid-row: 2;
     min-width: 0;
     min-height: 0;
-    display: grid;
-    grid-template-columns: minmax(220px, 35%) minmax(0, 1fr);
-    grid-template-rows: repeat(2, minmax(0, 1fr));
-    gap: 1px;
-    overflow: hidden;
-    background: #e5e7eb;
+    grid-template-columns: minmax(190px, 34%) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .conversation-workspace {
-    display: contents;
+    grid-column: 2;
+    grid-row: 1;
+    grid-template-columns: minmax(160px, .72fr) minmax(0, 1.28fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .panel-students {
@@ -850,13 +935,7 @@ body {
   }
 
   .panel-sessions {
-    grid-column: 1;
-    grid-row: 2;
-  }
-
-  .panel-timeline {
-    grid-column: 2;
-    grid-row: 1 / span 2;
+    min-height: 130px;
   }
 
   .attention-filters {
@@ -953,6 +1032,10 @@ body {
   .compose button {
     min-height: 40px;
     padding: 0 16px;
+  }
+
+  .notification-form input {
+    font-size: 16px;
   }
 
   .compose input {

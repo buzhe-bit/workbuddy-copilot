@@ -64,12 +64,14 @@ def browser():
     with sync_playwright() as p:
         try:
             b = p.chromium.launch()
-        except Exception as e:  # 内核缺失等
-            pytest.skip(
-                "无法启动 chromium 内核，请先运行 "
-                "`venv/bin/python -m playwright install chromium`。原始错误: "
-                f"{e}"
-            )
+        except Exception as bundled_error:  # bundled 内核缺失等
+            try:
+                b = p.chromium.launch(channel="chrome")
+            except Exception as chrome_error:
+                pytest.skip(
+                    "无法启动 bundled Chromium 或本机 Chrome。"
+                    f"bundled Chromium: {bundled_error}; Chrome channel: {chrome_error}"
+                )
         try:
             yield b
         finally:
@@ -777,7 +779,7 @@ def test_transcript_entry_failure(page, static_server):
 
 
 # ─────────────────────────────────────────────────────────────
-# 真实数据形态：会话标题为空 → 列表显示"未命名对话"，绝不回退显示原始 session_id。
+# 真实数据形态：会话标题为空 → 列表显示安全的非 ID 占位，绝不回退显示原始 session_id。
 # 覆盖两种真实空标题：uuid 型会话与 hook-test 型会话；title 为纯空白也算空（trim）。
 # 负控：若把 sessionTitleOf 改回 `|| s.session_id`，session_id 文本会出现 → 本用例必红。
 # ─────────────────────────────────────────────────────────────
@@ -800,9 +802,9 @@ def test_session_empty_title_shows_placeholder(page, static_server):
     names = page.locator(".session-item .name")
     expect(names).to_have_count(2)
 
-    # 两条都显示占位标题，而不是原始 session_id
-    expect(names.nth(0)).to_have_text("未命名对话")
-    expect(names.nth(1)).to_have_text("未命名对话")
+    # 两条都显示非 ID 占位标题，而不是原始 session_id
+    expect(names.nth(0)).to_have_text("新建对话")
+    expect(names.nth(1)).to_have_text("新建对话")
 
     # 负控：整份对话列表里绝不出现原始 session_id 文本
     list_text = page.locator(".session-list").inner_text()
@@ -1972,7 +1974,7 @@ def test_attention_cross_student_navigation_preserves_delivery_receipt_state(
     page.locator('.attention-card[data-attention-id="23"] [data-action="view"]').click()
     page.locator("#compose-input").fill("给 A 的导师提示")
     page.locator("#compose-send").click()
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中…")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中")
 
     page.locator('.attention-card[data-attention-id="24"] [data-action="view"]').click()
     expect(page.locator("#timeline .card-me")).to_have_count(0)
@@ -1985,7 +1987,147 @@ def test_attention_cross_student_navigation_preserves_delivery_receipt_state(
 
     page.locator('.attention-card[data-attention-id="23"] [data-action="view"]').click()
     expect(page.locator("#timeline .card-me")).to_have_count(1)
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
+
+
+def test_session_reply_is_scoped_and_student_notification_stays_outside_timeline(
+    page,
+    static_server,
+):
+    """切换对话不能串出站消息；通知只进入独立通知状态而非 timeline。"""
+    messages = []
+    open_console(
+        page,
+        static_server,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={"s1": [
+            {
+                "session_id": "sess-1",
+                "display_title": "优先显示的会话名",
+                "title": "后备标题",
+                "group_type": "task",
+            },
+            {"session_id": "sess-2", "title": "第二个会话", "group_type": "task"},
+        ]},
+        timeline_by_session={"sess-1": [], "sess-2": []},
+        mentor_messages=messages,
+    )
+
+    page.locator(".student-item").click()
+    first = page.locator('.session-item[data-session-id="sess-1"]')
+    expect(first.locator(".name")).to_have_text("优先显示的会话名")
+    first.click()
+    expect(page.locator("#conversation-context")).to_contain_text("学员甲")
+    expect(page.locator("#conversation-context")).to_contain_text("优先显示的会话名")
+
+    page.locator("#compose-input").fill("只给第一个会话")
+    page.locator("#compose-send").click()
+    assert messages[-1]["student_id"] == "s1"
+    assert messages[-1]["session_id"] == "sess-1"
+    assert messages[-1]["scope"] == "session"
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+
+    page.locator('.session-item[data-session-id="sess-2"]').click()
+    expect(page.locator("#timeline .card-me")).to_have_count(0)
+    page.locator("#compose-input").fill("只给第二个会话")
+    page.locator("#compose-send").click()
+    assert messages[-1]["session_id"] == "sess-2"
+    assert messages[-1]["scope"] == "session"
+
+    first.click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+
+    page.locator("#notification-toggle").click()
+    page.locator("#notification-input").fill("这是一条独立通知")
+    page.locator("#notification-form button[type=submit]").click()
+    assert messages[-1]["student_id"] == "s1"
+    assert messages[-1]["scope"] == "student"
+    assert "session_id" not in messages[-1]
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    expect(page.locator("#notification-status")).to_contain_text("发送中")
+
+
+def test_rest_timeline_merges_optimistic_session_message_without_guessing_delivery(
+    page,
+    static_server,
+):
+    """切回会话时，同一 message/client request 只能出现一次，状态以 REST delivered 为准。"""
+    messages = []
+    timeline = {"sess-1": [], "sess-2": []}
+    open_console(
+        page,
+        static_server,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={"s1": [
+            {"session_id": "sess-1", "title": "第一个会话", "group_type": "task"},
+            {"session_id": "sess-2", "title": "第二个会话", "group_type": "task"},
+        ]},
+        timeline_by_session=timeline,
+        mentor_messages=messages,
+    )
+
+    page.locator(".student-item").click()
+    page.locator('.session-item[data-session-id="sess-1"]').click()
+    expect(page.locator("#compose-input")).to_be_enabled()
+    page.locator("#compose-input").fill("离线会话回复")
+    page.locator("#compose-send").click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中")
+
+    sent = messages[-1]
+    timeline["sess-1"] = [{
+        "type": "mentor_message",
+        "content": "离线会话回复",
+        "created_at": 1,
+        "student_id": "s1",
+        "session_id": "sess-1",
+        "message_id": "message-1",
+        "id": 1,
+        "client_request_id": sent["client_request_id"],
+        "delivered": False,
+    }]
+    page.locator('.session-item[data-session-id="sess-2"]').click()
+    page.locator('.session-item[data-session-id="sess-1"]').click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中")
+
+    timeline["sess-1"][0]["delivered"] = True
+    page.locator('.session-item[data-session-id="sess-2"]').click()
+    page.locator('.session-item[data-session-id="sess-1"]').click()
+    expect(page.locator("#timeline .card-me")).to_have_count(1)
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
+
+
+def test_notification_ws_receipt_marks_independent_notification_displayed(page, static_server):
+    """通知不进会话时间线，但同样必须消费 message_delivered 回执。"""
+    ws_holder = {}
+    page.route_web_socket(
+        "**/ws/mentor",
+        lambda ws: ws_holder.setdefault("socket", ws),
+    )
+    messages = []
+    install_api_routes(
+        page,
+        students=[{"student_id": "s1", "display_name": "学员甲"}],
+        sessions_by_student={"s1": []},
+        mentor_messages=messages,
+    )
+    page.goto(static_server + "/index.html")
+    page.locator(".student-item").click()
+    expect(page.locator("#notification-toggle")).to_be_enabled()
+    page.locator("#notification-toggle").click()
+    page.locator("#notification-input").fill("独立通知回执")
+    page.locator("#notification-form button[type=submit]").click()
+    expect(page.locator("#notification-status")).to_contain_text("发送中")
+
+    ws_holder["socket"].send(json.dumps({
+        "type": "message_delivered",
+        "student_id": "s1",
+        "message_id": "message-1",
+        "id": 1,
+        "client_request_id": messages[-1]["client_request_id"],
+    }))
+    expect(page.locator("#notification-status")).to_contain_text("已展示")
 
 
 def test_delivery_receipt_before_message_post_response_is_not_lost(page, static_server):
@@ -2032,7 +2174,7 @@ def test_delivery_receipt_before_message_post_response_is_not_lost(page, static_
         "id": 99,
     }))
     page.evaluate("window.__resolveMentorMessage()")
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
 
 
 def test_lost_message_post_response_recovers_from_status_on_first_ws_open(
@@ -2090,7 +2232,7 @@ def test_lost_message_post_response_recovers_from_status_on_first_ws_open(
 
     page.evaluate("window.__controlledMentorSocket.onopen()")
     expect(page.locator("#timeline .card-me")).to_have_count(1)
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
     assert len(messages) == 1
     assert sum(client_request_id in request for request in status_requests) >= 2
 
@@ -2158,7 +2300,7 @@ def test_lost_response_rechecks_same_id_until_delayed_commit_without_ws_reconnec
         "student_id": "s1",
         "delivered": True,
     }
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
     assert page.evaluate("window.__messagePostAttempts") == 1
     assert len(status_requests) == 4
     assert all(request == [client_request_id] for request in status_requests)
@@ -2219,7 +2361,7 @@ def test_client_request_id_receipt_matches_before_post_response(
         "id": 33,
         "client_request_id": client_request_id,
     }))
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
 
 
 def test_status_hit_undelivered_clears_false_failed_state(page, static_server):
@@ -2262,7 +2404,7 @@ def test_status_hit_undelivered_clears_false_failed_state(page, static_server):
     ):
         page.locator("#compose-send").click()
 
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中…")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中")
     assert len(messages) == 1
     assert status_requests == [[messages[0]["client_request_id"]]]
 
@@ -2307,6 +2449,7 @@ def test_stale_undelivered_status_cannot_downgrade_newer_ws_receipt(
     )
     page.goto(static_server + "/index.html")
     page.locator('.attention-card[data-attention-id="32"] [data-action="view"]').click()
+    expect(page.locator("#compose-input")).to_be_enabled()
     page.evaluate("() => sendMentorMessage('新回执不得被旧快照覆盖')")
     assert len(messages) == 1
 
@@ -2318,10 +2461,10 @@ def test_stale_undelivered_status_cannot_downgrade_newer_ws_receipt(
         type: 'message_delivered', student_id: 's1', message_id: 'message-1', id: 1
       })})
     """)
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
 
     page.evaluate("window.__resolveOldMessageStatus()")
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
 
 
 def test_ws_reconnect_recovers_delivery_ack_missed_while_disconnected(
@@ -2351,18 +2494,19 @@ def test_ws_reconnect_recovers_delivery_ack_missed_while_disconnected(
     page.goto(static_server + "/index.html")
     page.evaluate("window.__controlledMentorSocket.onopen()")
     page.locator('.attention-card[data-attention-id="27"] [data-action="view"]').click()
+    expect(page.locator("#compose-input")).to_be_enabled()
     page.evaluate("() => sendMentorMessage('断线期间学员已确认')")
 
     assert len(messages) == 1
     client_request_id = messages[0].get("client_request_id")
     assert client_request_id
     statuses[client_request_id]["delivered"] = True
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中…")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("发送中")
 
     # 用同一 onopen 回调模拟重连成功：不自动重发，只查状态。
     page.evaluate("window.__controlledMentorSocket.onopen()")
     expect(page.locator("#timeline .card-me")).to_have_count(1)
-    expect(page.locator("#timeline .card-me .pill")).to_have_text("✓ 已展示")
+    expect(page.locator("#timeline .card-me .pill")).to_have_text("已展示")
     assert len(messages) == 1
     assert any(client_request_id in request for request in status_requests)
 
@@ -2393,6 +2537,7 @@ def test_outbound_message_recovery_is_bounded_to_300_without_duplicate_render(
     )
     page.goto(static_server + "/index.html")
     page.locator('.attention-card[data-attention-id="28"] [data-action="view"]').click()
+    expect(page.locator("#compose-input")).to_be_enabled()
     page.evaluate("""
       () => Promise.all(Array.from({length: 301}, (_, index) =>
         sendMentorMessage('批量消息 ' + index)
@@ -3284,7 +3429,9 @@ def test_responsive_desktop_1440_keeps_attention_and_original_three_areas_usable
     students = _box(page, ".panel-students")
     sessions = _box(page, ".panel-sessions")
     timeline = _box(page, ".panel-timeline")
-    assert attention["x"] < students["x"] < sessions["x"] < timeline["x"]
+    # 1440px 为关注队列 / 学员来源 / 当前会话三栏；会话树位于当前会话栏上方。
+    assert attention["x"] < students["x"] < timeline["x"]
+    assert abs(sessions["x"] - timeline["x"]) <= 1
 
     page.locator('.attention-card[data-attention-id="71"] [data-action="view"]').click()
     expect(page.locator("#timeline")).to_contain_text("学员卡在响应式调试")
@@ -3306,12 +3453,11 @@ def test_responsive_tablet_700_uses_full_width_attention_then_navigation_timelin
     sessions = _box(page, ".panel-sessions")
     timeline = _box(page, ".panel-timeline")
 
-    # 600–959px：关注队列占据上排全宽；下排是左侧导航栈
-    # （学员 + 对话竖排）和右侧时间线。
+    # 600–959px：关注队列占据上排全宽；下排保留学员来源 + 当前会话双栏。
     assert attention["width"] >= 680
     assert students["y"] >= attention["y"] + attention["height"] - 1
-    assert abs(students["x"] - sessions["x"]) <= 1
-    assert sessions["y"] >= students["y"] + students["height"] - 1
+    assert sessions["x"] >= students["x"] + students["width"] - 1
+    assert sessions["y"] >= students["y"] - 1
     assert timeline["x"] >= students["x"] + students["width"] - 1
     assert abs(timeline["y"] - students["y"]) <= 1
 

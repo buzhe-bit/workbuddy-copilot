@@ -335,6 +335,8 @@ class WindowsMessageStore:
                 CREATE TABLE IF NOT EXISTS windows_ui_mentor_messages (
                     message_id TEXT PRIMARY KEY,
                     student_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT 'legacy',
                     payload_json TEXT NOT NULL,
                     delivery_state TEXT NOT NULL,
                     created_at_ns INTEGER NOT NULL,
@@ -343,6 +345,22 @@ class WindowsMessageStore:
                 )
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(windows_ui_mentor_messages)"
+                )
+            }
+            if "session_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE windows_ui_mentor_messages "
+                    "ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "scope" not in columns:
+                connection.execute(
+                    "ALTER TABLE windows_ui_mentor_messages "
+                    "ADD COLUMN scope TEXT NOT NULL DEFAULT 'legacy'"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS windows_ui_analyses (
@@ -413,6 +431,16 @@ class WindowsMessageStore:
             separators=(",", ":"),
         )
 
+    @staticmethod
+    def _normalized_mentor_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Treat only omitted route defaults as compatible schema upgrades."""
+        normalized = dict(payload)
+        session_id = str(normalized.get("session_id") or "").strip()
+        normalized.setdefault("session_id", session_id)
+        normalized.setdefault("scope", "legacy")
+        normalized.setdefault("client_request_id", None)
+        return normalized
+
     def _validate_identity(self, payload: Mapping[str, Any]) -> None:
         if str(payload.get("student_id") or "").strip() != self.student_id:
             raise ValueError("message student identity mismatch")
@@ -451,8 +479,20 @@ class WindowsMessageStore:
             raise ValueError("mentor message_id is required")
         if state not in self._MENTOR_RANK:
             raise ValueError("invalid mentor delivery state")
+        normalized_payload = self._normalized_mentor_payload(payload)
+        session_id = str(normalized_payload.get("session_id") or "").strip()
+        requested_scope = str(normalized_payload.get("scope") or "").strip()
+        scope = (
+            "session"
+            if session_id and requested_scope in {"", "session"}
+            else "student"
+            if requested_scope == "student"
+            else "legacy"
+        )
+        if requested_scope == "session" and not session_id:
+            scope = "student"
         now = int(self._clock_ns())
-        encoded = self._encoded(payload)
+        encoded = self._encoded(normalized_payload)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -466,16 +506,37 @@ class WindowsMessageStore:
                 connection.execute(
                     """
                     INSERT INTO windows_ui_mentor_messages(
-                        message_id, student_id, payload_json, delivery_state,
+                        message_id, student_id, session_id, scope, payload_json, delivery_state,
                         created_at_ns, terminal_at_ns, read_at_ns
-                    ) VALUES(?, ?, ?, ?, ?, ?, NULL)
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
-                    (message_id, self.student_id, encoded, state, now, terminal_at),
+                    (
+                        message_id,
+                        self.student_id,
+                        session_id,
+                        scope,
+                        encoded,
+                        state,
+                        now,
+                        terminal_at,
+                    ),
                 )
             else:
                 if str(row["student_id"]) != self.student_id:
                     raise ValueError("mentor message identity collision")
-                if str(row["payload_json"]) != encoded:
+                try:
+                    stored_payload = json.loads(str(row["payload_json"]))
+                    stored_normalized = self._normalized_mentor_payload(stored_payload)
+                    if "scope" not in stored_payload and "scope" in payload:
+                        stored_normalized["scope"] = (
+                            "session"
+                            if str(stored_normalized.get("session_id") or "").strip()
+                            else "student"
+                        )
+                    stored_encoded = self._encoded(stored_normalized)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    stored_encoded = str(row["payload_json"])
+                if stored_encoded != encoded:
                     raise ValueError("mentor message payload collision")
                 merged = self._merged_state(
                     str(row["delivery_state"]), state, self._MENTOR_RANK
@@ -486,10 +547,10 @@ class WindowsMessageStore:
                 connection.execute(
                     """
                     UPDATE windows_ui_mentor_messages
-                    SET payload_json = ?, delivery_state = ?, terminal_at_ns = ?
+                    SET session_id = ?, scope = ?, payload_json = ?, delivery_state = ?, terminal_at_ns = ?
                     WHERE message_id = ?
                     """,
-                    (encoded, merged, terminal_at, message_id),
+                    (session_id, scope, encoded, merged, terminal_at, message_id),
                 )
             updated = connection.execute(
                 "SELECT * FROM windows_ui_mentor_messages WHERE message_id = ?",
@@ -1153,6 +1214,40 @@ class WindowsMessageStore:
             ).fetchall()
         return [self._mentor_item(row) for row in rows]
 
+    def list_session_mentor(self, session_id: str | None) -> list[StoredWindowsItem]:
+        with self._connect() as connection:
+            if session_id:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM windows_ui_mentor_messages
+                    WHERE student_id = ? AND scope = 'session' AND session_id = ?
+                    ORDER BY created_at_ns ASC, message_id ASC
+                    """,
+                    (self.student_id, session_id),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM windows_ui_mentor_messages
+                    WHERE student_id = ? AND scope = 'legacy'
+                    ORDER BY created_at_ns ASC, message_id ASC
+                    """,
+                    (self.student_id,),
+                ).fetchall()
+        return [self._mentor_item(row) for row in rows]
+
+    def list_notifications(self) -> list[StoredWindowsItem]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM windows_ui_mentor_messages
+                WHERE student_id = ? AND scope = 'student'
+                ORDER BY created_at_ns ASC, message_id ASC
+                """,
+                (self.student_id,),
+            ).fetchall()
+        return [self._mentor_item(row) for row in rows]
+
     def list_analysis(self) -> list[StoredWindowsItem]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1216,6 +1311,56 @@ class WindowsMessageStore:
         finally:
             connection.close()
 
+    def mark_session_mentor_read(self, session_id: str | None) -> int:
+        now = int(self._clock_ns())
+        scope = "session" if session_id else "legacy"
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE windows_ui_mentor_messages SET read_at_ns = ?
+                WHERE student_id = ? AND scope = ?
+                  AND (? = '' OR session_id = ?) AND read_at_ns IS NULL
+                """,
+                (now, self.student_id, scope, str(session_id or ""), str(session_id or "")),
+            )
+            connection.commit()
+            return int(cursor.rowcount)
+        finally:
+            connection.close()
+
+    def mark_notifications_read(self) -> int:
+        now = int(self._clock_ns())
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE windows_ui_mentor_messages SET read_at_ns = ?
+                WHERE student_id = ? AND scope = 'student' AND read_at_ns IS NULL
+                """,
+                (now, self.student_id),
+            )
+            connection.commit()
+            return int(cursor.rowcount)
+        finally:
+            connection.close()
+
+    def mark_analysis_read(self) -> int:
+        now = int(self._clock_ns())
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE windows_ui_analyses SET read_at_ns = ?
+                WHERE student_id = ? AND read_at_ns IS NULL
+                """,
+                (now, self.student_id),
+            )
+            connection.commit()
+            return int(cursor.rowcount)
+        finally:
+            connection.close()
+
 
 @dataclass(frozen=True)
 class SessionOption:
@@ -1242,6 +1387,7 @@ class WindowsViewState:
     expanded: bool
     unread_count: int
     mentor_messages: tuple[StoredWindowsItem, ...]
+    mentor_notifications: tuple[StoredWindowsItem, ...]
     analyses: tuple[StoredWindowsItem, ...]
     sessions: tuple[SessionOption, ...]
     selected_session_id: str | None
@@ -1304,7 +1450,8 @@ class WindowsStudentView:
         return WindowsViewState(
             expanded=self._expanded,
             unread_count=self.store.unread_count,
-            mentor_messages=tuple(self.store.list_mentor()),
+            mentor_messages=tuple(self.store.list_session_mentor(selected)),
+            mentor_notifications=tuple(self.store.list_notifications()),
             analyses=tuple(self.store.list_analysis()),
             sessions=self._sessions,
             selected_session_id=selected,
@@ -1330,6 +1477,18 @@ class WindowsStudentView:
         result = self.store.upsert_mentor(payload, state="unrendered")
         if self.renderer is None:
             raise RuntimeError("Windows UI renderer is unavailable")
+        session_id = str(payload.get("session_id") or "").strip()
+        scope = str(payload.get("scope") or "").strip()
+        is_session = bool(session_id and scope in {"", "session"})
+        if is_session and session_id != self.state.selected_session_id:
+            self._refresh(render=False)
+            return False
+        if result.item.state == "ack_pending":
+            # A session switch can render a locally queued card before the
+            # next server replay reaches Student Core.  It is now safe for
+            # that replay to produce the deferred receipt without a second
+            # renderer pass.
+            return True
         # Render the complete keyed snapshot. Replays replace the model rather
         # than append a second card, including after a process restart.
         self._refresh(render=True)
@@ -1337,7 +1496,7 @@ class WindowsStudentView:
             str(payload.get("message_id") or ""), "ack_pending"
         )
         if self._expanded:
-            self.store.mark_all_read()
+            self._mark_visible_read()
         self._refresh(render=False)
         return result.created
 
@@ -1367,7 +1526,7 @@ class WindowsStudentView:
             self._expanded = was_expanded
             self._refresh(render=False)
             raise
-        self.store.mark_all_read()
+        self._mark_visible_read()
         self._refresh(render=False)
 
     def close_panel(self) -> None:
@@ -1403,7 +1562,7 @@ class WindowsStudentView:
             options.append(
                 SessionOption(
                     session_id=session_id,
-                    title=str(raw.get("title") or raw.get("session_title") or session_id),
+                    title=str(raw.get("title") or raw.get("session_title") or "新建对话"),
                 )
             )
         self._sessions = tuple(options)
@@ -1426,6 +1585,16 @@ class WindowsStudentView:
         self._selected_session_id = resolved
         self._session_selection_source = "manual"
         self._refresh(render=True)
+        for item in self.store.list_session_mentor(resolved):
+            if item.state == "unrendered":
+                self.store.mark_mentor_state(item.key, "ack_pending")
+        self.store.mark_session_mentor_read(resolved)
+        self._refresh(render=False)
+
+    def _mark_visible_read(self) -> None:
+        self.store.mark_session_mentor_read(self.state.selected_session_id)
+        self.store.mark_notifications_read()
+        self.store.mark_analysis_read()
 
     def begin_ask(
         self,
@@ -1660,6 +1829,15 @@ class TkWindowsStudentAdapter:
     @staticmethod
     def _text(state: WindowsViewState) -> str:
         blocks: list[str] = []
+        for item in state.mentor_notifications:
+            content = str(
+                item.payload.get("content")
+                or item.payload.get("message")
+                or item.payload.get("text")
+                or ""
+            ).strip()
+            if content:
+                blocks.append(f"导师通知 · {content}")
         for item in state.mentor_messages:
             content = str(
                 item.payload.get("content")
@@ -1683,11 +1861,19 @@ class TkWindowsStudentAdapter:
     def _render_sessions(self, state: WindowsViewState) -> None:
         if self.session_selector is None:
             return
+        titles = [session.title for session in state.sessions]
+        title_counts = {title: titles.count(title) for title in titles}
+        title_indexes: dict[str, int] = {}
         labels: list[str] = []
         selected_label = ""
         mapping: dict[str, str] = {}
         for session in state.sessions:
-            label = f"{session.title} [{session.session_id}]"
+            title_indexes[session.title] = title_indexes.get(session.title, 0) + 1
+            label = (
+                f"{session.title}（{title_indexes[session.title]}）"
+                if title_counts[session.title] > 1
+                else session.title
+            )
             labels.append(label)
             mapping[label] = session.session_id
             if session.session_id == state.selected_session_id:

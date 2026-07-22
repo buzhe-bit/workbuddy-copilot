@@ -128,6 +128,19 @@ class TestTimelineAggregation:
         timeline = store.get_timeline_by_session("nonexistent")
         assert timeline == []
 
+    def test_timeline_includes_only_its_session_mentor_messages(self, store):
+        store.upsert_student("stu-1")
+        store.upsert_session("sess-1", "stu-1", "", "", created_at=1, last_activity_at=1)
+        store.upsert_session("sess-2", "stu-1", "", "", created_at=1, last_activity_at=1)
+        store.add_mentor_message("stu-1", "mentor", "sess-1", "session message", "msg-session")
+        store.add_mentor_message("stu-1", "mentor", "", "student notice", "msg-student")
+
+        session_one = [row for row in store.get_timeline_by_session("sess-1") if row["type"] == "mentor_message"]
+        session_two = [row for row in store.get_timeline_by_session("sess-2") if row["type"] == "mentor_message"]
+
+        assert [row["content"] for row in session_one] == ["session message"]
+        assert session_two == []
+
     def test_get_prompt_reply_concatenates_assistants_until_next_user(self, store):
         store.replace_session_messages(
             session_id="sess-reply",

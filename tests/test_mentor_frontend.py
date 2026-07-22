@@ -137,6 +137,45 @@ class TestFrontendStructure:
         assert "完成后灰显对话将陆续点亮" not in js
         assert 'id="retry-analysis"' in html
 
+    def test_session_reply_and_student_notification_scope_contract(self):
+        """会话回复有精确上下文；学员通知独立于任何会话时间线。"""
+        static_dir = Path(__file__).parent.parent / "copilot" / "static" / "mentor"
+        html = (static_dir / "index.html").read_text()
+        js = (static_dir / "app.js").read_text()
+
+        for element_id in (
+            "conversation-context",
+            "notification-toggle",
+            "notification-form",
+            "notification-input",
+            "notification-status",
+        ):
+            assert f'id="{element_id}"' in html
+        assert "display_title" in js
+        assert "scope: 'session'" in js
+        assert "scope: 'student'" in js
+        assert "session_id: sessionId" in js
+        assert "entry.session_id === sessionId" in js
+        assert "'发送中…'" not in js
+        assert "'✓ 已展示'" not in js
+
+    def test_notification_status_isolated_to_current_student(self):
+        """切换学员后，通知区不能显示上一位学员的发送状态。"""
+        js = (Path(__file__).parent.parent / "copilot" / "static" / "mentor" / "app.js").read_text()
+
+        assert "filter((entry) => entry.student_id === state.currentStudentId)" in js
+        compose_section = js.split("function updateComposeEnabled()", 1)[1].split(
+            "function retainOutboundMessage", 1
+        )[0]
+        assert "renderNotificationStatus();" in compose_section
+    def test_rest_mentor_messages_preserve_explicit_delivery_and_merge_optimistic_entry(self):
+        """REST 时间线回流不得重复乐观消息，也不能把未回执消息猜成已展示。"""
+        js = (Path(__file__).parent.parent / "copilot" / "static" / "mentor" / "app.js").read_text()
+
+        assert "r.delivered === true" in js
+        assert "mergeTimelineOutbound" in js
+        assert "entry.type === 'mentor_notification'" in js
+
 
 class TestFrontendServed:
     """前端可通过 HTTP 访问。"""
