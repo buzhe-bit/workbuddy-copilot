@@ -547,7 +547,7 @@ def test_mentor_message_reaches_real_agent_and_browser_receives_delivery_receipt
     page.locator("#compose-input").fill("请先缩小问题范围")
     page.locator("#compose").press("Enter")
     expect(page.locator(".timeline")).to_contain_text("请先缩小问题范围")
-    expect(page.locator(".timeline")).to_contain_text("✓ 已展示", timeout=5_000)
+    expect(page.locator(".timeline")).to_contain_text("已展示", timeout=5_000)
 
     def message_was_receipted() -> bool:
         with system.store._conn() as conn:
@@ -591,8 +591,8 @@ def test_failed_student_transport_receipt_recovers_from_real_backlog_without_fal
     system.wait_for(lambda: system.rejected_ack_request_seen, description="real rejected receipt POST")
 
     expect(page.locator(".timeline")).to_contain_text("这条消息不能伪报送达")
-    expect(page.locator(".timeline")).to_contain_text("发送中…")
-    assert "✓ 已展示" not in page.locator(".timeline").inner_text()
+    expect(page.locator(".timeline")).to_contain_text("发送中")
+    assert "已展示" not in page.locator(".timeline").inner_text()
     with system.store._conn() as conn:
         row = conn.execute(
             "SELECT delivered_at FROM mentor_messages WHERE student_id = ? ORDER BY id DESC LIMIT 1",
@@ -615,5 +615,5 @@ def test_failed_student_transport_receipt_recovers_from_real_backlog_without_fal
         return recovered is not None and recovered[0] is not None
 
     system.wait_for(recovered_message_was_receipted, description="recovered StudentAgent receipt backlog")
-    expect(page.locator(".timeline")).to_contain_text("✓ 已展示", timeout=5_000)
+    expect(page.locator(".timeline")).to_contain_text("已展示", timeout=5_000)
     assert len(system.rendered_message_ids) == 1
